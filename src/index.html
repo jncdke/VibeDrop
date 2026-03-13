@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VoiceDrop</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div id="app">
+        <div class="titlebar-spacer"></div>
+
+        <!-- 权限引导界面 -->
+        <section id="permission-view" class="view" style="display: none;">
+            <div class="permission-card">
+                <div class="permission-icon">🔐</div>
+                <h2>需要辅助功能权限</h2>
+                <p class="permission-desc">
+                    VoiceDrop 需要「辅助功能」权限来模拟键盘输入。
+                    这样手机发来的文字才能自动出现在光标位置。
+                </p>
+                <div class="permission-steps">
+                    <div class="step">① 点击下方按钮打开系统设置</div>
+                    <div class="step">② 在列表中找到 <strong>VoiceDrop</strong></div>
+                    <div class="step">③ 打开它的开关 ✅</div>
+                </div>
+                <button id="btn-open-settings" class="btn-primary">打开辅助功能设置</button>
+                <button id="btn-check-again" class="btn-secondary">我已授权，检查一下</button>
+            </div>
+        </section>
+
+        <!-- 正常主界面 -->
+        <section id="main-view" class="view" style="display: none;">
+            <header>
+                <div class="logo">
+                    <img class="logo-icon" src="icon.png" alt="VoiceDrop" width="36" height="36">
+                    <h1>VoiceDrop</h1>
+                </div>
+                <div class="status-badge" id="status-badge">
+                    <span class="pulse"></span>
+                    运行中
+                </div>
+            </header>
+
+            <section class="info-card">
+                <div class="info-row">
+                    <span class="info-label">💻 主机名</span>
+                    <span class="info-value" id="hostname">加载中...</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">📡 地址</span>
+                    <span class="info-value copyable" id="address" title="点击复制">加载中...</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">🔑 PIN</span>
+                    <span class="info-value mono" id="pin">加载中...</span>
+                </div>
+            </section>
+
+            <section class="info-card tip-card">
+                <p>📱 在手机浏览器中打开上方地址即可使用</p>
+            </section>
+
+            <section class="log-section">
+                <div class="log-header">
+                    <h2>📋 最近收到</h2>
+                    <button id="btn-export-log" class="btn-small" title="导出备份">📥 导出</button>
+                </div>
+                <div class="log-list" id="log-list">
+                    <p class="empty">等待接收...</p>
+                </div>
+            </section>
+        </section>
+    </div>
+
+    <script src="main.js"></script>
+</body>
+
+</html>

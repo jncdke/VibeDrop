@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="description" content="VoiceDrop - 从手机发送文字到 Mac 电脑">
+    <title>VoiceDrop</title>
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#0a0a1a">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="apple-touch-icon" href="/icon.png">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- 顶部标题栏 -->
+        <header id="header">
+            <h1><img src="/icon.png" alt="" width="24" height="24" style="vertical-align: middle; margin-right: 6px;">VoiceDrop</h1>
+            <button id="nav-settings-btn" class="icon-btn" title="设置">⚙️</button>
+        </header>
+
+        <!-- 设置页面 -->
+        <section id="settings-view" class="view">
+            <h2>连接设置</h2>
+            <p class="hint">填写两台 Mac 的局域网 IP 和 PIN 码</p>
+
+            <div class="settings-card">
+                <h3>Mac 1</h3>
+                <div class="setting-row">
+                    <label>IP 地址</label>
+                    <input type="text" id="mac1-ip" placeholder="192.168.1.10">
+                </div>
+                <div class="setting-row">
+                    <label>端口</label>
+                    <input type="number" id="mac1-port" placeholder="9001" value="9001">
+                </div>
+                <div class="setting-row">
+                    <label>PIN 码</label>
+                    <input type="password" id="mac1-pin" placeholder="输入 PIN">
+                </div>
+            </div>
+
+            <div class="settings-card">
+                <h3>Mac 2</h3>
+                <div class="setting-row">
+                    <label>IP 地址</label>
+                    <input type="text" id="mac2-ip" placeholder="192.168.1.20">
+                </div>
+                <div class="setting-row">
+                    <label>端口</label>
+                    <input type="number" id="mac2-port" placeholder="9001" value="9001">
+                </div>
+                <div class="setting-row">
+                    <label>PIN 码</label>
+                    <input type="password" id="mac2-pin" placeholder="输入 PIN">
+                </div>
+            </div>
+
+            <button id="save-settings-btn" class="primary-btn">保存并连接</button>
+        </section>
+
+        <!-- 发送页面 -->
+        <section id="send-view" class="view hidden">
+            <!-- Mac 1 -->
+            <div class="mac-card" id="mac1-card">
+                <div class="mac-header">
+                    <span class="status-dot" id="mac1-status-dot"></span>
+                    <span class="mac-name" id="mac1-name">Mac 1</span>
+                    <span class="status-text" id="mac1-status-text">未连接</span>
+                </div>
+                <div class="input-group">
+                    <textarea id="mac1-input" placeholder="输入要发送的文字..." rows="3"></textarea>
+                    <button class="send-btn" id="mac1-send-btn" disabled>发送</button>
+                </div>
+            </div>
+
+            <!-- Mac 2 -->
+            <div class="mac-card" id="mac2-card">
+                <div class="mac-header">
+                    <span class="status-dot" id="mac2-status-dot"></span>
+                    <span class="mac-name" id="mac2-name">Mac 2</span>
+                    <span class="status-text" id="mac2-status-text">未连接</span>
+                </div>
+                <div class="input-group">
+                    <textarea id="mac2-input" placeholder="输入要发送的文字..." rows="3"></textarea>
+                    <button class="send-btn" id="mac2-send-btn" disabled>发送</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 历史页面 -->
+        <section id="history-view" class="view hidden">
+            <div class="history-header">
+                <h2>发送历史</h2>
+                <div class="history-filter">
+                    <button class="filter-btn active" data-filter="all">全部</button>
+                    <button class="filter-btn" data-filter="mac1">Mac 1</button>
+                    <button class="filter-btn" data-filter="mac2">Mac 2</button>
+                </div>
+            </div>
+            <div id="history-list" class="history-list">
+                <p class="empty-hint">暂无发送记录</p>
+            </div>
+            <div class="history-actions">
+                <button id="export-history-btn" class="secondary-btn">📥 导出备份</button>
+                <button id="clear-history-btn" class="danger-btn">🗑 清空历史</button>
+            </div>
+        </section>
+
+        <!-- 底部导航栏 -->
+        <nav id="bottom-nav">
+            <button class="nav-btn active" data-view="send-view" id="nav-send-btn">
+                <span class="nav-icon">📝</span>
+                <span class="nav-label">发送</span>
+            </button>
+            <button class="nav-btn" data-view="history-view" id="nav-history-btn">
+                <span class="nav-icon">📋</span>
+                <span class="nav-label">历史</span>
+            </button>
+        </nav>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>
