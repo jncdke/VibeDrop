@@ -227,7 +227,7 @@ fn main() {
                 *h = Some(app.handle().clone());
             }
             // 创建系统托盘菜单（类似 KDE Connect 风格）
-            let title = MenuItem::with_id(app, "title", "VoiceDrop - 运行中", false, None::<&str>)?;
+            let title = MenuItem::with_id(app, "title", "VibeDrop - 运行中", false, None::<&str>)?;
             let addr_label = MenuItem::with_id(
                 app, "addr",
                 &format!("📡 {}:{}", ip, port),
@@ -241,7 +241,7 @@ fn main() {
             let sep1 = PredefinedMenuItem::separator(app)?;
             let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
             let sep2 = PredefinedMenuItem::separator(app)?;
-            let quit = MenuItem::with_id(app, "quit", "退出 VoiceDrop", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出 VibeDrop", true, None::<&str>)?;
 
             let menu = Menu::with_items(app, &[
                 &title, &addr_label, &pin_label,
@@ -262,7 +262,7 @@ fn main() {
                 .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(true)
-                .tooltip(&format!("VoiceDrop - {}:{}", ip, port))
+                .tooltip(&format!("VibeDrop - {}:{}", ip, port))
                 .on_menu_event(|app, event| {
                     match event.id.as_ref() {
                         "quit" => {

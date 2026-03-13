@@ -1,6 +1,6 @@
 {
-    "name": "VoiceDrop",
-    "short_name": "VoiceDrop",
+    "name": "VibeDrop",
+    "short_name": "VibeDrop",
     "description": "从手机发送文字到 Mac 电脑",
     "start_url": "/",
     "display": "standalone",
