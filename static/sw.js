@@ -1,11 +1,14 @@
-// VoiceDrop Service Worker
-const CACHE_NAME = 'vibedrop-v3';
+// VibeDrop Service Worker
+const CACHE_NAME = 'vibedrop-v4';
 const ASSETS = [
     '/',
     '/index.html',
     '/style.css',
     '/app.js',
     '/manifest.json',
+    '/icon.png',
+    '/icon-192.png',
+    '/icon-512.png',
 ];
 
 // 安装：缓存静态资源
