@@ -43,12 +43,12 @@ async function showMainView() {
     try {
         const info = await invoke('get_service_info');
         document.getElementById('hostname').textContent = info.hostname;
-        document.getElementById('address').textContent = `http://${info.ip}:${info.port}`;
+        document.getElementById('address').textContent = `https://${info.ip}:${info.https_port}`;
         document.getElementById('pin').textContent = info.pin;
 
         // 点击地址复制
         document.getElementById('address').addEventListener('click', () => {
-            navigator.clipboard.writeText(`http://${info.ip}:${info.port}`);
+            navigator.clipboard.writeText(`https://${info.ip}:${info.https_port}`);
             const el = document.getElementById('address');
             const original = el.textContent;
             el.textContent = '已复制 ✓';

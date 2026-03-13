@@ -4,7 +4,9 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use enigo::{Enigo, Keyboard, Settings};
+use rcgen::generate_simple_self_signed;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -57,6 +59,7 @@ struct ServiceInfo {
     hostname: String,
     ip: String,
     port: u16,
+    https_port: u16,
     pin: String,
     running: bool,
 }
@@ -88,6 +91,7 @@ fn get_service_info(state: tauri::State<'_, AppState>) -> ServiceInfo {
         hostname: state.hostname.clone(),
         ip: state.ip.clone(),
         port: state.port,
+        https_port: state.https_port,
         pin: state.pin.clone(),
         running: true,
     }
@@ -100,6 +104,7 @@ struct AppState {
     hostname: String,
     ip: String,
     port: u16,
+    https_port: u16,
 }
 
 // ---- 主函数 ----
@@ -151,11 +156,14 @@ fn main() {
         });
     });
 
+    let https_port: u16 = port + 1; // HTTPS 端口 = HTTP 端口 + 1
+
     let state = AppState {
         pin: pin.clone(),
         hostname: hostname.clone(),
         ip: ip.clone(),
         port,
+        https_port,
     };
 
     // 获取 static 目录路径（跟随可执行文件）
@@ -184,8 +192,9 @@ fn main() {
     let app_handle_ws = Arc::clone(&app_handle);
     let ws_static_dir = static_dir.clone();
 
-    // 启动 WebSocket 服务器（后台）
+    // 启动 HTTP + HTTPS 服务器（后台）
     let ws_port = port;
+    let ws_https_port = https_port;
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -205,14 +214,40 @@ fn main() {
                 .route("/ws", get(move |ws| ws_handler(ws, shared_clone)))
                 .fallback_service(ServeDir::new(ws_static_dir));
 
-            let addr = format!("0.0.0.0:{}", ws_port);
-            info!("WebSocket 服务启动在 {}", addr);
+            // HTTP 服务
+            let http_app = app.clone();
+            let http_addr = format!("0.0.0.0:{}", ws_port);
+            info!("HTTP 服务启动在 {}", http_addr);
+            let http_handle = tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(&http_addr)
+                    .await
+                    .unwrap_or_else(|_| panic!("无法绑定 HTTP 端口 {}", ws_port));
+                axum::serve(listener, http_app).await.unwrap();
+            });
 
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .unwrap_or_else(|_| panic!("无法绑定端口 {}", ws_port));
+            // 生成自签名证书
+            let subject_alt_names = vec!["localhost".to_string()];
+            let cert = generate_simple_self_signed(subject_alt_names)
+                .expect("无法生成自签名证书");
+            let cert_pem = cert.cert.pem();
+            let key_pem = cert.key_pair.serialize_pem();
 
-            axum::serve(listener, app).await.unwrap();
+            // HTTPS 服务
+            let https_addr = format!("0.0.0.0:{}", ws_https_port);
+            info!("HTTPS 服务启动在 {}", https_addr);
+            let tls_config = RustlsConfig::from_pem(
+                cert_pem.into_bytes(),
+                key_pem.into_bytes(),
+            ).await.expect("TLS 配置失败");
+
+            let https_handle = tokio::spawn(async move {
+                axum_server::bind_rustls(https_addr.parse().unwrap(), tls_config)
+                    .serve(app.into_make_service())
+                    .await
+                    .unwrap();
+            });
+
+            let _ = tokio::join!(http_handle, https_handle);
         });
     });
 
