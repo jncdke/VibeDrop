@@ -6,7 +6,6 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use enigo::{Enigo, Keyboard, Settings};
-use rcgen::generate_simple_self_signed;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -225,19 +224,16 @@ fn main() {
                 axum::serve(listener, http_app).await.unwrap();
             });
 
-            // 生成自签名证书
-            let subject_alt_names = vec!["localhost".to_string()];
-            let cert = generate_simple_self_signed(subject_alt_names)
-                .expect("无法生成自签名证书");
-            let cert_pem = cert.cert.pem();
-            let key_pem = cert.key_pair.serialize_pem();
+            // 加载 mkcert 生成的受信任证书
+            let cert_pem = include_bytes!("../certs/cert.pem").to_vec();
+            let key_pem = include_bytes!("../certs/key.pem").to_vec();
 
             // HTTPS 服务
             let https_addr = format!("0.0.0.0:{}", ws_https_port);
             info!("HTTPS 服务启动在 {}", https_addr);
             let tls_config = RustlsConfig::from_pem(
-                cert_pem.into_bytes(),
-                key_pem.into_bytes(),
+                cert_pem,
+                key_pem,
             ).await.expect("TLS 配置失败");
 
             let https_handle = tokio::spawn(async move {
