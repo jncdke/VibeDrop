@@ -114,7 +114,11 @@ fn main() {
     tracing_subscriber::fmt::init();
 
     // 获取配置（硬编码默认值，后续可改为配置文件）
-    let pin = std::env::var("VOICEDROP_PIN").unwrap_or_else(|_| "1234".to_string());
+    let pin = std::env::var("VOICEDROP_PIN").unwrap_or_else(|_| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+        format!("{:04}", seed % 10000)
+    });
     let port: u16 = std::env::var("VOICEDROP_PORT")
         .ok()
         .and_then(|p| p.parse().ok())

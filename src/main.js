@@ -43,16 +43,18 @@ async function showMainView() {
     try {
         const info = await invoke('get_service_info');
         document.getElementById('hostname').textContent = info.hostname;
-        document.getElementById('address').textContent = `https://${info.ip}:${info.https_port}`;
+        document.getElementById('ip-address').textContent = info.ip;
+        document.getElementById('port').textContent = info.port;
         document.getElementById('pin').textContent = info.pin;
 
-        // 点击地址复制
-        document.getElementById('address').addEventListener('click', () => {
-            navigator.clipboard.writeText(`https://${info.ip}:${info.https_port}`);
-            const el = document.getElementById('address');
-            const original = el.textContent;
-            el.textContent = '已复制 ✓';
-            setTimeout(() => el.textContent = original, 1500);
+        // 点击任意 copyable 字段复制
+        document.querySelectorAll('.copyable').forEach(el => {
+            el.addEventListener('click', () => {
+                navigator.clipboard.writeText(el.textContent);
+                const original = el.textContent;
+                el.textContent = '已复制 ✓';
+                setTimeout(() => el.textContent = original, 1500);
+            });
         });
     } catch (e) {
         console.error('获取服务信息失败:', e);
