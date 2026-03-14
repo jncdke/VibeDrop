@@ -133,14 +133,7 @@ function createLogElement(text, timestamp) {
     `;
     item.addEventListener('click', () => {
         navigator.clipboard.writeText(text);
-        const logText = item.querySelector('.log-text');
-        const original = logText.innerHTML;
-        logText.textContent = '已复制 ✓';
-        logText.style.color = '#00d68f';
-        setTimeout(() => {
-            logText.innerHTML = original;
-            logText.style.color = '';
-        }, 1000);
+        showToast('已复制 ✓');
     });
     return item;
 }
@@ -166,4 +159,22 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+function showToast(message) {
+    let toast = document.getElementById('toast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'toast';
+        toast.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgba(108,92,231,0.95);color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;z-index:9999;transition:opacity 0.15s;pointer-events:none;';
+        document.body.appendChild(toast);
+    }
+    toast.style.opacity = '0';
+    clearTimeout(toast._timer);
+    clearTimeout(toast._showTimer);
+    toast._showTimer = setTimeout(() => {
+        toast.textContent = message;
+        toast.style.opacity = '1';
+        toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 2000);
+    }, 150);
 }
