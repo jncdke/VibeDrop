@@ -492,11 +492,11 @@ function renderHistory() {
         return;
     }
 
-    list.innerHTML = history.map(h => {
+    list.innerHTML = history.map((h, i) => {
         const time = formatTime(h.timestamp);
         const statusIcon = h.status === 'success' ? '✅' : h.status === 'failed' ? '❌' : '⏳';
         return `
-            <div class="history-item">
+            <div class="history-item" data-idx="${i}" style="cursor:pointer" title="点击复制">
                 <div class="history-item-header">
                     <span class="history-time">${time}</span>
                     <span class="history-target">${h.targetName || h.target}</span>
@@ -506,6 +506,18 @@ function renderHistory() {
             </div>
         `;
     }).join('');
+
+    // 点击复制
+    list.querySelectorAll('.history-item').forEach((item, i) => {
+        item.addEventListener('click', () => {
+            const text = history[i].text;
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(text).then(() => {
+                    showToast('已复制 ✓');
+                });
+            }
+        });
+    });
 }
 
 function formatTime(isoString) {

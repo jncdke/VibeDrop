@@ -252,6 +252,13 @@ h1 {
     font-size: 13px;
     line-height: 1.4;
     word-break: break-all;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.log-item:hover {
+    background: rgba(108, 92, 231, 0.1);
+    border-color: var(--accent);
 }
 
 .empty {

@@ -125,10 +125,23 @@ function createLogElement(text, timestamp) {
 
     const item = document.createElement('div');
     item.className = 'log-item';
+    item.title = '点击复制';
+    item.style.cursor = 'pointer';
     item.innerHTML = `
         <div class="log-time">${timeStr}</div>
         <div class="log-text">${escapeHtml(text)}</div>
     `;
+    item.addEventListener('click', () => {
+        navigator.clipboard.writeText(text);
+        const logText = item.querySelector('.log-text');
+        const original = logText.innerHTML;
+        logText.textContent = '已复制 ✓';
+        logText.style.color = '#00d68f';
+        setTimeout(() => {
+            logText.innerHTML = original;
+            logText.style.color = '';
+        }, 1000);
+    });
     return item;
 }
 

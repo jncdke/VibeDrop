@@ -53,6 +53,7 @@ body {
     align-items: center;
     justify-content: space-between;
     padding: 16px 20px;
+    padding-top: calc(40px + 16px); /* Android 状态栏高度 (~40px) + 原有 padding */
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
     position: sticky;
@@ -400,6 +401,12 @@ body {
     font-size: 14px;
     line-height: 1.5;
     word-break: break-all;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.history-item:active {
+    background: rgba(108, 92, 231, 0.15);
 }
 
 .empty-hint {
