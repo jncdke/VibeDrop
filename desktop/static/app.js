@@ -176,7 +176,7 @@ function renderDeviceCards(devices) {
         card.innerHTML = `
             <div class="device-card-header">
                 <input type="text" class="device-name-input" value="${escapeHtml(dev.name)}" placeholder="设备名称">
-                <button class="device-delete-btn danger-btn-sm" title="删除">🗑</button>
+                <button class="device-delete-btn danger-btn-sm" title="删除">删除</button>
             </div>
             <div class="setting-row">
                 <label>IP 地址</label>
@@ -197,7 +197,7 @@ function renderDeviceCards(devices) {
         card.querySelector('.device-delete-btn').addEventListener('click', () => {
             const allCards = document.querySelectorAll('#device-cards .settings-card');
             if (allCards.length <= 1) {
-                showToast('⚠️ 至少保留一个设备');
+                showToast('至少保留一个设备');
                 return;
             }
             if (confirm(`确定删除"${dev.name}"？`)) {
@@ -229,16 +229,24 @@ function renderSendCards(devices) {
             </div>
             <div class="input-group">
                 <textarea id="input-${dev.id}" placeholder="输入要发送的文字..." rows="3"></textarea>
-                <button class="send-btn" id="sendbtn-${dev.id}" disabled>发送</button>
+                <div class="send-actions">
+                    <button class="send-btn aux-btn" id="sendbtn-${dev.id}" disabled>发送</button>
+                    <button class="send-btn aux-btn enter-btn" id="enterbtn-${dev.id}" disabled>回车</button>
+                </div>
+                <button class="send-btn combo-btn" id="sendenterbtn-${dev.id}" disabled>发送并回车</button>
             </div>
         `;
         container.appendChild(card);
 
         // 发送按钮
-        const btn = card.querySelector('.send-btn');
+        const sendBtn = card.querySelector(`#sendbtn-${dev.id}`);
+        const enterBtn = card.querySelector(`#enterbtn-${dev.id}`);
+        const sendEnterBtn = card.querySelector(`#sendenterbtn-${dev.id}`);
         const input = card.querySelector('textarea');
 
-        btn.addEventListener('click', () => sendText(dev.id));
+        sendBtn.addEventListener('click', () => sendText(dev.id));
+        enterBtn.addEventListener('click', () => sendEnter(dev.id));
+        sendEnterBtn.addEventListener('click', () => sendTextAndEnter(dev.id));
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -338,16 +346,16 @@ function initSettingsButton() {
 function testConnection() {
     const resultDiv = $('test-result');
     resultDiv.style.display = 'block';
-    resultDiv.innerHTML = '⏳ 正在测试...';
-    resultDiv.style.color = '#a0a0c0';
+    resultDiv.innerHTML = '正在测试...';
+    resultDiv.style.color = '#667085';
 
     const devices = getDevicesFromUI();
 
     function testOne(dev) {
         return new Promise((resolve) => {
-            if (!dev.ip) { resolve(`${dev.name}: ⏭ 未配置`); return; }
+            if (!dev.ip) { resolve(`${dev.name}: 未配置`); return; }
             const ws = new WebSocket(`ws://${dev.ip}:${dev.port}/ws`);
-            const timeout = setTimeout(() => { ws.close(); resolve(`${dev.name}: ❌ 连接超时`); }, 3000);
+            const timeout = setTimeout(() => { ws.close(); resolve(`${dev.name}: 连接超时`); }, 3000);
             ws.onopen = () => {
                 ws.send(JSON.stringify({ action: 'auth', pin: dev.pin }));
             };
@@ -356,18 +364,18 @@ function testConnection() {
                 const data = JSON.parse(e.data);
                 ws.close();
                 if (data.status === 'ok') {
-                    resolve(`${dev.name}: ✅ 连接成功 (${data.hostname})`);
+                    resolve(`${dev.name}: 已连接 (${data.hostname})`);
                 } else {
-                    resolve(`${dev.name}: ❌ ${data.error || 'PIN 错误'}`);
+                    resolve(`${dev.name}: ${data.error || 'PIN 错误'}`);
                 }
             };
-            ws.onerror = () => { clearTimeout(timeout); resolve(`${dev.name}: ❌ 无法连接`); };
+            ws.onerror = () => { clearTimeout(timeout); resolve(`${dev.name}: 无法连接`); };
         });
     }
 
     Promise.all(devices.map(d => testOne(d))).then(res => {
         resultDiv.innerHTML = res.join('<br>');
-        resultDiv.style.color = '#e0e0ff';
+        resultDiv.style.color = '#344054';
     });
 }
 
@@ -449,9 +457,9 @@ function connectDevice(deviceId, ip, port, pin) {
         if (data.action === 'clipboard') {
             if (data.text) {
                 writeClipboard(data.text).then(() => {
-                    showToast('📋 已同步到剪贴板');
+                    showToast('已同步到剪贴板');
                 }).catch(() => {
-                    showToast('⚠️ 剪贴板写入失败');
+                    showToast('剪贴板写入失败');
                 });
             }
             return;
@@ -529,6 +537,8 @@ function updateDeviceUI(deviceId, status, detail) {
     const text = $(`status-${deviceId}`);
     const card = $(`card-${deviceId}`);
     const sendBtn = $(`sendbtn-${deviceId}`);
+    const enterBtn = $(`enterbtn-${deviceId}`);
+    const sendEnterBtn = $(`sendenterbtn-${deviceId}`);
 
     if (!dot || !card) return; // 设备卡片可能不存在
 
@@ -540,24 +550,32 @@ function updateDeviceUI(deviceId, status, detail) {
             dot.classList.add('connected');
             card.classList.add('connected');
             text.textContent = '已连接';
-            sendBtn.disabled = false;
+            if (sendBtn) sendBtn.disabled = false;
+            if (enterBtn) enterBtn.disabled = false;
+            if (sendEnterBtn) sendEnterBtn.disabled = false;
             if (detail) name.textContent = detail;
             break;
         case 'connecting':
             dot.classList.add('connecting');
             text.textContent = detail || '连接中...';
-            sendBtn.disabled = true;
+            if (sendBtn) sendBtn.disabled = true;
+            if (enterBtn) enterBtn.disabled = true;
+            if (sendEnterBtn) sendEnterBtn.disabled = true;
             break;
         case 'error':
             dot.classList.add('error');
             card.classList.add('error');
             text.textContent = detail || '错误';
-            sendBtn.disabled = true;
+            if (sendBtn) sendBtn.disabled = true;
+            if (enterBtn) enterBtn.disabled = true;
+            if (sendEnterBtn) sendEnterBtn.disabled = true;
             break;
         case 'disconnected':
         default:
             text.textContent = detail || '未连接';
-            sendBtn.disabled = true;
+            if (sendBtn) sendBtn.disabled = true;
+            if (enterBtn) enterBtn.disabled = true;
+            if (sendEnterBtn) sendEnterBtn.disabled = true;
             break;
     }
 }
@@ -566,18 +584,99 @@ function updateDeviceUI(deviceId, status, detail) {
 // 发送文字
 // ============================================
 
+function setActionButtonsDisabled(deviceId, disabled) {
+    const sendBtn = $(`sendbtn-${deviceId}`);
+    const enterBtn = $(`enterbtn-${deviceId}`);
+    const sendEnterBtn = $(`sendenterbtn-${deviceId}`);
+    if (sendBtn) sendBtn.disabled = disabled;
+    if (enterBtn) enterBtn.disabled = disabled;
+    if (sendEnterBtn) sendEnterBtn.disabled = disabled;
+}
+
+async function sendDeviceAction(deviceId, {
+    action,
+    payload = {},
+    buttonId,
+    pendingText,
+    clearInput = false,
+    historyEntry = null,
+    failureToast = false,
+}) {
+    const conn = connections[deviceId];
+    const btn = $(buttonId);
+    const input = $(`input-${deviceId}`);
+
+    if (!btn || !conn || !conn.authenticated || !conn.ws) {
+        return { ok: false, error: '未连接' };
+    }
+
+    const originalText = btn.textContent;
+    btn.classList.add('sending');
+    btn.textContent = pendingText;
+    setActionButtonsDisabled(deviceId, true);
+
+    try {
+        const result = await new Promise((resolve, reject) => {
+            conn._sendCallback = resolve;
+            conn.ws.send(JSON.stringify({ action, ...payload }));
+            setTimeout(() => {
+                if (conn._sendCallback) {
+                    conn._sendCallback = null;
+                    reject(new Error('超时'));
+                }
+            }, 5000);
+        });
+
+        if (result.status === 'ok') {
+            if (historyEntry) {
+                historyEntry.status = 'success';
+                updateHistory(historyEntry);
+            }
+            btn.classList.add('success');
+            btn.textContent = '✓';
+            if (clearInput && input) {
+                input.value = '';
+            }
+            return { ok: true };
+        }
+
+        if (historyEntry) {
+            historyEntry.status = 'failed';
+            updateHistory(historyEntry);
+        }
+        if (failureToast) {
+            showToast(result.error || '操作失败');
+        }
+        btn.classList.add('fail');
+        btn.textContent = '✗';
+        return { ok: false, error: result.error || '操作失败' };
+    } catch (e) {
+        if (historyEntry) {
+            historyEntry.status = 'failed';
+            updateHistory(historyEntry);
+        }
+        if (failureToast) {
+            showToast(e.message || '操作失败');
+        }
+        btn.classList.add('fail');
+        btn.textContent = '✗';
+        return { ok: false, error: e.message || '操作失败' };
+    } finally {
+        setTimeout(() => {
+            btn.classList.remove('sending', 'success', 'fail');
+            btn.textContent = originalText;
+            setActionButtonsDisabled(deviceId, !conn.authenticated);
+        }, 800);
+    }
+
+}
+
 async function sendText(deviceId) {
     const conn = connections[deviceId];
     const input = $(`input-${deviceId}`);
-    const btn = $(`sendbtn-${deviceId}`);
     const text = input.value.trim();
 
     if (!text || !conn || !conn.authenticated || !conn.ws) return;
-
-    btn.classList.add('sending');
-    btn.disabled = true;
-    const originalText = btn.textContent;
-    btn.textContent = '发送中...';
 
     // 查找设备名称
     const devices = getDevices();
@@ -594,41 +693,60 @@ async function sendText(deviceId) {
     };
     addHistory(historyEntry);
 
-    try {
-        const result = await new Promise((resolve, reject) => {
-            conn._sendCallback = resolve;
-            conn.ws.send(JSON.stringify({ action: 'type', text: text }));
-            setTimeout(() => {
-                if (conn._sendCallback) {
-                    conn._sendCallback = null;
-                    reject(new Error('超时'));
-                }
-            }, 5000);
-        });
+    await sendDeviceAction(deviceId, {
+        action: 'type',
+        payload: { text },
+        buttonId: `sendbtn-${deviceId}`,
+        pendingText: '发送中...',
+        clearInput: true,
+        historyEntry,
+    });
+}
 
-        if (result.status === 'ok') {
-            historyEntry.status = 'success';
-            btn.classList.add('success');
-            btn.textContent = '✓';
-            input.value = '';
-        } else {
-            historyEntry.status = 'failed';
-            btn.classList.add('fail');
-            btn.textContent = '✗';
-        }
-    } catch (e) {
-        historyEntry.status = 'failed';
-        btn.classList.add('fail');
-        btn.textContent = '✗';
+async function sendEnter(deviceId) {
+    await sendDeviceAction(deviceId, {
+        action: 'enter',
+        buttonId: `enterbtn-${deviceId}`,
+        pendingText: '回车中...',
+    });
+}
+
+async function sendTextAndEnter(deviceId) {
+    const conn = connections[deviceId];
+    const input = $(`input-${deviceId}`);
+    const text = input.value.trim();
+
+    if (!text || !conn || !conn.authenticated || !conn.ws) return;
+
+    const devices = getDevices();
+    const dev = devices.find(d => d.id === deviceId);
+    const targetName = conn.hostname || (dev ? dev.name : deviceId);
+
+    const historyEntry = {
+        id: Date.now(),
+        timestamp: getLocalTimestamp(),
+        text,
+        target: deviceId,
+        targetName,
+        status: 'pending',
+    };
+    addHistory(historyEntry);
+
+    const result = await sendDeviceAction(deviceId, {
+        action: 'type_enter',
+        payload: { text },
+        buttonId: `sendenterbtn-${deviceId}`,
+        pendingText: '发送并回车中...',
+        clearInput: true,
+        historyEntry,
+        failureToast: true,
+    });
+
+    if (!result.ok && result.error && result.error.startsWith('文字已发送')) {
+        historyEntry.status = 'success';
+        updateHistory(historyEntry);
+        input.value = '';
     }
-
-    updateHistory(historyEntry);
-
-    setTimeout(() => {
-        btn.classList.remove('sending', 'success', 'fail');
-        btn.textContent = originalText;
-        btn.disabled = !conn.authenticated;
-    }, 800);
 }
 
 // ============================================
@@ -755,9 +873,9 @@ async function exportHistory() {
                 throw new Error(result.error || '导出失败');
             }
 
-            showToast(result.message || `✅ 已导出 ${filename}`);
+            showToast(result.message || `已导出 ${filename}`);
         } catch (err) {
-            showToast('❌ 导出失败: ' + err.message);
+            showToast('导出失败：' + err.message);
         }
         return;
     }
@@ -771,10 +889,10 @@ async function exportHistory() {
             const writable = await handle.createWritable();
             await writable.write(data);
             await writable.close();
-            showToast('✅ 已导出到你选择的位置');
+            showToast('已导出到你选择的位置');
         } catch (err) {
             if (err.name !== 'AbortError') {
-                showToast('❌ 导出失败: ' + err.message);
+                showToast('导出失败：' + err.message);
             }
         }
         return;
@@ -787,7 +905,7 @@ async function exportHistory() {
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
-    showToast('✅ 导出成功');
+    showToast('导出成功');
 }
 
 async function shareHistory() {
@@ -820,7 +938,7 @@ async function shareHistory() {
 
             showToast(result.message || '已打开分享面板');
         } catch (err) {
-            showToast('❌ 分享失败: ' + err.message);
+            showToast('分享失败：' + err.message);
         }
         return;
     }
@@ -843,7 +961,7 @@ async function shareHistory() {
             showToast('已打开分享面板');
         } catch (err) {
             if (err.name !== 'AbortError') {
-                showToast('❌ 分享失败: ' + err.message);
+                showToast('分享失败：' + err.message);
             }
         }
         return;
@@ -905,16 +1023,16 @@ function initHistoryActions() {
 function importHistory(file) {
     const resultDiv = $('import-result');
     resultDiv.style.display = 'block';
-    resultDiv.innerHTML = '⏳ 正在导入...';
-    resultDiv.style.color = '#a0a0c0';
+    resultDiv.innerHTML = '正在导入...';
+    resultDiv.style.color = '#667085';
 
     const reader = new FileReader();
     reader.onload = (e) => {
         try {
             const imported = JSON.parse(e.target.result);
             if (!Array.isArray(imported)) {
-                resultDiv.innerHTML = '❌ 文件格式错误（需要 JSON 数组）';
-                resultDiv.style.color = '#ff6b6b';
+                resultDiv.innerHTML = '文件格式错误，需要 JSON 数组';
+                resultDiv.style.color = '#c73b31';
                 return;
             }
 
@@ -942,11 +1060,11 @@ function importHistory(file) {
             localStorage.setItem(HISTORY_KEY, JSON.stringify(existing));
             persistHistory();
 
-            resultDiv.innerHTML = `✅ 导入 ${added} 条，跳过 ${skipped} 条重复`;
-            resultDiv.style.color = '#00d68f';
+            resultDiv.innerHTML = `已导入 ${added} 条，跳过 ${skipped} 条重复`;
+            resultDiv.style.color = '#147d33';
         } catch (err) {
-            resultDiv.innerHTML = `❌ 解析失败: ${err.message}`;
-            resultDiv.style.color = '#ff6b6b';
+            resultDiv.innerHTML = `解析失败：${err.message}`;
+            resultDiv.style.color = '#c73b31';
         }
     };
     reader.readAsText(file);
@@ -968,7 +1086,7 @@ function renderHistory() {
 
     list.innerHTML = filtered.map((h, i) => {
         const time = formatTime(h.timestamp);
-        const statusIcon = h.status === 'success' ? '✅' : h.status === 'failed' ? '❌' : '⏳';
+        const statusIcon = h.status === 'success' ? '已送达' : h.status === 'failed' ? '失败' : '发送中';
         return `
             <div class="history-item" data-idx="${i}" style="cursor:pointer" title="点击复制">
                 <div class="history-item-header">
@@ -986,9 +1104,9 @@ function renderHistory() {
         item.addEventListener('click', () => {
             const text = filtered[i].text;
             writeClipboard(text).then(() => {
-                showToast('已复制 ✓');
+                showToast('已复制');
             }).catch(() => {
-                showToast('⚠️ 复制失败');
+                showToast('复制失败');
             });
         });
     });
@@ -1038,7 +1156,7 @@ function showToast(message) {
     if (!toast) {
         toast = document.createElement('div');
         toast.id = 'toast';
-        toast.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:rgba(108,92,231,0.95);color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;z-index:9999;transition:opacity 0.15s;pointer-events:none;';
+        toast.style.cssText = 'position:fixed;top:92px;left:50%;transform:translateX(-50%);background:rgba(28,28,30,0.9);color:#fff;padding:12px 18px;border-radius:18px;font-size:13px;font-weight:600;z-index:9999;transition:opacity 0.18s ease;pointer-events:none;backdrop-filter:blur(18px);box-shadow:0 18px 34px rgba(15,23,42,0.18);border:1px solid rgba(255,255,255,0.14);';
         document.body.appendChild(toast);
     }
     toast.style.opacity = '0';

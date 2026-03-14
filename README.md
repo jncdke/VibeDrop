@@ -276,11 +276,70 @@ cargo tauri dev
 
 # 生产构建（生成 .app 和 .dmg）
 cargo tauri build
+```
 
-# 安装到 /Applications
-cp -a src-tauri/target/release/bundle/macos/VibeDrop.app /Applications/
-codesign --force --deep --sign "Your Name" /Applications/VibeDrop.app
-open /Applications/VibeDrop.app
+高频改代码测试时，可以直接用根目录脚本一键重装桌面端：
+
+```bash
+./scripts/deploy-desktop.sh
+```
+
+注意：
+- 桌面端辅助功能授权依赖稳定的 bundle identifier，当前固定为 `com.vibedrop.desktop`
+- 不要手动把 `.app` 拖来拖去或自己 `cp` 覆盖安装，统一走 `./scripts/deploy-desktop.sh`
+- 这个脚本会自动校验 bundle identifier、使用固定的本地签名身份并刷新 Launch Services，避免辅助功能开关点了又弹回去
+- 默认签名材料在 `~/.vibedrop/signing/`，找不到稳定签名身份时脚本会直接报错，不再静默退回 ad-hoc
+
+常用参数：
+
+```bash
+# 只重装和重启，不重新编译
+./scripts/deploy-desktop.sh --skip-build
+
+# 安装后不自动打开
+./scripts/deploy-desktop.sh --no-open
+```
+
+### 桌面端本地签名与备份
+
+桌面端现在默认使用一套本机专用的本地代码签名身份，而不是 ad-hoc 签名。这样重装 `.app` 时，macOS 更容易把它识别成同一个应用，辅助功能授权不会因为每次构建都变化的签名而反复失效。
+
+签名材料默认放在：
+
+```bash
+~/.vibedrop/signing/
+```
+
+其中最重要的文件有：
+
+- `~/.vibedrop/signing/vibedrop-codesign.keychain-db`
+  桌面部署脚本默认使用的专用 keychain
+- `~/.vibedrop/signing/.keychain-password`
+  上面这个 keychain 的密码
+- `~/.vibedrop/signing/.p12-password`
+  `.p12` 备份文件的加密密码
+- `~/.vibedrop/signing/backups/VibeTech-Local-Code-Signing-*.p12`
+  可迁移到其他机器的签名身份备份
+
+备份规则：
+
+- `~/.vibedrop/signing/` 属于本机状态目录，不要放进 git 仓库
+- 至少把最新的 `.p12` 备份文件和对应的 `.p12` 密码保存到密码管理器或离线加密介质
+- 如果以后换机器，只需要导入最新的 `.p12`，并把脚本指向对应的 keychain 即可
+- 除非只是临时救火，否则不要设置 `ALLOW_ADHOC_FALLBACK=1`；一旦退回 ad-hoc，辅助功能授权可能再次要求重授
+
+如果要手动恢复到另一台 Mac，核心流程是：
+
+```bash
+security import ~/path/to/VibeTech-Local-Code-Signing-xxxx.p12 \
+  -k ~/Library/Keychains/login.keychain-db \
+  -f pkcs12
+```
+
+然后让 `KEYCHAIN_PATH` 指向你想用的 keychain，再跑：
+
+```bash
+./scripts/deploy-desktop.sh
 ```
 
 ### Android 手机端
@@ -353,7 +412,9 @@ cp mobile/src/style.css  desktop/static/style.css
 |------|------|------|
 | Mac PIN | `~/.vibedrop/pin` | 4 位数字，重启不变，删除后重新生成 |
 | Mac 历史日志 | `~/.vibedrop/history.jsonl` | 收到的文字记录（JSONL 格式，每行一条） |
-| Mac 开机自启 | `~/Library/LaunchAgents/com.voicedrop.desktop.plist` | LaunchAgent 配置 |
+| Mac 桌面签名 keychain | `~/.vibedrop/signing/vibedrop-codesign.keychain-db` | 桌面端固定本地签名身份，供 `deploy-desktop.sh` 使用 |
+| Mac 桌面签名备份 | `~/.vibedrop/signing/backups/VibeTech-Local-Code-Signing-*.p12` | 可迁移到其他机器的桌面签名身份备份 |
+| Mac 开机自启 | `~/Library/LaunchAgents/com.vibedrop.desktop.plist` | LaunchAgent 配置 |
 | Android 历史 | `/data/data/com.vibedrop.mobile/files/history.json` | JSON 数组，`adb install -r` 不会清除 |
 | Android 导出 | `/storage/emulated/0/Download/vibedrop_history_*.json` | 用户点导出时生成 |
 | Android keystore | `~/.android/vibedrop.keystore` | APK 签名用，密码: `vibedrop123` |

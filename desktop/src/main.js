@@ -52,7 +52,7 @@ async function showMainView() {
             el.addEventListener('click', () => {
                 navigator.clipboard.writeText(el.textContent);
                 const original = el.textContent;
-                el.textContent = '已复制 ✓';
+                el.textContent = '已复制';
                 setTimeout(() => el.textContent = original, 1500);
             });
         });
@@ -61,7 +61,7 @@ async function showMainView() {
     }
 
     // 恢复历史记录
-    restoreLog();
+    await restoreLog();
 
     // 监听后端发来的文字接收事件
     if (window.__TAURI__.event) {
@@ -86,8 +86,21 @@ function saveLog(log) {
     localStorage.setItem(LOG_KEY, JSON.stringify(log));
 }
 
-function restoreLog() {
-    const log = getLog();
+async function restoreLog() {
+    let log = [];
+
+    try {
+        log = await invoke('load_history_entries');
+        if (Array.isArray(log) && log.length > 0) {
+            saveLog(log);
+        } else {
+            log = getLog();
+        }
+    } catch (e) {
+        console.error('读取桌面历史失败:', e);
+        log = getLog();
+    }
+
     if (log.length === 0) return;
 
     const list = document.getElementById('log-list');
@@ -133,7 +146,7 @@ function createLogElement(text, timestamp) {
     `;
     item.addEventListener('click', () => {
         navigator.clipboard.writeText(text);
-        showToast('已复制 ✓');
+        showToast('已复制');
     });
     return item;
 }
@@ -166,7 +179,7 @@ function showToast(message) {
     if (!toast) {
         toast = document.createElement('div');
         toast.id = 'toast';
-        toast.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgba(108,92,231,0.95);color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;z-index:9999;transition:opacity 0.15s;pointer-events:none;';
+        toast.style.cssText = 'position:fixed;top:72px;left:50%;transform:translateX(-50%);background:rgba(28,28,30,0.9);color:#fff;padding:12px 18px;border-radius:18px;font-size:13px;font-weight:600;z-index:9999;transition:opacity 0.18s ease;pointer-events:none;backdrop-filter:blur(18px);box-shadow:0 18px 34px rgba(15,23,42,0.18);border:1px solid rgba(255,255,255,0.14);';
         document.body.appendChild(toast);
     }
     toast.style.opacity = '0';

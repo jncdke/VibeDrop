@@ -15,62 +15,67 @@
         <!-- 权限引导界面 -->
         <section id="permission-view" class="view" style="display: none;">
             <div class="permission-card">
-                <div class="permission-icon">🔐</div>
-                <h2>需要辅助功能权限</h2>
+                <div class="permission-icon">
+                    <img class="permission-icon-image" src="icon.png" alt="" width="40" height="40">
+                </div>
+                <p class="permission-kicker">辅助功能</p>
+                <h2>允许 VibeDrop 代表你输入文字</h2>
                 <p class="permission-desc">
-                    VoiceDrop 需要「辅助功能」权限来模拟键盘输入。
-                    这样手机发来的文字才能自动出现在光标位置。
+                    VibeDrop 需要「辅助功能」权限来模拟键盘输入，
+                    这样手机发来的文字才能直接出现在当前光标位置。
                 </p>
                 <div class="permission-steps">
-                    <div class="step">① 点击下方按钮打开系统设置</div>
-                    <div class="step">② 在列表中找到 <strong>VibeDrop</strong></div>
-                    <div class="step">③ 打开它的开关 ✅</div>
+                    <div class="step">打开系统设置中的辅助功能</div>
+                    <div class="step">在列表中找到 <strong>VibeDrop</strong></div>
+                    <div class="step">开启权限后回到这里重新检查</div>
                 </div>
                 <button id="btn-open-settings" class="btn-primary">打开辅助功能设置</button>
-                <button id="btn-check-again" class="btn-secondary">我已授权，检查一下</button>
+                <button id="btn-check-again" class="btn-secondary">重新检查权限</button>
             </div>
         </section>
 
         <!-- 正常主界面 -->
         <section id="main-view" class="view" style="display: none;">
             <header>
-                <div class="logo">
-                    <img class="logo-icon" src="icon.png" alt="VoiceDrop" width="36" height="36">
-                    <h1>VibeDrop</h1>
+                <div class="title-group">
+                    <div class="logo">
+                        <img class="logo-icon" src="icon.png" alt="VibeDrop" width="40" height="40">
+                        <h1>VibeDrop</h1>
+                    </div>
                 </div>
                 <div class="status-badge" id="status-badge">
                     <span class="pulse"></span>
-                    运行中
+                    服务在线
                 </div>
             </header>
 
             <section class="info-card">
                 <div class="info-row">
-                    <span class="info-label">💻 主机名</span>
+                    <span class="info-label">主机名</span>
                     <span class="info-value" id="hostname">加载中...</span>
                 </div>
                 <div class="info-row">
-                    <span class="info-label">📡 IP 地址</span>
+                    <span class="info-label">IP 地址</span>
                     <span class="info-value copyable" id="ip-address" title="点击复制">加载中...</span>
                 </div>
                 <div class="info-row">
-                    <span class="info-label">🔌 端口</span>
+                    <span class="info-label">端口</span>
                     <span class="info-value copyable" id="port" title="点击复制">加载中...</span>
                 </div>
                 <div class="info-row">
-                    <span class="info-label">🔑 PIN</span>
+                    <span class="info-label">PIN</span>
                     <span class="info-value mono copyable" id="pin" title="点击复制">加载中...</span>
                 </div>
             </section>
 
             <section class="info-card tip-card">
-                <p>📱 在手机 APP 中填入上方 IP 地址、端口和 PIN 即可连接</p>
+                <p>在手机端填入上方 IP 地址、端口和 PIN，即可完成连接。</p>
             </section>
 
             <section class="log-section">
                 <div class="log-header">
-                    <h2>📋 最近收到</h2>
-                    <button id="btn-export-log" class="btn-small" title="导出备份">📥 导出</button>
+                    <h2>最近收到</h2>
+                    <button id="btn-export-log" class="btn-small" title="导出备份">导出</button>
                 </div>
                 <div class="log-list" id="log-list">
                     <p class="empty">等待接收...</p>

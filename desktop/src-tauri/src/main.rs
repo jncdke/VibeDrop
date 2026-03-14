@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use axum::{
     Router,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -5,11 +7,11 @@ use axum::{
     routing::get,
 };
 
-use enigo::{Enigo, Keyboard, Settings};
+use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{
@@ -41,15 +43,21 @@ struct ServerMessage {
     error: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct HistoryEntry {
     timestamp: String,
     text: String,
     client_ip: String,
 }
 
-struct TypeRequest {
-    text: String,
+enum InputAction {
+    TypeText(String),
+    TypeTextAndEnter(String),
+    PressEnter,
+}
+
+struct InputRequest {
+    action: InputAction,
     reply: oneshot::Sender<Result<(), String>>,
 }
 
@@ -95,6 +103,31 @@ fn get_service_info(state: tauri::State<'_, AppState>) -> ServiceInfo {
     }
 }
 
+#[tauri::command]
+fn load_history_entries() -> Vec<HistoryEntry> {
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for path in history_log_paths() {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if line.trim().is_empty() || !seen.insert(line.clone()) {
+                continue;
+            }
+
+            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
+                entries.push(entry);
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    entries
+}
+
 // ---- 应用状态 ----
 
 struct AppState {
@@ -106,7 +139,6 @@ struct AppState {
 
 // ---- 主函数 ----
 
-#[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 fn main() {
     tracing_subscriber::fmt::init();
 
@@ -146,7 +178,7 @@ fn main() {
     fs::create_dir_all(&log_dir).expect("无法创建日志目录");
 
     // enigo 键盘模拟线程
-    let (type_tx, mut type_rx) = mpsc::channel::<TypeRequest>(32);
+    let (input_tx, mut input_rx) = mpsc::channel::<InputRequest>(32);
 
     std::thread::spawn(move || {
         let mut enigo = Enigo::new(&Settings::default())
@@ -158,11 +190,20 @@ fn main() {
             .unwrap();
 
         rt.block_on(async {
-            while let Some(req) = type_rx.recv().await {
-                let result = enigo.text(&req.text);
-                let reply = match result {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(format!("{:?}", e)),
+            while let Some(req) = input_rx.recv().await {
+                let reply = match req.action {
+                    InputAction::TypeText(text) => enigo.text(&text).map_err(|e| format!("{:?}", e)),
+                    InputAction::TypeTextAndEnter(text) => {
+                        match enigo.text(&text) {
+                            Ok(()) => enigo
+                                .key(Key::Return, Direction::Click)
+                                .map_err(|e| format!("文字已发送，但回车失败: {:?}", e)),
+                            Err(e) => Err(format!("{:?}", e)),
+                        }
+                    }
+                    InputAction::PressEnter => enigo
+                        .key(Key::Return, Direction::Click)
+                        .map_err(|e| format!("{:?}", e)),
                 };
                 let _ = req.reply.send(reply);
             }
@@ -197,7 +238,7 @@ fn main() {
 
     let ws_pin = pin.clone();
     let ws_hostname = hostname.clone();
-    let ws_type_tx = type_tx.clone();
+    let ws_input_tx = input_tx.clone();
     let app_handle: Arc<std::sync::Mutex<Option<AppHandle>>> = Arc::new(std::sync::Mutex::new(None));
     let app_handle_ws = Arc::clone(&app_handle);
     let ws_static_dir = static_dir.clone();
@@ -236,7 +277,7 @@ fn main() {
             let shared = Arc::new(WsState {
                 pin: ws_pin,
                 hostname: ws_hostname,
-                type_tx: ws_type_tx,
+                input_tx: ws_input_tx,
                 app_handle: app_handle_ws,
                 clipboard_tx,
             });
@@ -259,7 +300,12 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(state)
-        .invoke_handler(tauri::generate_handler![get_service_info, check_accessibility, open_accessibility_settings])
+        .invoke_handler(tauri::generate_handler![
+            get_service_info,
+            check_accessibility,
+            open_accessibility_settings,
+            load_history_entries
+        ])
         .setup(move |app| {
             // 把 app_handle 传给 WebSocket 线程
             if let Ok(mut h) = app_handle.lock() {
@@ -329,7 +375,7 @@ fn main() {
 struct WsState {
     pin: String,
     hostname: String,
-    type_tx: mpsc::Sender<TypeRequest>,
+    input_tx: mpsc::Sender<InputRequest>,
     app_handle: Arc<std::sync::Mutex<Option<AppHandle>>>,
     clipboard_tx: broadcast::Sender<String>,
 }
@@ -390,7 +436,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                 }
                             }
 
-                            "type" => {
+                            "type" | "type_enter" => {
                                 if !authenticated {
                                     let reply = ServerMessage {
                                         status: "error".to_string(),
@@ -402,16 +448,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                 }
 
                                 if let Some(text_content) = &client_msg.text {
-                                    info!("收到文字: {}", text_content);
+                                    let send_with_enter = client_msg.action == "type_enter";
+                                    if send_with_enter {
+                                        info!("收到文字并回车: {}", text_content);
+                                    } else {
+                                        info!("收到文字: {}", text_content);
+                                    }
                                     log_history(text_content, "ws-client");
 
                                     let (reply_tx, reply_rx) = oneshot::channel();
-                                    let req = TypeRequest {
-                                        text: text_content.clone(),
+                                    let req = InputRequest {
+                                        action: if send_with_enter {
+                                            InputAction::TypeTextAndEnter(text_content.clone())
+                                        } else {
+                                            InputAction::TypeText(text_content.clone())
+                                        },
                                         reply: reply_tx,
                                     };
 
-                                    if state.type_tx.send(req).await.is_ok() {
+                                    if state.input_tx.send(req).await.is_ok() {
                                         match reply_rx.await {
                                             Ok(Ok(())) => {
                                                 info!("文字已输入");
@@ -438,13 +493,58 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                                 let reply = ServerMessage {
                                                     status: "error".to_string(),
                                                     hostname: None,
-                                                    error: Some(format!("键盘输入失败: {}", e)),
+                                                    error: Some(e),
                                                 };
                                                 let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
                                             }
                                             Err(_) => {
                                                 error!("键盘输入线程无响应");
                                             }
+                                        }
+                                    }
+                                }
+                            }
+
+                            "enter" => {
+                                if !authenticated {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("未认证".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                }
+
+                                info!("收到回车请求");
+
+                                let (reply_tx, reply_rx) = oneshot::channel();
+                                let req = InputRequest {
+                                    action: InputAction::PressEnter,
+                                    reply: reply_tx,
+                                };
+
+                                if state.input_tx.send(req).await.is_ok() {
+                                    match reply_rx.await {
+                                        Ok(Ok(())) => {
+                                            let reply = ServerMessage {
+                                                status: "ok".to_string(),
+                                                hostname: None,
+                                                error: None,
+                                            };
+                                            let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                        }
+                                        Ok(Err(e)) => {
+                                            error!("回车模拟失败: {}", e);
+                                            let reply = ServerMessage {
+                                                status: "error".to_string(),
+                                                hostname: None,
+                                                error: Some(format!("回车失败: {}", e)),
+                                            };
+                                            let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                        }
+                                        Err(_) => {
+                                            error!("键盘输入线程无响应");
                                         }
                                     }
                                 }
@@ -485,6 +585,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
 fn dirs_log_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join(".vibedrop")
+}
+
+fn history_log_paths() -> Vec<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home = PathBuf::from(home);
+
+    vec![
+        home.join(".vibedrop").join("history.jsonl"),
+        home.join(".voicedrop").join("history.jsonl"),
+    ]
 }
 
 fn log_history(text: &str, client_ip: &str) {

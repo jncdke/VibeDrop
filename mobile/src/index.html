@@ -6,9 +6,9 @@
     <meta name="description" content="VibeDrop - 从手机发送文字到 Mac 电脑">
     <title>VibeDrop</title>
     <link rel="manifest" href="/manifest.json">
-    <meta name="theme-color" content="#0a0a1a">
+    <meta name="theme-color" content="#eef1f5">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <link rel="apple-touch-icon" href="/icon.png">
     <link rel="stylesheet" href="/style.css">
 </head>
@@ -16,34 +16,38 @@
     <div id="app">
         <!-- 顶部标题栏 -->
         <header id="header">
-            <h1><img src="/icon.png" alt="" width="24" height="24" style="vertical-align: middle; margin-right: 6px;">VibeDrop</h1>
-            <button id="nav-settings-btn" class="icon-btn" title="设置">⚙️</button>
+            <div class="header-title-group">
+                <h1><img class="header-icon" src="/icon.png" alt="" width="28" height="28">VibeDrop</h1>
+            </div>
+            <button id="nav-settings-btn" class="icon-btn settings-btn" title="设置">设置</button>
         </header>
 
         <!-- 设置页面 -->
         <section id="settings-view" class="view">
             <div class="settings-header">
-                <button id="settings-back-btn" class="icon-btn" title="返回">← 返回</button>
-                <h2>连接设置</h2>
+                <button id="settings-back-btn" class="icon-btn back-btn" title="返回">返回</button>
+                <div class="settings-title-group">
+                    <h2>连接设置</h2>
+                    <p class="hint">添加你的 Mac 设备，填写局域网 IP、端口和 PIN。</p>
+                </div>
             </div>
-            <p class="hint">添加你的 Mac 设备，填写局域网 IP 和 PIN 码</p>
 
             <!-- 动态设备卡片容器 -->
             <div id="device-cards"></div>
 
-            <button id="add-device-btn" class="secondary-btn" style="width:100%;margin-bottom:12px">＋ 添加设备</button>
+            <button id="add-device-btn" class="secondary-btn stack-action">添加设备</button>
 
-            <button id="test-connection-btn" class="secondary-btn">🔍 测试连接</button>
+            <button id="test-connection-btn" class="secondary-btn">测试连接</button>
             <div id="test-result" class="test-result" style="display:none"></div>
-            <button id="save-settings-btn" class="primary-btn">💾 保存并连接</button>
+            <button id="save-settings-btn" class="primary-btn">保存并连接</button>
 
-            <div class="settings-card" style="margin-top:16px">
+            <div class="settings-card data-card">
                 <h3>数据管理</h3>
                 <div class="history-actions">
-                    <button id="import-history-btn" class="secondary-btn">📤 导入历史</button>
-                    <button id="export-history-btn" class="secondary-btn">📥 导出历史</button>
-                    <button id="share-history-btn" class="secondary-btn">📨 分享历史</button>
-                    <button id="clear-history-btn" class="danger-btn">🗑 清空历史</button>
+                    <button id="import-history-btn" class="secondary-btn">导入历史</button>
+                    <button id="export-history-btn" class="secondary-btn">导出历史</button>
+                    <button id="share-history-btn" class="secondary-btn">分享历史</button>
+                    <button id="clear-history-btn" class="danger-btn">清空历史</button>
                 </div>
                 <input type="file" id="import-file-input" accept=".json" style="display:none">
                 <div id="import-result" class="test-result" style="display:none"></div>
@@ -71,11 +75,9 @@
         <!-- 底部导航栏 -->
         <nav id="bottom-nav">
             <button class="nav-btn active" data-view="send-view" id="nav-send-btn">
-                <span class="nav-icon">📝</span>
                 <span class="nav-label">发送</span>
             </button>
             <button class="nav-btn" data-view="history-view" id="nav-history-btn">
-                <span class="nav-icon">📋</span>
                 <span class="nav-label">历史</span>
             </button>
         </nav>
