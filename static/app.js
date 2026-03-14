@@ -16,12 +16,30 @@ const connections = {}; // key = device.id, value = { ws, authenticated, hostnam
 const $ = (id) => document.getElementById(id);
 
 // ---- 初始化 ----
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+    await loadPersistentHistory(); // 从文件恢复历史（优先于 localStorage）
     loadSettings();
     initNavigation();
     initSettingsButton();
     initHistoryActions();
 });
+
+// ---- 持久化存储（Tauri 文件系统）----
+async function loadPersistentHistory() {
+    if (!window.__TAURI__) return;
+    try {
+        const data = await window.__TAURI__.core.invoke('load_history');
+        if (data && data !== '[]') {
+            localStorage.setItem(HISTORY_KEY, data);
+        }
+    } catch (e) { console.log('加载持久化历史失败:', e); }
+}
+
+function persistHistory() {
+    if (!window.__TAURI__) return;
+    const data = localStorage.getItem(HISTORY_KEY) || '[]';
+    window.__TAURI__.core.invoke('save_history', { data }).catch(() => {});
+}
 
 // ============================================
 // 设备管理
@@ -626,6 +644,7 @@ function addHistory(entry) {
     const history = getHistory();
     history.unshift(entry);
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    persistHistory();
 }
 
 function exportHistory() {
@@ -634,13 +653,37 @@ function exportHistory() {
         showToast('暂无历史可导出');
         return;
     }
-    const blob = new Blob([JSON.stringify(history, null, 2)], { type: 'application/json' });
+    const data = JSON.stringify(history, null, 2);
+    const now = new Date();
+    const ts = now.getFullYear()
+        + '-' + String(now.getMonth() + 1).padStart(2, '0')
+        + '-' + String(now.getDate()).padStart(2, '0')
+        + '_' + String(now.getHours()).padStart(2, '0')
+        + '-' + String(now.getMinutes()).padStart(2, '0')
+        + '-' + String(now.getSeconds()).padStart(2, '0');
+    const filename = `vibedrop_history_${ts}.json`;
+
+    // 方案 1：Tauri 原生写文件到 Download 目录
+    if (window.__TAURI__) {
+        window.__TAURI__.core.invoke('export_history_file', { filename, data })
+            .then((path) => {
+                showToast(`✅ 已保存到 Download/${filename}`);
+            })
+            .catch((err) => {
+                showToast('❌ 导出失败: ' + err);
+            });
+        return;
+    }
+
+    // 方案 2：浏览器下载
+    const blob = new Blob([data], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `vibedrop_history_${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+    showToast('✅ 导出成功');
 }
 
 function updateHistory(entry) {
@@ -649,11 +692,13 @@ function updateHistory(entry) {
     if (idx !== -1) {
         history[idx] = entry;
         localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+        persistHistory();
     }
 }
 
 function clearHistory() {
     localStorage.removeItem(HISTORY_KEY);
+    persistHistory();
     renderHistory();
 }
 
@@ -723,6 +768,7 @@ function importHistory(file) {
 
             existing.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
             localStorage.setItem(HISTORY_KEY, JSON.stringify(existing));
+            persistHistory();
 
             resultDiv.innerHTML = `✅ 导入 ${added} 条，跳过 ${skipped} 条重复`;
             resultDiv.style.color = '#00d68f';
@@ -792,11 +838,22 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// ---- 剪贴板写入（Tauri 原生优先，浏览器 API 兜底）----
+// ---- 剪贴板写入（透明 Activity 优先 → Tauri 原生 → 浏览器 API）----
 async function writeClipboard(text) {
+    // 方案 1：透明 Activity 写入（绕过 Android 后台限制）
+    if (window.NativeClipboard) {
+        try {
+            window.NativeClipboard.writeText(text);
+            return; // 透明 Activity 是异步的，无法等结果，但成功率最高
+        } catch (e) {
+            console.warn('NativeClipboard 调用失败，降级到 Tauri 插件', e);
+        }
+    }
+    // 方案 2：Tauri 原生插件
     if (window.__TAURI__ && window.__TAURI__.clipboardManager) {
         return window.__TAURI__.clipboardManager.writeText(text);
     }
+    // 方案 3：浏览器 API
     if (navigator.clipboard) {
         return navigator.clipboard.writeText(text);
     }
