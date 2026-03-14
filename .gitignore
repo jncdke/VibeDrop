@@ -1,3 +1,10 @@
 target/
 node_modules/
 .DS_Store
+*.apk
+*.idsig
+
+# Android build artifacts
+.gradle/
+build/
+local.properties

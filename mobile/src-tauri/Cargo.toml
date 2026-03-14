@@ -1,0 +1,19 @@
+[package]
+name = "vibedrop-mobile"
+version = "0.1.0"
+description = "VibeDrop Mobile Client"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tauri = { version = "2.10.3", features = [] }
+tauri-plugin-clipboard-manager = "2"
