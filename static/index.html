@@ -66,9 +66,12 @@
             <div class="settings-card" style="margin-top:16px">
                 <h3>数据管理</h3>
                 <div class="history-actions">
+                    <button id="import-history-btn" class="secondary-btn">📤 导入历史</button>
                     <button id="export-history-btn" class="secondary-btn">📥 导出历史</button>
                     <button id="clear-history-btn" class="danger-btn">🗑 清空历史</button>
                 </div>
+                <input type="file" id="import-file-input" accept=".json" style="display:none">
+                <div id="import-result" class="test-result" style="display:none"></div>
             </div>
         </section>
 

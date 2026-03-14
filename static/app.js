@@ -534,6 +534,69 @@ function initHistoryFilter() {
     if (exportBtn) {
         exportBtn.addEventListener('click', () => exportHistory());
     }
+
+    // 导入按钮
+    const importBtn = $('import-history-btn');
+    const importInput = $('import-file-input');
+    if (importBtn && importInput) {
+        importBtn.addEventListener('click', () => importInput.click());
+        importInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                importHistory(e.target.files[0]);
+                e.target.value = ''; // 清空以便再次选择同文件
+            }
+        });
+    }
+}
+
+function importHistory(file) {
+    const resultDiv = $('import-result');
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '⏳ 正在导入...';
+    resultDiv.style.color = '#a0a0c0';
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        try {
+            const imported = JSON.parse(e.target.result);
+            if (!Array.isArray(imported)) {
+                resultDiv.innerHTML = '❌ 文件格式错误（需要 JSON 数组）';
+                resultDiv.style.color = '#ff6b6b';
+                return;
+            }
+
+            const existing = getHistory();
+            // 用 timestamp+text 做去重 key
+            const existingKeys = new Set(
+                existing.map(h => `${h.timestamp}|${h.text}`)
+            );
+
+            let added = 0;
+            let skipped = 0;
+
+            for (const entry of imported) {
+                const key = `${entry.timestamp}|${entry.text}`;
+                if (existingKeys.has(key)) {
+                    skipped++;
+                } else {
+                    existing.push(entry);
+                    existingKeys.add(key);
+                    added++;
+                }
+            }
+
+            // 按时间倒序排列
+            existing.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+            localStorage.setItem(HISTORY_KEY, JSON.stringify(existing));
+
+            resultDiv.innerHTML = `✅ 导入 ${added} 条，跳过 ${skipped} 条重复`;
+            resultDiv.style.color = '#00d68f';
+        } catch (err) {
+            resultDiv.innerHTML = `❌ 解析失败: ${err.message}`;
+            resultDiv.style.color = '#ff6b6b';
+        }
+    };
+    reader.readAsText(file);
 }
 
 function renderHistory() {
