@@ -157,6 +157,43 @@ body {
     color: var(--accent);
 }
 
+.device-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.device-name-input {
+    flex: 1;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    padding: 8px 12px;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.device-delete-btn {
+    border: none;
+    background: rgba(255,107,107,0.15);
+    color: #ff6b6b;
+    border-radius: var(--radius);
+    padding: 6px 10px;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.device-delete-btn:active {
+    background: rgba(255,107,107,0.3);
+}
+
+.danger-btn-sm {
+    font-size: 13px;
+    padding: 4px 8px;
+}
+
 .setting-row {
     display: flex;
     align-items: center;

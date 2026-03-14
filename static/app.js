@@ -1,80 +1,261 @@
 // ============================================
-// VibeDrop — 前端逻辑
+// VibeDrop — 前端逻辑（动态多设备版）
 // ============================================
 
 // ---- 常量 ----
-const HEARTBEAT_INTERVAL = 5000; // 心跳间隔 5 秒
-const HEARTBEAT_TIMEOUT = 10000; // 心跳超时 10 秒
-const RECONNECT_INTERVAL = 3000; // 重连间隔 3 秒
+const HEARTBEAT_INTERVAL = 5000;
+const HEARTBEAT_TIMEOUT = 10000;
+const RECONNECT_INTERVAL = 3000;
 const HISTORY_KEY = 'voicedrop_history';
 const SETTINGS_KEY = 'voicedrop_settings';
 
-
 // ---- 状态 ----
-const connections = {
-    mac1: { ws: null, authenticated: false, hostname: null, heartbeatTimer: null, timeoutTimer: null, reconnectTimer: null },
-    mac2: { ws: null, authenticated: false, hostname: null, heartbeatTimer: null, timeoutTimer: null, reconnectTimer: null },
-};
+const connections = {}; // key = device.id, value = { ws, authenticated, hostname, ... }
 
-// ---- DOM 元素缓存 ----
+// ---- DOM 缓存 ----
 const $ = (id) => document.getElementById(id);
 
 // ---- 初始化 ----
 document.addEventListener('DOMContentLoaded', () => {
     loadSettings();
     initNavigation();
-    initSendButtons();
-    initHistoryFilter();
     initSettingsButton();
+    initHistoryActions();
 });
+
+// ============================================
+// 设备管理
+// ============================================
+
+function getDevices() {
+    const saved = localStorage.getItem(SETTINGS_KEY);
+    if (!saved) return [];
+    const settings = JSON.parse(saved);
+
+    // 向后兼容：旧格式 mac1Ip/mac2Ip → 新格式 devices[]
+    if (!settings.devices) {
+        const devices = [];
+        if (settings.mac1Ip) {
+            devices.push({
+                id: 'dev_migrated_1',
+                name: '设备 1',
+                ip: settings.mac1Ip,
+                port: settings.mac1Port || '9001',
+                pin: settings.mac1Pin || ''
+            });
+        }
+        if (settings.mac2Ip) {
+            devices.push({
+                id: 'dev_migrated_2',
+                name: '设备 2',
+                ip: settings.mac2Ip,
+                port: settings.mac2Port || '9001',
+                pin: settings.mac2Pin || ''
+            });
+        }
+        if (devices.length > 0) {
+            saveDevices(devices);
+        }
+        return devices;
+    }
+
+    return settings.devices;
+}
+
+function saveDevices(devices) {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ devices }));
+}
+
+function newDeviceId() {
+    return 'dev_' + Date.now();
+}
+
+function ensureConnection(deviceId) {
+    if (!connections[deviceId]) {
+        connections[deviceId] = {
+            ws: null, authenticated: false, hostname: null,
+            heartbeatTimer: null, timeoutTimer: null, reconnectTimer: null,
+            _sendCallback: null
+        };
+    }
+    return connections[deviceId];
+}
 
 // ============================================
 // 设置管理
 // ============================================
 
 function loadSettings() {
-    const saved = localStorage.getItem(SETTINGS_KEY);
-    if (saved) {
-        const settings = JSON.parse(saved);
-        $('mac1-ip').value = settings.mac1Ip || '';
-        $('mac1-port').value = settings.mac1Port || '9001';
-        $('mac1-pin').value = settings.mac1Pin || '';
-        $('mac2-ip').value = settings.mac2Ip || '';
-        $('mac2-port').value = settings.mac2Port || '9001';
-        $('mac2-pin').value = settings.mac2Pin || '';
+    const devices = getDevices();
 
-        // 如果有保存过设置，直接跳到发送页并连接
-        if (settings.mac1Ip || settings.mac2Ip) {
-            showView('send-view');
-            connectAll();
-        }
+    if (devices.length > 0) {
+        renderDeviceCards(devices);
+        renderSendCards(devices);
+        renderHistoryFilters(devices);
+        showView('send-view');
+        connectAll();
     } else {
-        // 首次打开：自动从当前页面 URL 获取 Mac 的 IP 和端口
+        // 首次打开：创建一个空设备
+        const defaultDevices = [{ id: newDeviceId(), name: '设备 1', ip: '', port: '9001', pin: '' }];
+
+        // 自动填充当前页面的 host（浏览器模式）
         const currentHost = window.location.hostname;
         const currentPort = window.location.port || '9001';
         if (currentHost && currentHost !== 'localhost' && currentHost !== '127.0.0.1') {
-            $('mac1-ip').value = currentHost;
-            $('mac1-port').value = currentPort;
+            defaultDevices[0].ip = currentHost;
+            defaultDevices[0].port = currentPort;
         }
+
+        renderDeviceCards(defaultDevices);
+        renderSendCards(defaultDevices);
+        renderHistoryFilters(defaultDevices);
     }
 }
 
-function saveSettings() {
-    const settings = {
-        mac1Ip: $('mac1-ip').value.trim(),
-        mac1Port: $('mac1-port').value.trim() || '9001',
-        mac1Pin: $('mac1-pin').value.trim(),
-        mac2Ip: $('mac2-ip').value.trim(),
-        mac2Port: $('mac2-port').value.trim() || '9001',
-        mac2Pin: $('mac2-pin').value.trim(),
-    };
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-    return settings;
+function saveSettingsFromUI() {
+    const cards = document.querySelectorAll('#device-cards .settings-card');
+    const devices = [];
+    cards.forEach(card => {
+        devices.push({
+            id: card.dataset.deviceId,
+            name: card.querySelector('.device-name-input').value.trim() || '未命名设备',
+            ip: card.querySelector('.device-ip-input').value.trim(),
+            port: card.querySelector('.device-port-input').value.trim() || '9001',
+            pin: card.querySelector('.device-pin-input').value.trim(),
+        });
+    });
+    saveDevices(devices);
+    return devices;
 }
 
-function getSettings() {
-    const saved = localStorage.getItem(SETTINGS_KEY);
-    return saved ? JSON.parse(saved) : {};
+function getDevicesFromUI() {
+    const cards = document.querySelectorAll('#device-cards .settings-card');
+    const devices = [];
+    cards.forEach(card => {
+        devices.push({
+            id: card.dataset.deviceId,
+            name: card.querySelector('.device-name-input').value.trim() || '未命名设备',
+            ip: card.querySelector('.device-ip-input').value.trim(),
+            port: card.querySelector('.device-port-input').value.trim() || '9001',
+            pin: card.querySelector('.device-pin-input').value.trim(),
+        });
+    });
+    return devices;
+}
+
+// ============================================
+// 动态渲染 — 设置页设备卡片
+// ============================================
+
+function renderDeviceCards(devices) {
+    const container = $('device-cards');
+    container.innerHTML = '';
+
+    devices.forEach((dev, i) => {
+        const card = document.createElement('div');
+        card.className = 'settings-card';
+        card.dataset.deviceId = dev.id;
+        card.innerHTML = `
+            <div class="device-card-header">
+                <input type="text" class="device-name-input" value="${escapeHtml(dev.name)}" placeholder="设备名称">
+                <button class="device-delete-btn danger-btn-sm" title="删除">🗑</button>
+            </div>
+            <div class="setting-row">
+                <label>IP 地址</label>
+                <input type="text" class="device-ip-input" value="${escapeHtml(dev.ip)}" placeholder="192.168.1.10">
+            </div>
+            <div class="setting-row">
+                <label>端口</label>
+                <input type="number" class="device-port-input" value="${escapeHtml(dev.port)}" placeholder="9001">
+            </div>
+            <div class="setting-row">
+                <label>PIN 码</label>
+                <input type="text" class="device-pin-input" value="${escapeHtml(dev.pin)}" placeholder="输入 PIN">
+            </div>
+        `;
+        container.appendChild(card);
+
+        // 删除按钮
+        card.querySelector('.device-delete-btn').addEventListener('click', () => {
+            const allCards = document.querySelectorAll('#device-cards .settings-card');
+            if (allCards.length <= 1) {
+                showToast('⚠️ 至少保留一个设备');
+                return;
+            }
+            if (confirm(`确定删除"${dev.name}"？`)) {
+                card.remove();
+            }
+        });
+    });
+}
+
+// ============================================
+// 动态渲染 — 发送页
+// ============================================
+
+function renderSendCards(devices) {
+    const container = $('send-cards');
+    container.innerHTML = '';
+
+    devices.forEach(dev => {
+        if (!dev.ip) return; // 未配置的设备不显示
+
+        const card = document.createElement('div');
+        card.className = 'mac-card';
+        card.id = `card-${dev.id}`;
+        card.innerHTML = `
+            <div class="mac-header">
+                <span class="status-dot" id="dot-${dev.id}"></span>
+                <span class="mac-name" id="name-${dev.id}">${escapeHtml(dev.name)}</span>
+                <span class="status-text" id="status-${dev.id}">未连接</span>
+            </div>
+            <div class="input-group">
+                <textarea id="input-${dev.id}" placeholder="输入要发送的文字..." rows="3"></textarea>
+                <button class="send-btn" id="sendbtn-${dev.id}" disabled>发送</button>
+            </div>
+        `;
+        container.appendChild(card);
+
+        // 发送按钮
+        const btn = card.querySelector('.send-btn');
+        const input = card.querySelector('textarea');
+
+        btn.addEventListener('click', () => sendText(dev.id));
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendText(dev.id);
+            }
+        });
+    });
+}
+
+// ============================================
+// 动态渲染 — 历史筛选按钮
+// ============================================
+
+function renderHistoryFilters(devices) {
+    const container = $('history-filter-btns');
+    container.innerHTML = '<button class="filter-btn active" data-filter="all">全部</button>';
+
+    devices.forEach(dev => {
+        if (!dev.ip) return;
+        const btn = document.createElement('button');
+        btn.className = 'filter-btn';
+        btn.dataset.filter = dev.id;
+        btn.textContent = dev.name;
+        container.appendChild(btn);
+    });
+
+    // 绑定事件
+    container.querySelectorAll('.filter-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            container.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentFilter = btn.dataset.filter;
+            renderHistory();
+        });
+    });
 }
 
 // ============================================
@@ -94,25 +275,42 @@ function initNavigation() {
 
 function initSettingsButton() {
     $('nav-settings-btn').addEventListener('click', () => {
+        // 进入设置时重新加载设备卡片（丢弃未保存的更改）
+        const devices = getDevices();
+        if (devices.length === 0) {
+            renderDeviceCards([{ id: newDeviceId(), name: '设备 1', ip: '', port: '9001', pin: '' }]);
+        } else {
+            renderDeviceCards(devices);
+        }
         showView('settings-view');
         document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
     });
 
     // 返回按钮（不保存）
     $('settings-back-btn').addEventListener('click', () => {
-        loadSettings(); // 恢复原来的值，丢弃修改
         showView('send-view');
         $('nav-send-btn').classList.add('active');
     });
 
-    // 测试连接（不保存，只测试当前填写的值）
+    // 添加设备
+    $('add-device-btn').addEventListener('click', () => {
+        const current = getDevicesFromUI();
+        const newDev = { id: newDeviceId(), name: `设备 ${current.length + 1}`, ip: '', port: '9001', pin: '' };
+        current.push(newDev);
+        renderDeviceCards(current);
+    });
+
+    // 测试连接
     $('test-connection-btn').addEventListener('click', () => {
         testConnection();
     });
 
+    // 保存并连接
     $('save-settings-btn').addEventListener('click', () => {
-        saveSettings();
+        const devices = saveSettingsFromUI();
         disconnectAll();
+        renderSendCards(devices);
+        renderHistoryFilters(devices);
         showView('send-view');
         $('nav-send-btn').classList.add('active');
         connectAll();
@@ -125,41 +323,31 @@ function testConnection() {
     resultDiv.innerHTML = '⏳ 正在测试...';
     resultDiv.style.color = '#a0a0c0';
 
-    const ip1 = $('mac1-ip').value.trim();
-    const port1 = $('mac1-port').value.trim() || '9001';
-    const pin1 = $('mac1-pin').value.trim();
-    const ip2 = $('mac2-ip').value.trim();
-    const port2 = $('mac2-port').value.trim() || '9001';
-    const pin2 = $('mac2-pin').value.trim();
+    const devices = getDevicesFromUI();
 
-    let results = [];
-
-    function testOne(name, ip, port, pin) {
+    function testOne(dev) {
         return new Promise((resolve) => {
-            if (!ip) { resolve(`${name}: ⏭ 未配置`); return; }
-            const ws = new WebSocket(`ws://${ip}:${port}/ws`);
-            const timeout = setTimeout(() => { ws.close(); resolve(`${name}: ❌ 连接超时`); }, 3000);
+            if (!dev.ip) { resolve(`${dev.name}: ⏭ 未配置`); return; }
+            const ws = new WebSocket(`ws://${dev.ip}:${dev.port}/ws`);
+            const timeout = setTimeout(() => { ws.close(); resolve(`${dev.name}: ❌ 连接超时`); }, 3000);
             ws.onopen = () => {
-                ws.send(JSON.stringify({ action: 'auth', pin }));
+                ws.send(JSON.stringify({ action: 'auth', pin: dev.pin }));
             };
             ws.onmessage = (e) => {
                 clearTimeout(timeout);
                 const data = JSON.parse(e.data);
                 ws.close();
                 if (data.status === 'ok') {
-                    resolve(`${name}: ✅ 连接成功 (${data.hostname})`);
+                    resolve(`${dev.name}: ✅ 连接成功 (${data.hostname})`);
                 } else {
-                    resolve(`${name}: ❌ ${data.error || 'PIN 错误'}`);
+                    resolve(`${dev.name}: ❌ ${data.error || 'PIN 错误'}`);
                 }
             };
-            ws.onerror = () => { clearTimeout(timeout); resolve(`${name}: ❌ 无法连接`); };
+            ws.onerror = () => { clearTimeout(timeout); resolve(`${dev.name}: ❌ 无法连接`); };
         });
     }
 
-    Promise.all([
-        testOne('Mac 1', ip1, port1, pin1),
-        testOne('Mac 2', ip2, port2, pin2),
-    ]).then(res => {
+    Promise.all(devices.map(d => testOne(d))).then(res => {
         resultDiv.innerHTML = res.join('<br>');
         resultDiv.style.color = '#e0e0ff';
     });
@@ -168,7 +356,6 @@ function testConnection() {
 function showView(viewId) {
     document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
     $(viewId).classList.remove('hidden');
-
     if (viewId === 'history-view') {
         renderHistory();
     }
@@ -179,17 +366,16 @@ function showView(viewId) {
 // ============================================
 
 function connectAll() {
-    const settings = getSettings();
-    if (settings.mac1Ip) {
-        connectMac('mac1', settings.mac1Ip, settings.mac1Port || '9001', settings.mac1Pin || '');
-    }
-    if (settings.mac2Ip) {
-        connectMac('mac2', settings.mac2Ip, settings.mac2Port || '9001', settings.mac2Pin || '');
-    }
+    const devices = getDevices();
+    devices.forEach(dev => {
+        if (dev.ip) {
+            connectDevice(dev.id, dev.ip, dev.port || '9001', dev.pin || '');
+        }
+    });
 }
 
 function disconnectAll() {
-    ['mac1', 'mac2'].forEach(id => {
+    Object.keys(connections).forEach(id => {
         const conn = connections[id];
         clearTimers(conn);
         if (conn.ws) {
@@ -198,58 +384,50 @@ function disconnectAll() {
         }
         conn.authenticated = false;
         conn.hostname = null;
-        updateMacUI(id, 'disconnected');
+        updateDeviceUI(id, 'disconnected');
     });
 }
 
-function connectMac(macId, ip, port, pin) {
-    const conn = connections[macId];
+function connectDevice(deviceId, ip, port, pin) {
+    const conn = ensureConnection(deviceId);
 
-    // 清理旧连接
     clearTimers(conn);
     if (conn.ws) {
         conn.ws.close();
     }
     conn.authenticated = false;
 
-    updateMacUI(macId, 'connecting');
+    updateDeviceUI(deviceId, 'connecting');
 
     const url = `ws://${ip}:${port}/ws`;
-    console.log(`[${macId}] 正在连接: ${url}`);
+    console.log(`[${deviceId}] 正在连接: ${url}`);
     let ws;
     try {
         ws = new WebSocket(url);
     } catch (e) {
-        console.error(`[${macId}] WebSocket 创建失败:`, e);
-        updateMacUI(macId, 'error', '连接失败');
-        scheduleReconnect(macId, ip, port, pin);
+        console.error(`[${deviceId}] WebSocket 创建失败:`, e);
+        updateDeviceUI(deviceId, 'error', '连接失败');
+        scheduleReconnect(deviceId, ip, port, pin);
         return;
     }
 
     conn.ws = ws;
 
     ws.onopen = () => {
-        console.log(`[${macId}] WebSocket 已连接，发送 PIN 认证`);
+        console.log(`[${deviceId}] WebSocket 已连接，发送 PIN 认证`);
         ws.send(JSON.stringify({ action: 'auth', pin: pin }));
-        updateMacUI(macId, 'connecting', '认证中...');
+        updateDeviceUI(deviceId, 'connecting', '认证中...');
     };
 
     ws.onmessage = (event) => {
-        console.log(`[${macId}] 收到消息:`, event.data);
         let data;
-        try {
-            data = JSON.parse(event.data);
-        } catch {
-            return;
-        }
+        try { data = JSON.parse(event.data); } catch { return; }
 
-        // 心跳响应
         if (data.action === 'pong') {
             clearTimeout(conn.timeoutTimer);
             return;
         }
 
-        // 剪贴板同步（Mac → 手机）
         if (data.action === 'clipboard') {
             if (data.text) {
                 writeClipboard(data.text).then(() => {
@@ -261,68 +439,58 @@ function connectMac(macId, ip, port, pin) {
             return;
         }
 
-        // 认证响应
         if (!conn.authenticated) {
             if (data.status === 'ok' && data.hostname) {
                 conn.authenticated = true;
                 conn.hostname = data.hostname;
-                console.log(`[${macId}] 认证成功，主机名: ${data.hostname}`);
-                updateMacUI(macId, 'connected', data.hostname);
-                startHeartbeat(macId, ip, port, pin);
+                updateDeviceUI(deviceId, 'connected', data.hostname);
+                startHeartbeat(deviceId, ip, port, pin);
             } else {
-                console.warn(`[${macId}] 认证失败:`, data.error);
-                updateMacUI(macId, 'error', data.error || 'PIN 错误');
+                updateDeviceUI(deviceId, 'error', data.error || 'PIN 错误');
             }
             return;
         }
 
-        // 发送结果响应（通过回调处理）
         if (conn._sendCallback) {
             conn._sendCallback(data);
             conn._sendCallback = null;
         }
     };
 
-    ws.onerror = (e) => {
-        console.error(`[${macId}] WebSocket 错误:`, e);
-        updateMacUI(macId, 'error', '连接出错');
+    ws.onerror = () => {
+        updateDeviceUI(deviceId, 'error', '连接出错');
     };
 
-    ws.onclose = (e) => {
-        console.log(`[${macId}] WebSocket 关闭, code=${e.code}, reason=${e.reason}`);
+    ws.onclose = () => {
         conn.authenticated = false;
-        updateMacUI(macId, 'disconnected', '已断开');
+        updateDeviceUI(deviceId, 'disconnected', '已断开');
         clearTimers(conn);
-        scheduleReconnect(macId, ip, port, pin);
+        scheduleReconnect(deviceId, ip, port, pin);
     };
 }
 
 // ---- 心跳 ----
 
-function startHeartbeat(macId, ip, port, pin) {
-    const conn = connections[macId];
+function startHeartbeat(deviceId, ip, port, pin) {
+    const conn = connections[deviceId];
     clearTimers(conn);
 
     conn.heartbeatTimer = setInterval(() => {
         if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
             conn.ws.send(JSON.stringify({ action: 'ping' }));
-
-            // 设置超时检测
             conn.timeoutTimer = setTimeout(() => {
-                // 心跳超时，关闭连接触发重连
-                if (conn.ws) {
-                    conn.ws.close();
-                }
+                if (conn.ws) conn.ws.close();
             }, HEARTBEAT_TIMEOUT);
         }
     }, HEARTBEAT_INTERVAL);
 }
 
-function scheduleReconnect(macId, ip, port, pin) {
-    const conn = connections[macId];
+function scheduleReconnect(deviceId, ip, port, pin) {
+    const conn = connections[deviceId];
+    if (!conn) return;
     clearTimeout(conn.reconnectTimer);
     conn.reconnectTimer = setTimeout(() => {
-        connectMac(macId, ip, port, pin);
+        connectDevice(deviceId, ip, port, pin);
     }, RECONNECT_INTERVAL);
 }
 
@@ -337,14 +505,15 @@ function clearTimers(conn) {
 
 // ---- UI 更新 ----
 
-function updateMacUI(macId, status, detail) {
-    const dot = $(`${macId}-status-dot`);
-    const name = $(`${macId}-name`);
-    const text = $(`${macId}-status-text`);
-    const card = $(`${macId}-card`);
-    const sendBtn = $(`${macId}-send-btn`);
+function updateDeviceUI(deviceId, status, detail) {
+    const dot = $(`dot-${deviceId}`);
+    const name = $(`name-${deviceId}`);
+    const text = $(`status-${deviceId}`);
+    const card = $(`card-${deviceId}`);
+    const sendBtn = $(`sendbtn-${deviceId}`);
 
-    // 清除所有状态类
+    if (!dot || !card) return; // 设备卡片可能不存在
+
     dot.className = 'status-dot';
     card.className = 'mac-card';
 
@@ -379,55 +548,38 @@ function updateMacUI(macId, status, detail) {
 // 发送文字
 // ============================================
 
-function initSendButtons() {
-    ['mac1', 'mac2'].forEach(macId => {
-        const btn = $(`${macId}-send-btn`);
-        const input = $(`${macId}-input`);
-
-        btn.addEventListener('click', () => sendText(macId));
-
-        // 可选：按 Enter 发送（Shift+Enter 换行）
-        input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                sendText(macId);
-            }
-        });
-    });
-}
-
-async function sendText(macId) {
-    const conn = connections[macId];
-    const input = $(`${macId}-input`);
-    const btn = $(`${macId}-send-btn`);
+async function sendText(deviceId) {
+    const conn = connections[deviceId];
+    const input = $(`input-${deviceId}`);
+    const btn = $(`sendbtn-${deviceId}`);
     const text = input.value.trim();
 
-    if (!text || !conn.authenticated || !conn.ws) return;
+    if (!text || !conn || !conn.authenticated || !conn.ws) return;
 
-    // 按钮动画
     btn.classList.add('sending');
     btn.disabled = true;
     const originalText = btn.textContent;
     btn.textContent = '发送中...';
 
-    // 记录到本地历史（先记录，确保不丢）
+    // 查找设备名称
+    const devices = getDevices();
+    const dev = devices.find(d => d.id === deviceId);
+    const targetName = conn.hostname || (dev ? dev.name : deviceId);
+
     const historyEntry = {
         id: Date.now(),
         timestamp: new Date().toISOString(),
         text: text,
-        target: macId,
-        targetName: conn.hostname || macId,
+        target: deviceId,
+        targetName: targetName,
         status: 'pending',
     };
     addHistory(historyEntry);
 
-    // 发送
     try {
         const result = await new Promise((resolve, reject) => {
             conn._sendCallback = resolve;
             conn.ws.send(JSON.stringify({ action: 'type', text: text }));
-
-            // 超时
             setTimeout(() => {
                 if (conn._sendCallback) {
                     conn._sendCallback = null;
@@ -452,10 +604,8 @@ async function sendText(macId) {
         btn.textContent = '✗';
     }
 
-    // 更新历史记录状态
     updateHistory(historyEntry);
 
-    // 恢复按钮
     setTimeout(() => {
         btn.classList.remove('sending', 'success', 'fail');
         btn.textContent = originalText;
@@ -481,16 +631,14 @@ function addHistory(entry) {
 function exportHistory() {
     const history = getHistory();
     if (history.length === 0) {
-        alert('没有历史记录可导出');
+        showToast('暂无历史可导出');
         return;
     }
-    const data = JSON.stringify(history, null, 2);
-    const blob = new Blob([data], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify(history, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    const time = new Date().toISOString().slice(0, 10);
     a.href = url;
-    a.download = `vibedrop_history_${time}.json`;
+    a.download = `vibedrop_history_${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
 }
@@ -513,29 +661,18 @@ function clearHistory() {
 
 let currentFilter = 'all';
 
-function initHistoryFilter() {
-    document.querySelectorAll('.filter-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            currentFilter = btn.dataset.filter;
-            renderHistory();
-        });
-    });
-
+function initHistoryActions() {
     $('clear-history-btn').addEventListener('click', () => {
         if (confirm('确定清空所有发送历史？')) {
             clearHistory();
         }
     });
 
-    // 导出按钮
     const exportBtn = $('export-history-btn');
     if (exportBtn) {
         exportBtn.addEventListener('click', () => exportHistory());
     }
 
-    // 导入按钮
     const importBtn = $('import-history-btn');
     const importInput = $('import-file-input');
     if (importBtn && importInput) {
@@ -543,7 +680,7 @@ function initHistoryFilter() {
         importInput.addEventListener('change', (e) => {
             if (e.target.files.length > 0) {
                 importHistory(e.target.files[0]);
-                e.target.value = ''; // 清空以便再次选择同文件
+                e.target.value = '';
             }
         });
     }
@@ -566,7 +703,6 @@ function importHistory(file) {
             }
 
             const existing = getHistory();
-            // 用 timestamp+text 做去重 key
             const existingKeys = new Set(
                 existing.map(h => `${h.timestamp}|${h.text}`)
             );
@@ -585,7 +721,6 @@ function importHistory(file) {
                 }
             }
 
-            // 按时间倒序排列
             existing.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
             localStorage.setItem(HISTORY_KEY, JSON.stringify(existing));
 
@@ -601,19 +736,19 @@ function importHistory(file) {
 
 function renderHistory() {
     const list = $('history-list');
-    let history = getHistory();
+    if (!list) return;
+    const history = getHistory();
 
-    // 筛选
-    if (currentFilter !== 'all') {
-        history = history.filter(h => h.target === currentFilter);
-    }
+    const filtered = currentFilter === 'all'
+        ? history
+        : history.filter(h => h.target === currentFilter);
 
-    if (history.length === 0) {
+    if (filtered.length === 0) {
         list.innerHTML = '<p class="empty-hint">暂无发送记录</p>';
         return;
     }
 
-    list.innerHTML = history.map((h, i) => {
+    list.innerHTML = filtered.map((h, i) => {
         const time = formatTime(h.timestamp);
         const statusIcon = h.status === 'success' ? '✅' : h.status === 'failed' ? '❌' : '⏳';
         return `
@@ -631,7 +766,7 @@ function renderHistory() {
     // 点击复制
     list.querySelectorAll('.history-item').forEach((item, i) => {
         item.addEventListener('click', () => {
-            const text = history[i].text;
+            const text = filtered[i].text;
             writeClipboard(text).then(() => {
                 showToast('已复制 ✓');
             }).catch(() => {
@@ -645,13 +780,8 @@ function formatTime(isoString) {
     const d = new Date(isoString);
     const now = new Date();
     const isToday = d.toDateString() === now.toDateString();
-
     const time = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-
-    if (isToday) {
-        return `今天 ${time}`;
-    }
-
+    if (isToday) return `今天 ${time}`;
     const date = d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
     return `${date} ${time}`;
 }
@@ -664,11 +794,9 @@ function escapeHtml(text) {
 
 // ---- 剪贴板写入（Tauri 原生优先，浏览器 API 兜底）----
 async function writeClipboard(text) {
-    // Tauri 原生插件（不受前台/聚焦限制）
     if (window.__TAURI__ && window.__TAURI__.clipboardManager) {
         return window.__TAURI__.clipboardManager.writeText(text);
     }
-    // 浏览器 API 兜底（需要页面聚焦）
     if (navigator.clipboard) {
         return navigator.clipboard.writeText(text);
     }
@@ -684,7 +812,6 @@ function showToast(message) {
         toast.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:rgba(108,92,231,0.95);color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;z-index:9999;transition:opacity 0.15s;pointer-events:none;';
         document.body.appendChild(toast);
     }
-    // 先隐藏再显示，让用户明确知道点了新的一条
     toast.style.opacity = '0';
     clearTimeout(toast._timer);
     clearTimeout(toast._showTimer);
@@ -697,5 +824,5 @@ function showToast(message) {
 
 // ---- Service Worker 注册 ----
 if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js').catch(() => { });
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
