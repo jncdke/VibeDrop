@@ -18,6 +18,7 @@ use tauri::{
     AppHandle, Emitter, Manager,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
+    WebviewWindowBuilder, WindowEvent,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tower_http::services::ServeDir;
@@ -48,6 +49,12 @@ struct HistoryEntry {
     timestamp: String,
     text: String,
     client_ip: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct WindowState {
+    width: f64,
+    height: f64,
 }
 
 enum InputAction {
@@ -136,6 +143,9 @@ struct AppState {
     ip: String,
     port: u16,
 }
+
+const MIN_WINDOW_WIDTH: f64 = 320.0;
+const MIN_WINDOW_HEIGHT: f64 = 420.0;
 
 // ---- 主函数 ----
 
@@ -300,6 +310,40 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(state)
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+
+            let next_state = match event {
+                WindowEvent::Resized(size) => {
+                    let scale_factor = window.scale_factor().unwrap_or(1.0);
+                    let logical = size.to_logical::<f64>(scale_factor);
+                    Some(WindowState {
+                        width: logical.width,
+                        height: logical.height,
+                    })
+                }
+                WindowEvent::ScaleFactorChanged {
+                    scale_factor,
+                    new_inner_size,
+                    ..
+                } => {
+                    let logical = new_inner_size.to_logical::<f64>(*scale_factor);
+                    Some(WindowState {
+                        width: logical.width,
+                        height: logical.height,
+                    })
+                }
+                _ => None,
+            };
+
+            if let Some(window_state) = next_state {
+                if let Err(err) = save_window_state(&window_state) {
+                    warn!("保存窗口尺寸失败: {}", err);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_service_info,
             check_accessibility,
@@ -307,6 +351,18 @@ fn main() {
             load_history_entries
         ])
         .setup(move |app| {
+            if let Some(window_config) = app.config().app.windows.first().cloned() {
+                let mut window_config = window_config;
+
+                if let Some(saved) = load_window_state() {
+                    window_config.width = saved.width;
+                    window_config.height = saved.height;
+                    window_config.center = false;
+                }
+
+                WebviewWindowBuilder::from_config(app, &window_config)?.build()?;
+            }
+
             // 把 app_handle 传给 WebSocket 线程
             if let Ok(mut h) = app_handle.lock() {
                 *h = Some(app.handle().clone());
@@ -585,6 +641,48 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
 fn dirs_log_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join(".vibedrop")
+}
+
+fn window_state_path() -> PathBuf {
+    dirs_log_dir().join("window-state.json")
+}
+
+fn normalize_window_state(state: WindowState) -> Option<WindowState> {
+    if !state.width.is_finite() || !state.height.is_finite() {
+        return None;
+    }
+
+    let width = state.width.max(MIN_WINDOW_WIDTH);
+    let height = state.height.max(MIN_WINDOW_HEIGHT);
+
+    Some(WindowState { width, height })
+}
+
+fn load_window_state() -> Option<WindowState> {
+    let state_path = window_state_path();
+    let Ok(raw) = std::fs::read_to_string(state_path) else {
+        return None;
+    };
+
+    let Ok(state) = serde_json::from_str::<WindowState>(&raw) else {
+        return None;
+    };
+
+    normalize_window_state(state)
+}
+
+fn save_window_state(state: &WindowState) -> Result<(), String> {
+    let Some(normalized) = normalize_window_state(state.clone()) else {
+        return Err("窗口尺寸无效".to_string());
+    };
+
+    let state_path = window_state_path();
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let payload = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
+    fs::write(state_path, payload).map_err(|e| e.to_string())
 }
 
 fn history_log_paths() -> Vec<PathBuf> {
