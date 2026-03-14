@@ -22,3 +22,5 @@ chrono = { version = "0.4", features = ["serde"] }
 hostname = "0.4"
 png = "0.17"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+arboard = "3"
+futures-util = "0.3"

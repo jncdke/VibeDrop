@@ -6,6 +6,7 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use enigo::{Enigo, Keyboard, Settings};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -16,7 +17,7 @@ use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tower_http::services::ServeDir;
 use tracing::{error, info, warn};
 
@@ -191,6 +192,28 @@ fn main() {
     let app_handle_ws = Arc::clone(&app_handle);
     let ws_static_dir = static_dir.clone();
 
+    // 剪贴板广播 channel
+    let (clipboard_tx, _) = broadcast::channel::<String>(16);
+    let clipboard_tx_clone = clipboard_tx.clone();
+
+    // 剪贴板监听线程（每 500ms 检查变化）
+    std::thread::spawn(move || {
+        let mut clipboard = arboard::Clipboard::new().expect("无法初始化剪贴板");
+        let mut last_text = clipboard.get_text().unwrap_or_default();
+        info!("剪贴板监听已启动");
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Ok(current) = clipboard.get_text() {
+                if current != last_text && !current.is_empty() {
+                    last_text = current.clone();
+                    info!("剪贴板变化: {}...", &last_text.chars().take(50).collect::<String>());
+                    let _ = clipboard_tx_clone.send(last_text.clone());
+                }
+            }
+        }
+    });
+
     // 启动 HTTP + HTTPS 服务器（后台）
     let ws_port = port;
     let ws_https_port = https_port;
@@ -206,6 +229,7 @@ fn main() {
                 hostname: ws_hostname,
                 type_tx: ws_type_tx,
                 app_handle: app_handle_ws,
+                clipboard_tx,
             });
 
             let shared_clone = Arc::clone(&shared);
@@ -323,130 +347,152 @@ struct WsState {
     hostname: String,
     type_tx: mpsc::Sender<TypeRequest>,
     app_handle: Arc<std::sync::Mutex<Option<AppHandle>>>,
+    clipboard_tx: broadcast::Sender<String>,
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, state: Arc<WsState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
+async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     info!("新的 WebSocket 连接");
     let mut authenticated = false;
 
-    while let Some(Ok(msg)) = socket.recv().await {
-        match msg {
-            Message::Text(text) => {
-                let client_msg: ClientMessage = match serde_json::from_str(&text) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!("无效 JSON: {}", e);
-                        let reply = ServerMessage {
-                            status: "error".to_string(),
-                            hostname: None,
-                            error: Some("无效的 JSON 格式".to_string()),
-                        };
-                        let _ = socket.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
-                        continue;
-                    }
-                };
+    // 拆分 WebSocket 为 sender/receiver，以便同时接收客户端消息和广播剪贴板
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+    let mut clipboard_rx = state.clipboard_tx.subscribe();
 
-                match client_msg.action.as_str() {
-                    "auth" => {
-                        if let Some(pin) = &client_msg.pin {
-                            if pin == &state.pin {
-                                authenticated = true;
-                                info!("客户端认证成功");
-                                let reply = ServerMessage {
-                                    status: "ok".to_string(),
-                                    hostname: Some(state.hostname.clone()),
-                                    error: None,
-                                };
-                                let _ = socket.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
-                            } else {
-                                warn!("PIN 错误");
+    loop {
+        tokio::select! {
+            // 接收客户端发来的消息
+            msg = ws_receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let client_msg: ClientMessage = match serde_json::from_str(&text) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!("无效 JSON: {}", e);
                                 let reply = ServerMessage {
                                     status: "error".to_string(),
                                     hostname: None,
-                                    error: Some("PIN 码错误".to_string()),
+                                    error: Some("无效的 JSON 格式".to_string()),
                                 };
-                                let _ = socket.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                continue;
                             }
-                        }
-                    }
+                        };
 
-                    "type" => {
-                        if !authenticated {
-                            let reply = ServerMessage {
-                                status: "error".to_string(),
-                                hostname: None,
-                                error: Some("未认证".to_string()),
-                            };
-                            let _ = socket.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
-                            continue;
-                        }
-
-                        if let Some(text_content) = &client_msg.text {
-                            info!("收到文字: {}", text_content);
-                            log_history(text_content, "ws-client");
-
-                            let (reply_tx, reply_rx) = oneshot::channel();
-                            let req = TypeRequest {
-                                text: text_content.clone(),
-                                reply: reply_tx,
-                            };
-
-                            if state.type_tx.send(req).await.is_ok() {
-                                match reply_rx.await {
-                                    Ok(Ok(())) => {
-                                        info!("文字已输入");
-
-                                        // 通知 Tauri 前端窗口
-                                        if let Ok(guard) = state.app_handle.lock() {
-                                            if let Some(handle) = guard.as_ref() {
-                                                let _ = handle.emit("text-received", serde_json::json!({
-                                                    "text": text_content,
-                                                    "timestamp": chrono::Local::now().to_rfc3339()
-                                                }));
-                                            }
-                                        }
-
+                        match client_msg.action.as_str() {
+                            "auth" => {
+                                if let Some(pin) = &client_msg.pin {
+                                    if pin == &state.pin {
+                                        authenticated = true;
+                                        info!("客户端认证成功");
                                         let reply = ServerMessage {
                                             status: "ok".to_string(),
-                                            hostname: None,
+                                            hostname: Some(state.hostname.clone()),
                                             error: None,
                                         };
-                                        let _ = socket.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
-                                    }
-                                    Ok(Err(e)) => {
-                                        error!("键盘模拟失败: {}", e);
+                                        let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    } else {
+                                        warn!("PIN 错误");
                                         let reply = ServerMessage {
                                             status: "error".to_string(),
                                             hostname: None,
-                                            error: Some(format!("键盘输入失败: {}", e)),
+                                            error: Some("PIN 码错误".to_string()),
                                         };
-                                        let _ = socket.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
-                                    }
-                                    Err(_) => {
-                                        error!("键盘输入线程无响应");
+                                        let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
                                     }
                                 }
                             }
+
+                            "type" => {
+                                if !authenticated {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("未认证".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                }
+
+                                if let Some(text_content) = &client_msg.text {
+                                    info!("收到文字: {}", text_content);
+                                    log_history(text_content, "ws-client");
+
+                                    let (reply_tx, reply_rx) = oneshot::channel();
+                                    let req = TypeRequest {
+                                        text: text_content.clone(),
+                                        reply: reply_tx,
+                                    };
+
+                                    if state.type_tx.send(req).await.is_ok() {
+                                        match reply_rx.await {
+                                            Ok(Ok(())) => {
+                                                info!("文字已输入");
+
+                                                // 通知 Tauri 前端窗口
+                                                if let Ok(guard) = state.app_handle.lock() {
+                                                    if let Some(handle) = guard.as_ref() {
+                                                        let _ = handle.emit("text-received", serde_json::json!({
+                                                            "text": text_content,
+                                                            "timestamp": chrono::Local::now().to_rfc3339()
+                                                        }));
+                                                    }
+                                                }
+
+                                                let reply = ServerMessage {
+                                                    status: "ok".to_string(),
+                                                    hostname: None,
+                                                    error: None,
+                                                };
+                                                let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                            }
+                                            Ok(Err(e)) => {
+                                                error!("键盘模拟失败: {}", e);
+                                                let reply = ServerMessage {
+                                                    status: "error".to_string(),
+                                                    hostname: None,
+                                                    error: Some(format!("键盘输入失败: {}", e)),
+                                                };
+                                                let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                            }
+                                            Err(_) => {
+                                                error!("键盘输入线程无响应");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            "ping" => {
+                                let reply = serde_json::json!({"action": "pong"});
+                                let _ = ws_sender.send(Message::Text(reply.to_string().into())).await;
+                            }
+
+                            _ => {}
                         }
                     }
-
-                    "ping" => {
-                        let reply = serde_json::json!({"action": "pong"});
-                        let _ = socket.send(Message::Text(reply.to_string().into())).await;
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = ws_sender.send(Message::Pong(data)).await;
                     }
-
+                    Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }
             }
-            Message::Ping(data) => {
-                let _ = socket.send(Message::Pong(data)).await;
+            // 接收剪贴板广播，转发给已认证的客户端
+            clipboard_text = clipboard_rx.recv() => {
+                if authenticated {
+                    if let Ok(text) = clipboard_text {
+                        let msg = serde_json::json!({
+                            "action": "clipboard",
+                            "text": text
+                        });
+                        let _ = ws_sender.send(Message::Text(msg.to_string().into())).await;
+                    }
+                }
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
     info!("WebSocket 连接关闭");

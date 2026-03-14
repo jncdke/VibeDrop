@@ -191,6 +191,18 @@ function connectMac(macId, ip, port, pin) {
             return;
         }
 
+        // 剪贴板同步（Mac → 手机）
+        if (data.action === 'clipboard') {
+            if (data.text && navigator.clipboard) {
+                navigator.clipboard.writeText(data.text).then(() => {
+                    showToast('📋 已同步到剪贴板');
+                }).catch(() => {
+                    showToast('⚠️ 剪贴板写入失败');
+                });
+            }
+            return;
+        }
+
         // 认证响应
         if (!conn.authenticated) {
             if (data.status === 'ok' && data.hostname) {
@@ -515,6 +527,21 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ---- Toast 提示 ----
+function showToast(message) {
+    let toast = document.getElementById('toast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'toast';
+        toast.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:rgba(108,92,231,0.95);color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;z-index:9999;transition:opacity 0.3s;pointer-events:none;';
+        document.body.appendChild(toast);
+    }
+    toast.textContent = message;
+    toast.style.opacity = '1';
+    clearTimeout(toast._timer);
+    toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 2000);
 }
 
 // ---- Service Worker 注册 ----
