@@ -110,11 +110,23 @@ struct AppState {
 fn main() {
     tracing_subscriber::fmt::init();
 
-    // 获取配置（硬编码默认值，后续可改为配置文件）
+    // PIN 持久化：保存到 ~/.vibedrop/pin，重启不变
+    let pin_path = dirs_log_dir().join("pin");
     let pin = std::env::var("VOICEDROP_PIN").unwrap_or_else(|_| {
+        // 尝试读取已保存的 PIN
+        if let Ok(saved) = std::fs::read_to_string(&pin_path) {
+            let saved = saved.trim().to_string();
+            if !saved.is_empty() {
+                return saved;
+            }
+        }
+        // 首次运行：生成随机 PIN 并保存
         use std::time::{SystemTime, UNIX_EPOCH};
         let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
-        format!("{:04}", seed % 10000)
+        let new_pin = format!("{:04}", seed % 10000);
+        let _ = fs::create_dir_all(pin_path.parent().unwrap());
+        let _ = std::fs::write(&pin_path, &new_pin);
+        new_pin
     });
     let port: u16 = std::env::var("VOICEDROP_PORT")
         .ok()
