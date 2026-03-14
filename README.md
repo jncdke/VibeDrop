@@ -2,8 +2,8 @@
 
 VibeDrop 是一个局域网内的 **剪贴板同步 + 文字传输** 工具，由两个独立应用组成：
 
-- **Mac 桌面端**（本仓库 `安卓发送mac输入文字app/`）
-- **Android 手机端**（`vibedrop-mobile/`）
+- **Mac 桌面端**（`desktop/`）
+- **Android 手机端**（`mobile/`）
 
 两端通过 **WebSocket**（`ws://`）在局域网内通信，无需互联网，无需云服务。
 
@@ -189,7 +189,7 @@ app.js 连接生命周期：
 | `src/main.js` | ~180 | Mac 窗口 UI 逻辑：显示连接信息（IP/端口/PIN），实时日志列表，点击复制，辅助功能权限检测 |
 | `src/index.html` | ~65 | Mac 窗口 HTML 结构 |
 | `src/style.css` | ~270 | Mac 窗口样式（深色主题） |
-| `static/*` | — | HTTP 服务器提供的文件（手机浏览器版），与 `vibedrop-mobile/src/` 保持同步 |
+| `static/*` | — | HTTP 服务器提供的文件（手机浏览器版），与 `mobile/src/` 保持同步 |
 
 ### Android 手机端
 
@@ -269,7 +269,7 @@ rustup target add aarch64-linux-android  # Android 交叉编译
 ### Mac 桌面端
 
 ```bash
-cd 安卓发送mac输入文字app
+cd desktop
 
 # 开发模式（热重载）
 cargo tauri dev
@@ -286,7 +286,7 @@ open /Applications/VibeDrop.app
 ### Android 手机端
 
 ```bash
-cd vibedrop-mobile
+cd mobile
 
 # 构建 Release APK（仅 arm64）
 cargo tauri android build --target aarch64
@@ -307,12 +307,12 @@ adb shell am start -n com.vibedrop.mobile/.MainActivity
 
 ### 代码同步（两端共享前端文件）
 
-手机端 `vibedrop-mobile/src/` 是前端源文件，修改后需要同步到 Mac 端的 `static/`：
+手机端 `mobile/src/` 是前端源文件，修改后需要同步到 Mac 端的 `static/`：
 
 ```bash
-cp vibedrop-mobile/src/app.js    安卓发送mac输入文字app/static/app.js
-cp vibedrop-mobile/src/index.html 安卓发送mac输入文字app/static/index.html
-cp vibedrop-mobile/src/style.css  安卓发送mac输入文字app/static/style.css
+cp mobile/src/app.js    desktop/static/app.js
+cp mobile/src/index.html desktop/static/index.html
+cp mobile/src/style.css  desktop/static/style.css
 ```
 
 > **注意**：Mac 端自己的 UI 是 `src/main.js` + `src/index.html` + `src/style.css`，这三个文件和手机端**不共享**，是 Mac 桌面窗口专用的。Mac 端的 `static/` 目录是给手机浏览器版用的（通过 HTTP 服务器访问）。
@@ -445,7 +445,7 @@ cp vibedrop-mobile/src/style.css  安卓发送mac输入文字app/static/style.cs
 
 2. **文件同步**：修改手机端前端代码后，**必须手动同步**到 Mac 端的 `static/` 目录，否则手机浏览器版不会更新
 
-3. **gen 目录不要乱动**：`vibedrop-mobile/src-tauri/gen/android/` 是 Tauri 自动生成的 Android 项目，但我们手动修改了其中的 `AndroidManifest.xml`、`MainActivity.kt`、`KeepAliveService.kt`、`build.gradle.kts`。重新运行 `tauri init` 会覆盖这些修改
+3. **gen 目录不要乱动**：`mobile/src-tauri/gen/android/` 是 Tauri 自动生成的 Android 项目，但我们手动修改了其中的 `AndroidManifest.xml`、`MainActivity.kt`、`KeepAliveService.kt`、`build.gradle.kts`。重新运行 `tauri init` 会覆盖这些修改
 
 4. **签名**：APK 必须签名才能安装。keystore 在 `~/.android/vibedrop.keystore`，密码 `vibedrop123`。丢失 keystore 后用户需要卸载重装（无法覆盖安装）
 
