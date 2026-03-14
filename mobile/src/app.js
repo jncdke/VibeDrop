@@ -586,7 +586,7 @@ async function sendText(deviceId) {
 
     const historyEntry = {
         id: Date.now(),
-        timestamp: new Date().toISOString(),
+        timestamp: getLocalTimestamp(),
         text: text,
         target: deviceId,
         targetName: targetName,
@@ -647,13 +647,89 @@ function addHistory(entry) {
     persistHistory();
 }
 
-function exportHistory() {
+function pad2(value) {
+    return String(value).padStart(2, '0');
+}
+
+function getLocalTimestamp(value = new Date()) {
+    const date = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        return new Date().toISOString();
+    }
+
+    const year = date.getFullYear();
+    const month = pad2(date.getMonth() + 1);
+    const day = pad2(date.getDate());
+    const hour = pad2(date.getHours());
+    const minute = pad2(date.getMinutes());
+    const second = pad2(date.getSeconds());
+    const millisecond = String(date.getMilliseconds()).padStart(3, '0');
+
+    const offsetMinutes = -date.getTimezoneOffset();
+    const sign = offsetMinutes >= 0 ? '+' : '-';
+    const absoluteOffset = Math.abs(offsetMinutes);
+    const offsetHour = pad2(Math.floor(absoluteOffset / 60));
+    const offsetMinute = pad2(absoluteOffset % 60);
+
+    return `${year}-${month}-${day}T${hour}:${minute}:${second}.${millisecond}${sign}${offsetHour}:${offsetMinute}`;
+}
+
+function buildHistoryExportData(history) {
+    return history.map(entry => ({
+        ...entry,
+        timestamp: getLocalTimestamp(entry.timestamp),
+    }));
+}
+
+function normalizeImportedHistoryEntry(entry) {
+    const timestampSource = entry.timestamp_iso || entry.timestamp;
+    const normalizedTimestamp = getLocalTimestamp(timestampSource);
+
+    return {
+        ...entry,
+        timestamp: normalizedTimestamp,
+    };
+}
+
+function waitForNativeBridgeEvent(eventName, invokeNative) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+
+        const handler = (event) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            window.removeEventListener(eventName, handler);
+            resolve(event.detail || {});
+        };
+
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            window.removeEventListener(eventName, handler);
+            reject(new Error('原生操作超时'));
+        }, 15000);
+
+        window.addEventListener(eventName, handler);
+
+        try {
+            invokeNative();
+        } catch (error) {
+            settled = true;
+            clearTimeout(timer);
+            window.removeEventListener(eventName, handler);
+            reject(error);
+        }
+    });
+}
+
+async function exportHistory() {
     const history = getHistory();
     if (history.length === 0) {
         showToast('暂无历史可导出');
         return;
     }
-    const data = JSON.stringify(history, null, 2);
+    const data = JSON.stringify(buildHistoryExportData(history), null, 2);
     const now = new Date();
     const ts = now.getFullYear()
         + '-' + String(now.getMonth() + 1).padStart(2, '0')
@@ -662,21 +738,49 @@ function exportHistory() {
         + '-' + String(now.getMinutes()).padStart(2, '0')
         + '-' + String(now.getSeconds()).padStart(2, '0');
     const filename = `vibedrop_history_${ts}.json`;
+    const mimeType = 'application/json';
 
-    // 方案 1：Tauri 原生写文件到 Download 目录
-    if (window.__TAURI__) {
-        window.__TAURI__.core.invoke('export_history_file', { filename, data })
-            .then((path) => {
-                showToast(`✅ 已保存到 Download/${filename}`);
-            })
-            .catch((err) => {
-                showToast('❌ 导出失败: ' + err);
+    if (window.NativeShare && window.NativeShare.exportHistory) {
+        try {
+            const result = await waitForNativeBridgeEvent('native-export-result', () => {
+                window.NativeShare.exportHistory(filename, data);
             });
+
+            if (result.cancelled) {
+                showToast(result.message || '已取消导出');
+                return;
+            }
+
+            if (!result.ok) {
+                throw new Error(result.error || '导出失败');
+            }
+
+            showToast(result.message || `✅ 已导出 ${filename}`);
+        } catch (err) {
+            showToast('❌ 导出失败: ' + err.message);
+        }
         return;
     }
 
-    // 方案 2：浏览器下载
-    const blob = new Blob([data], { type: 'application/json' });
+    if (window.showSaveFilePicker) {
+        try {
+            const handle = await window.showSaveFilePicker({
+                suggestedName: filename,
+                types: [{ description: 'JSON 文件', accept: { [mimeType]: ['.json'] } }],
+            });
+            const writable = await handle.createWritable();
+            await writable.write(data);
+            await writable.close();
+            showToast('✅ 已导出到你选择的位置');
+        } catch (err) {
+            if (err.name !== 'AbortError') {
+                showToast('❌ 导出失败: ' + err.message);
+            }
+        }
+        return;
+    }
+
+    const blob = new Blob([data], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -684,6 +788,68 @@ function exportHistory() {
     a.click();
     URL.revokeObjectURL(url);
     showToast('✅ 导出成功');
+}
+
+async function shareHistory() {
+    const history = getHistory();
+    if (history.length === 0) {
+        showToast('暂无历史可分享');
+        return;
+    }
+
+    const data = JSON.stringify(buildHistoryExportData(history), null, 2);
+    const now = new Date();
+    const ts = now.getFullYear()
+        + '-' + String(now.getMonth() + 1).padStart(2, '0')
+        + '-' + String(now.getDate()).padStart(2, '0')
+        + '_' + String(now.getHours()).padStart(2, '0')
+        + '-' + String(now.getMinutes()).padStart(2, '0')
+        + '-' + String(now.getSeconds()).padStart(2, '0');
+    const filename = `vibedrop_history_${ts}.json`;
+    const mimeType = 'application/json';
+
+    if (window.NativeShare && window.NativeShare.shareHistory) {
+        try {
+            const result = await waitForNativeBridgeEvent('native-share-result', () => {
+                window.NativeShare.shareHistory(filename, data);
+            });
+
+            if (!result.ok) {
+                throw new Error(result.error || '分享失败');
+            }
+
+            showToast(result.message || '已打开分享面板');
+        } catch (err) {
+            showToast('❌ 分享失败: ' + err.message);
+        }
+        return;
+    }
+
+    if (navigator.share) {
+        try {
+            const file = new File([data], filename, { type: mimeType });
+            if (navigator.canShare && navigator.canShare({ files: [file] })) {
+                await navigator.share({
+                    title: 'VibeDrop 历史记录',
+                    text: 'VibeDrop 导出的历史记录',
+                    files: [file],
+                });
+            } else {
+                await navigator.share({
+                    title: 'VibeDrop 历史记录',
+                    text: data,
+                });
+            }
+            showToast('已打开分享面板');
+        } catch (err) {
+            if (err.name !== 'AbortError') {
+                showToast('❌ 分享失败: ' + err.message);
+            }
+        }
+        return;
+    }
+
+    showToast('当前环境不支持系统分享');
 }
 
 function updateHistory(entry) {
@@ -716,6 +882,11 @@ function initHistoryActions() {
     const exportBtn = $('export-history-btn');
     if (exportBtn) {
         exportBtn.addEventListener('click', () => exportHistory());
+    }
+
+    const shareBtn = $('share-history-btn');
+    if (shareBtn) {
+        shareBtn.addEventListener('click', () => shareHistory());
     }
 
     const importBtn = $('import-history-btn');
@@ -755,7 +926,8 @@ function importHistory(file) {
             let added = 0;
             let skipped = 0;
 
-            for (const entry of imported) {
+            for (const rawEntry of imported) {
+                const entry = normalizeImportedHistoryEntry(rawEntry);
                 const key = `${entry.timestamp}|${entry.text}`;
                 if (existingKeys.has(key)) {
                     skipped++;

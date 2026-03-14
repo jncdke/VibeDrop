@@ -1,5 +1,7 @@
 package com.vibedrop.mobile
 
+import android.content.ActivityNotFoundException
+import android.content.ClipData
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
@@ -12,15 +14,80 @@ import android.provider.Settings
 import android.util.Log
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import org.json.JSONObject
+import java.io.File
 
 class MainActivity : TauriActivity() {
 
   companion object {
     private const val TAG = "VibeDrop"
+  }
+
+  private var appWebView: WebView? = null
+  private var pendingExportFilename: String? = null
+  private var pendingExportData: String? = null
+
+  private val exportDocumentLauncher = registerForActivityResult(
+    ActivityResultContracts.CreateDocument("application/json")
+  ) { uri ->
+    val filename = pendingExportFilename ?: "vibedrop_history.json"
+    val data = pendingExportData
+    pendingExportFilename = null
+    pendingExportData = null
+
+    if (uri == null) {
+      emitBridgeEvent(
+        "native-export-result",
+        JSONObject().apply {
+          put("ok", false)
+          put("cancelled", true)
+          put("message", "已取消导出")
+        }
+      )
+      return@registerForActivityResult
+    }
+
+    if (data == null) {
+      emitBridgeEvent(
+        "native-export-result",
+        JSONObject().apply {
+          put("ok", false)
+          put("error", "没有可导出的数据")
+        }
+      )
+      return@registerForActivityResult
+    }
+
+    try {
+      contentResolver.openOutputStream(uri)?.use { output ->
+        output.write(data.toByteArray(Charsets.UTF_8))
+      } ?: throw IllegalStateException("无法打开导出目标")
+
+      emitBridgeEvent(
+        "native-export-result",
+        JSONObject().apply {
+          put("ok", true)
+          put("message", "已导出到你选择的位置")
+          put("filename", filename)
+          put("uri", uri.toString())
+        }
+      )
+    } catch (e: Exception) {
+      Log.e(TAG, "导出历史失败", e)
+      emitBridgeEvent(
+        "native-export-result",
+        JSONObject().apply {
+          put("ok", false)
+          put("error", e.message ?: "导出失败")
+        }
+      )
+    }
   }
 
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -54,7 +121,9 @@ class MainActivity : TauriActivity() {
    */
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
+    appWebView = webView
     webView.addJavascriptInterface(ClipboardBridge(this), "NativeClipboard")
+    webView.addJavascriptInterface(ShareBridge(), "NativeShare")
     Log.d(TAG, "JS Bridge NativeClipboard 已注入")
   }
 
@@ -66,6 +135,74 @@ class MainActivity : TauriActivity() {
     fun writeText(text: String) {
       Log.d(TAG, "JS 调用 NativeClipboard.writeText, 长度: ${text.length}")
       ClipboardFloatingActivity.launchWrite(context, text)
+    }
+  }
+
+  inner class ShareBridge {
+    @JavascriptInterface
+    fun exportHistory(filename: String, data: String) {
+      runOnUiThread {
+        val safeFilename = sanitizeFilename(filename)
+        pendingExportFilename = safeFilename
+        pendingExportData = data
+        exportDocumentLauncher.launch(safeFilename)
+      }
+    }
+
+    @JavascriptInterface
+    fun shareHistory(filename: String, data: String) {
+      runOnUiThread {
+        try {
+          val safeFilename = sanitizeFilename(filename)
+          val shareDir = File(cacheDir, "shared").apply { mkdirs() }
+          val shareFile = File(shareDir, safeFilename)
+          shareFile.writeText(data, Charsets.UTF_8)
+
+          val uri = FileProvider.getUriForFile(
+            this@MainActivity,
+            "$packageName.fileprovider",
+            shareFile
+          )
+
+          val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "application/json"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, safeFilename)
+            putExtra(Intent.EXTRA_TITLE, safeFilename)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            clipData = ClipData.newUri(contentResolver, safeFilename, uri)
+          }
+
+          startActivity(Intent.createChooser(shareIntent, "分享历史记录"))
+
+          emitBridgeEvent(
+            "native-share-result",
+            JSONObject().apply {
+              put("ok", true)
+              put("message", "已打开分享面板")
+              put("filename", safeFilename)
+            }
+          )
+        } catch (e: ActivityNotFoundException) {
+          Log.e(TAG, "没有可用的分享应用", e)
+          emitBridgeEvent(
+            "native-share-result",
+            JSONObject().apply {
+              put("ok", false)
+              put("error", "没有可用的分享应用")
+            }
+          )
+        } catch (e: Exception) {
+          Log.e(TAG, "分享历史失败", e)
+          emitBridgeEvent(
+            "native-share-result",
+            JSONObject().apply {
+              put("ok", false)
+              put("error", e.message ?: "分享失败")
+            }
+          )
+        }
+      }
     }
   }
 
@@ -144,6 +281,19 @@ class MainActivity : TauriActivity() {
       try {
         startActivity(Intent(Settings.ACTION_SETTINGS))
       } catch (_: Exception) {}
+    }
+  }
+
+  private fun sanitizeFilename(filename: String): String {
+    val cleaned = filename.replace(Regex("""[\\/:*?"<>|]"""), "_").trim()
+    return if (cleaned.isNotEmpty()) cleaned else "vibedrop_history.json"
+  }
+
+  private fun emitBridgeEvent(eventName: String, payload: JSONObject) {
+    val webView = appWebView ?: return
+    val js = "window.dispatchEvent(new CustomEvent(${JSONObject.quote(eventName)}, { detail: ${payload} }));"
+    webView.post {
+      webView.evaluateJavascript(js, null)
     }
   }
 }

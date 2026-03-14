@@ -305,6 +305,25 @@ adb shell am force-stop com.vibedrop.mobile
 adb shell am start -n com.vibedrop.mobile/.MainActivity
 ```
 
+高频改代码测试时，可以直接用根目录脚本一键重装：
+
+```bash
+./scripts/deploy-android.sh
+```
+
+常用参数：
+
+```bash
+# 多设备时指定序列号
+./scripts/deploy-android.sh --device 3B6F4FE910B8KRLS
+
+# 如果同时改了 mobile/src 共享前端，顺手同步到 desktop/static
+./scripts/deploy-android.sh --sync-static
+
+# 只重新签名并安装现有 APK
+./scripts/deploy-android.sh --skip-build
+```
+
 ### 代码同步（两端共享前端文件）
 
 手机端 `mobile/src/` 是前端源文件，修改后需要同步到 Mac 端的 `static/`：
@@ -458,4 +477,3 @@ cp mobile/src/style.css  desktop/static/style.css
 ## 许可证
 
 [MIT License](LICENSE) — 完全开源，自由使用。
-
