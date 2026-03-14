@@ -668,13 +668,18 @@ function showToast(message) {
     if (!toast) {
         toast = document.createElement('div');
         toast.id = 'toast';
-        toast.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:rgba(108,92,231,0.95);color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;z-index:9999;transition:opacity 0.3s;pointer-events:none;';
+        toast.style.cssText = 'position:fixed;top:80px;left:50%;transform:translateX(-50%);background:rgba(108,92,231,0.95);color:#fff;padding:10px 20px;border-radius:20px;font-size:14px;z-index:9999;transition:opacity 0.15s;pointer-events:none;';
         document.body.appendChild(toast);
     }
-    toast.textContent = message;
-    toast.style.opacity = '1';
+    // 先隐藏再显示，让用户明确知道点了新的一条
+    toast.style.opacity = '0';
     clearTimeout(toast._timer);
-    toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 2000);
+    clearTimeout(toast._showTimer);
+    toast._showTimer = setTimeout(() => {
+        toast.textContent = message;
+        toast.style.opacity = '1';
+        toast._timer = setTimeout(() => { toast.style.opacity = '0'; }, 2000);
+    }, 150);
 }
 
 // ---- Service Worker 注册 ----
