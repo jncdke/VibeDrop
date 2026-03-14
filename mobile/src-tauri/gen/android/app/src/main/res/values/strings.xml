@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name">VibeDrop</string>
     <string name="main_activity_title">VibeDrop</string>
+    <string name="share_target_title">传送到电脑</string>
 </resources>

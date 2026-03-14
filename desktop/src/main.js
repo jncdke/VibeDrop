@@ -66,7 +66,7 @@ async function showMainView() {
     // 监听后端发来的文字接收事件
     if (window.__TAURI__.event) {
         window.__TAURI__.event.listen('text-received', (event) => {
-            addLogItem(event.payload.text, event.payload.timestamp);
+            addLogItem(event.payload);
         });
     }
 
@@ -108,17 +108,31 @@ async function restoreLog() {
     if (empty) empty.remove();
 
     log.forEach(entry => {
-        const item = createLogElement(entry.text, entry.timestamp);
+        const item = createLogElement(entry);
         list.appendChild(item);
     });
 }
 
-function addLogItem(text, timestamp) {
-    const ts = timestamp || new Date().toISOString();
+function normalizeLogEntry(entryOrText, timestamp) {
+    if (typeof entryOrText === 'string') {
+        return {
+            text: entryOrText,
+            timestamp: timestamp || new Date().toISOString(),
+        };
+    }
+
+    return {
+        ...entryOrText,
+        timestamp: entryOrText.timestamp || timestamp || new Date().toISOString(),
+    };
+}
+
+function addLogItem(entryOrText, timestamp) {
+    const entry = normalizeLogEntry(entryOrText, timestamp);
 
     // 保存到 localStorage
     const log = getLog();
-    log.unshift({ text, timestamp: ts });
+    log.unshift(entry);
     saveLog(log);
 
     // 显示到界面
@@ -126,26 +140,85 @@ function addLogItem(text, timestamp) {
     const empty = list.querySelector('.empty');
     if (empty) empty.remove();
 
-    const item = createLogElement(text, ts);
+    const item = createLogElement(entry);
     list.insertBefore(item, list.firstChild);
 }
 
-function createLogElement(text, timestamp) {
-    const time = new Date(timestamp || Date.now());
+function createLogElement(entryOrText, timestamp) {
+    const entry = normalizeLogEntry(entryOrText, timestamp);
+    const time = new Date(entry.timestamp || Date.now());
     const timeStr = time.toLocaleTimeString('zh-CN', {
         hour: '2-digit', minute: '2-digit', second: '2-digit'
     });
+    const isImage = entry.kind === 'image';
+    const isFile = entry.kind === 'file';
+    const thumbnail = entry.thumbnail_data_url || entry.thumbnailDataUrl;
+    const imagePath = entry.image_path || entry.imagePath;
+    const filePath = entry.file_path || entry.filePath;
 
     const item = document.createElement('div');
     item.className = 'log-item';
-    item.title = '点击复制';
+    item.title = isImage ? '点击打开原图' : isFile ? '点击打开文件' : '点击复制';
     item.style.cursor = 'pointer';
+
+    if (isImage && thumbnail) {
+        item.classList.add('log-item-image');
+        item.innerHTML = `
+            <div class="log-time">${timeStr}</div>
+            <div class="log-image-row">
+                <img class="log-image-thumb" src="${thumbnail}" alt="${escapeHtml(entry.file_name || entry.text || '图片')}">
+                <div class="log-image-meta">
+                    <div class="log-text">${escapeHtml(entry.text || '图片')}</div>
+                    <div class="log-image-hint">点击打开原图</div>
+                </div>
+            </div>
+        `;
+        item.addEventListener('click', async () => {
+            if (!imagePath) {
+                showToast('原图文件不可用');
+                return;
+            }
+            try {
+                await invoke('open_history_path', { path: imagePath });
+            } catch (error) {
+                showToast(`打开失败：${error}`);
+            }
+        });
+        return item;
+    }
+
+    if (isFile) {
+        item.classList.add('log-item-file');
+        item.innerHTML = `
+            <div class="log-time">${timeStr}</div>
+            <div class="log-image-row">
+                <div class="log-file-badge">文件</div>
+                <div class="log-image-meta">
+                    <div class="log-text">${escapeHtml(entry.text || '文件')}</div>
+                    <div class="log-image-hint">点击打开下载的文件</div>
+                </div>
+            </div>
+        `;
+        item.addEventListener('click', async () => {
+            if (!filePath) {
+                showToast('文件路径不可用');
+                return;
+            }
+            try {
+                await invoke('open_history_path', { path: filePath });
+            } catch (error) {
+                showToast(`打开失败：${error}`);
+            }
+        });
+        return item;
+    }
+
     item.innerHTML = `
         <div class="log-time">${timeStr}</div>
-        <div class="log-text">${escapeHtml(text)}</div>
+        <div class="log-text">${escapeHtml(entry.text || '')}</div>
     `;
     item.addEventListener('click', () => {
-        navigator.clipboard.writeText(text);
+        navigator.clipboard.writeText(entry.text || '');
         showToast('已复制');
     });
     return item;

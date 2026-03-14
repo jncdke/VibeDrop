@@ -29,6 +29,24 @@
             </intent-filter>
         </activity>
 
+        <activity-alias
+            android:name=".ShareToMacAlias"
+            android:targetActivity=".MainActivity"
+            android:exported="true"
+            android:label="@string/share_target_title"
+            android:icon="@mipmap/ic_launcher">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity-alias>
+
         <service
             android:name=".KeepAliveService"
             android:exported="false"

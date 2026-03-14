@@ -1,24 +1,27 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use axum::{
-    Router,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
     routing::get,
+    Router,
 };
 
+use arboard::ImageData;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
+use std::io::Cursor;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{
-    AppHandle, Emitter, Manager,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, Manager, WebviewWindowBuilder, WindowEvent,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tower_http::services::ServeDir;
@@ -33,6 +36,14 @@ struct ClientMessage {
     pin: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    image_base64: Option<String>,
+    #[serde(default)]
+    file_base64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,6 +60,16 @@ struct HistoryEntry {
     timestamp: String,
     text: String,
     client_ip: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thumbnail_data_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -68,6 +89,13 @@ struct InputRequest {
     reply: oneshot::Sender<Result<(), String>>,
 }
 
+struct SavedImage {
+    file_name: String,
+    image_path: String,
+    thumbnail_data_url: String,
+    clipboard_image: ImageData<'static>,
+}
+
 /// 前端可以调用的 Tauri 命令：获取服务信息
 #[derive(Debug, Serialize, Clone)]
 struct ServiceInfo {
@@ -77,8 +105,6 @@ struct ServiceInfo {
     pin: String,
     running: bool,
 }
-
-
 
 // ---- Tauri 命令 ----
 
@@ -97,6 +123,21 @@ fn open_accessibility_settings() {
     let _ = std::process::Command::new("open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
         .spawn();
+}
+
+#[tauri::command]
+fn open_history_path(path: String) -> Result<(), String> {
+    let path = PathBuf::from(&path);
+    if !path.exists() {
+        return Err("文件不存在".to_string());
+    }
+
+    std::process::Command::new("open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("无法打开文件: {}", e))?;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -147,6 +188,21 @@ struct AppState {
 const MIN_WINDOW_WIDTH: f64 = 320.0;
 const MIN_WINDOW_HEIGHT: f64 = 420.0;
 
+impl HistoryEntry {
+    fn text_entry(text: &str, client_ip: &str) -> Self {
+        Self {
+            timestamp: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
+            text: text.to_string(),
+            client_ip: client_ip.to_string(),
+            kind: None,
+            file_name: None,
+            image_path: None,
+            thumbnail_data_url: None,
+            file_path: None,
+        }
+    }
+}
+
 // ---- 主函数 ----
 
 fn main() {
@@ -164,7 +220,10 @@ fn main() {
         }
         // 首次运行：生成随机 PIN 并保存
         use std::time::{SystemTime, UNIX_EPOCH};
-        let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
         let new_pin = format!("{:04}", seed % 10000);
         let _ = fs::create_dir_all(pin_path.parent().unwrap());
         let _ = std::fs::write(&pin_path, &new_pin);
@@ -202,15 +261,15 @@ fn main() {
         rt.block_on(async {
             while let Some(req) = input_rx.recv().await {
                 let reply = match req.action {
-                    InputAction::TypeText(text) => enigo.text(&text).map_err(|e| format!("{:?}", e)),
-                    InputAction::TypeTextAndEnter(text) => {
-                        match enigo.text(&text) {
-                            Ok(()) => enigo
-                                .key(Key::Return, Direction::Click)
-                                .map_err(|e| format!("文字已发送，但回车失败: {:?}", e)),
-                            Err(e) => Err(format!("{:?}", e)),
-                        }
+                    InputAction::TypeText(text) => {
+                        enigo.text(&text).map_err(|e| format!("{:?}", e))
                     }
+                    InputAction::TypeTextAndEnter(text) => match enigo.text(&text) {
+                        Ok(()) => enigo
+                            .key(Key::Return, Direction::Click)
+                            .map_err(|e| format!("文字已发送，但回车失败: {:?}", e)),
+                        Err(e) => Err(format!("{:?}", e)),
+                    },
                     InputAction::PressEnter => enigo
                         .key(Key::Return, Direction::Click)
                         .map_err(|e| format!("{:?}", e)),
@@ -249,7 +308,8 @@ fn main() {
     let ws_pin = pin.clone();
     let ws_hostname = hostname.clone();
     let ws_input_tx = input_tx.clone();
-    let app_handle: Arc<std::sync::Mutex<Option<AppHandle>>> = Arc::new(std::sync::Mutex::new(None));
+    let app_handle: Arc<std::sync::Mutex<Option<AppHandle>>> =
+        Arc::new(std::sync::Mutex::new(None));
     let app_handle_ws = Arc::clone(&app_handle);
     let ws_static_dir = static_dir.clone();
 
@@ -268,7 +328,10 @@ fn main() {
             if let Ok(current) = clipboard.get_text() {
                 if current != last_text && !current.is_empty() {
                     last_text = current.clone();
-                    info!("剪贴板变化: {}...", &last_text.chars().take(50).collect::<String>());
+                    info!(
+                        "剪贴板变化: {}...",
+                        &last_text.chars().take(50).collect::<String>()
+                    );
                     let _ = clipboard_tx_clone.send(last_text.clone());
                 }
             }
@@ -348,7 +411,8 @@ fn main() {
             get_service_info,
             check_accessibility,
             open_accessibility_settings,
-            load_history_entries
+            load_history_entries,
+            open_history_path
         ])
         .setup(move |app| {
             if let Some(window_config) = app.config().app.windows.first().cloned() {
@@ -370,24 +434,23 @@ fn main() {
             // 创建系统托盘菜单（类似 KDE Connect 风格）
             let title = MenuItem::with_id(app, "title", "VibeDrop - 运行中", false, None::<&str>)?;
             let addr_label = MenuItem::with_id(
-                app, "addr",
+                app,
+                "addr",
                 &format!("📡 {}:{}", ip, port),
-                false, None::<&str>
+                false,
+                None::<&str>,
             )?;
-            let pin_label = MenuItem::with_id(
-                app, "pin",
-                &format!("🔑 PIN: {}", pin),
-                false, None::<&str>
-            )?;
+            let pin_label =
+                MenuItem::with_id(app, "pin", &format!("🔑 PIN: {}", pin), false, None::<&str>)?;
             let sep1 = PredefinedMenuItem::separator(app)?;
             let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
             let sep2 = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "退出 VibeDrop", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[
-                &title, &addr_label, &pin_label,
-                &sep1, &show, &sep2, &quit
-            ])?;
+            let menu = Menu::with_items(
+                app,
+                &[&title, &addr_label, &pin_label, &sep1, &show, &sep2, &quit],
+            )?;
 
             // 加载托盘图标（白色透明底）
             let tray_png = include_bytes!("../icons/tray-icon.png");
@@ -404,19 +467,17 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .tooltip(&format!("VibeDrop - {}:{}", ip, port))
-                .on_menu_event(|app, event| {
-                    match event.id.as_ref() {
-                        "quit" => {
-                            app.exit(0);
-                        }
-                        "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                        _ => {}
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => {
+                        app.exit(0);
                     }
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    _ => {}
                 })
                 .build(app)?;
 
@@ -510,7 +571,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                     } else {
                                         info!("收到文字: {}", text_content);
                                     }
-                                    log_history(text_content, "ws-client");
+                                    let history_entry = HistoryEntry::text_entry(text_content, "ws-client");
+                                    append_history_entry(&history_entry);
 
                                     let (reply_tx, reply_rx) = oneshot::channel();
                                     let req = InputRequest {
@@ -530,10 +592,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                                 // 通知 Tauri 前端窗口
                                                 if let Ok(guard) = state.app_handle.lock() {
                                                     if let Some(handle) = guard.as_ref() {
-                                                        let _ = handle.emit("text-received", serde_json::json!({
-                                                            "text": text_content,
-                                                            "timestamp": chrono::Local::now().to_rfc3339()
-                                                        }));
+                                                        let _ = handle.emit("text-received", &history_entry);
                                                     }
                                                 }
 
@@ -557,6 +616,166 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                                 error!("键盘输入线程无响应");
                                             }
                                         }
+                                    }
+                                }
+                            }
+
+                            "image_clipboard" => {
+                                if !authenticated {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("未认证".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                }
+
+                                let Some(image_base64) = client_msg.image_base64.as_deref() else {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("缺少图片数据".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                };
+
+                                let requested_file_name = client_msg.file_name.as_deref().unwrap_or("图片");
+                                info!(
+                                    "收到图片: {} ({})",
+                                    requested_file_name,
+                                    client_msg.mime_type.as_deref().unwrap_or("unknown")
+                                );
+
+                                match prepare_saved_image(
+                                    image_base64,
+                                    client_msg.file_name.as_deref(),
+                                    client_msg.mime_type.as_deref(),
+                                ) {
+                                    Ok(saved_image) => {
+                                        let history_entry = HistoryEntry {
+                                            timestamp: chrono::Local::now().to_rfc3339_opts(
+                                                chrono::SecondsFormat::Millis,
+                                                false,
+                                            ),
+                                            text: format!("[图片] {}", saved_image.file_name),
+                                            client_ip: "ws-client".to_string(),
+                                            kind: Some("image".to_string()),
+                                            file_name: Some(saved_image.file_name.clone()),
+                                            image_path: Some(saved_image.image_path.clone()),
+                                            thumbnail_data_url: Some(saved_image.thumbnail_data_url.clone()),
+                                            file_path: None,
+                                        };
+
+                                        if let Err(e) = set_clipboard_image(saved_image.clipboard_image) {
+                                            error!("图片写入剪贴板失败: {}", e);
+                                            let reply = ServerMessage {
+                                                status: "error".to_string(),
+                                                hostname: None,
+                                                error: Some(e),
+                                            };
+                                            let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                            continue;
+                                        }
+
+                                        append_history_entry(&history_entry);
+
+                                        if let Ok(guard) = state.app_handle.lock() {
+                                            if let Some(handle) = guard.as_ref() {
+                                                let _ = handle.emit("text-received", &history_entry);
+                                            }
+                                        }
+
+                                        let reply = ServerMessage {
+                                            status: "ok".to_string(),
+                                            hostname: None,
+                                            error: None,
+                                        };
+                                        let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    }
+                                    Err(e) => {
+                                        error!("图片处理失败: {}", e);
+                                        let reply = ServerMessage {
+                                            status: "error".to_string(),
+                                            hostname: None,
+                                            error: Some(e),
+                                        };
+                                        let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    }
+                                }
+                            }
+
+                            "file_download" => {
+                                if !authenticated {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("未认证".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                }
+
+                                let Some(file_base64) = client_msg.file_base64.as_deref() else {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("缺少文件数据".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                };
+
+                                let requested_file_name = client_msg.file_name.as_deref().unwrap_or("file.bin");
+                                info!(
+                                    "收到文件: {} ({})",
+                                    requested_file_name,
+                                    client_msg.mime_type.as_deref().unwrap_or("unknown")
+                                );
+
+                                match save_downloaded_file(
+                                    file_base64,
+                                    client_msg.file_name.as_deref(),
+                                ) {
+                                    Ok((saved_file_name, saved_file_path)) => {
+                                        let history_entry = HistoryEntry {
+                                            timestamp: chrono::Local::now().to_rfc3339_opts(
+                                                chrono::SecondsFormat::Millis,
+                                                false,
+                                            ),
+                                            text: format!("[文件] {}", saved_file_name),
+                                            client_ip: "ws-client".to_string(),
+                                            kind: Some("file".to_string()),
+                                            file_name: Some(saved_file_name),
+                                            image_path: None,
+                                            thumbnail_data_url: None,
+                                            file_path: Some(saved_file_path),
+                                        };
+
+                                        append_history_entry(&history_entry);
+
+                                        if let Ok(guard) = state.app_handle.lock() {
+                                            if let Some(handle) = guard.as_ref() {
+                                                let _ = handle.emit("text-received", &history_entry);
+                                            }
+                                        }
+
+                                        let reply = ServerMessage {
+                                            status: "ok".to_string(),
+                                            hostname: None,
+                                            error: None,
+                                        };
+                                        let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    }
+                                    Err(e) => {
+                                        error!("文件保存失败: {}", e);
+                                        let reply = ServerMessage {
+                                            status: "error".to_string(),
+                                            hostname: None,
+                                            error: Some(e),
+                                        };
+                                        let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
                                     }
                                 }
                             }
@@ -695,13 +914,7 @@ fn history_log_paths() -> Vec<PathBuf> {
     ]
 }
 
-fn log_history(text: &str, client_ip: &str) {
-    let entry = HistoryEntry {
-        timestamp: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
-        text: text.to_string(),
-        client_ip: client_ip.to_string(),
-    };
-
+fn append_history_entry(entry: &HistoryEntry) {
     let log_path = dirs_log_dir().join("history.jsonl");
     match OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(mut file) => {
@@ -711,4 +924,187 @@ fn log_history(text: &str, client_ip: &str) {
         }
         Err(e) => error!("无法写入日志: {}", e),
     }
+}
+
+fn decode_base64_bytes(encoded: &str) -> Result<Vec<u8>, String> {
+    BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("数据解码失败: {}", e))
+}
+
+fn file_extension(file_name: Option<&str>, mime_type: Option<&str>) -> &'static str {
+    if let Some(name) = file_name {
+        if let Some(ext) = Path::new(name).extension().and_then(|ext| ext.to_str()) {
+            let ext = ext.to_ascii_lowercase();
+            return match ext.as_str() {
+                "png" => "png",
+                "jpg" | "jpeg" => "jpg",
+                "gif" => "gif",
+                "webp" => "webp",
+                _ => "png",
+            };
+        }
+    }
+
+    match mime_type.unwrap_or_default() {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "png",
+    }
+}
+
+fn sanitize_file_name(file_name: Option<&str>, fallback_name: &str) -> String {
+    let source = file_name
+        .and_then(|name| Path::new(name).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    let sanitized: String = source
+        .chars()
+        .map(|ch| {
+            if ch == '/' || ch == '\\' || ch == ':' || ch.is_control() {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        fallback_name.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn preferred_image_name(file_name: Option<&str>, mime_type: Option<&str>) -> String {
+    let sanitized = sanitize_file_name(file_name, "image.png");
+    if Path::new(&sanitized).extension().is_some() {
+        return sanitized;
+    }
+
+    format!("{}.{}", sanitized, file_extension(file_name, mime_type))
+}
+
+fn unique_path(dir: &Path, preferred_name: &str) -> PathBuf {
+    let preferred_path = dir.join(preferred_name);
+    if !preferred_path.exists() {
+        return preferred_path;
+    }
+
+    let stem = Path::new(preferred_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("file");
+    let ext = Path::new(preferred_name)
+        .extension()
+        .and_then(|ext| ext.to_str());
+
+    for index in 1.. {
+        let candidate = if let Some(ext) = ext {
+            format!("{} ({index}).{}", stem, ext)
+        } else {
+            format!("{} ({index})", stem)
+        };
+        let path = dir.join(candidate);
+        if !path.exists() {
+            return path;
+        }
+    }
+
+    unreachable!()
+}
+
+fn downloads_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join("Downloads")
+}
+
+fn save_received_image(
+    image_bytes: &[u8],
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+) -> Result<(String, String), String> {
+    let image_dir = dirs_log_dir().join("received-images");
+    fs::create_dir_all(&image_dir).map_err(|e| format!("无法创建图片目录: {}", e))?;
+    let image_path = unique_path(&image_dir, &preferred_image_name(file_name, mime_type));
+    let final_file_name = image_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image.png")
+        .to_string();
+
+    fs::write(&image_path, image_bytes).map_err(|e| format!("无法保存原图: {}", e))?;
+
+    Ok((final_file_name, image_path.to_string_lossy().to_string()))
+}
+
+fn save_downloaded_file(file_base64: &str, file_name: Option<&str>) -> Result<(String, String), String> {
+    let file_bytes = decode_base64_bytes(file_base64)?;
+    let dir = downloads_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("无法创建下载目录: {}", e))?;
+
+    let preferred_name = sanitize_file_name(file_name, "file.bin");
+    let file_path = unique_path(&dir, &preferred_name);
+    let final_file_name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file.bin")
+        .to_string();
+
+    fs::write(&file_path, file_bytes).map_err(|e| format!("无法保存文件: {}", e))?;
+    Ok((final_file_name, file_path.to_string_lossy().to_string()))
+}
+
+fn build_thumbnail_data_url(image: &image::DynamicImage) -> Result<String, String> {
+    let thumb = image.thumbnail(220, 220);
+    let mut cursor = Cursor::new(Vec::new());
+    thumb
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .map_err(|e| format!("无法生成缩略图: {}", e))?;
+
+    let encoded = BASE64_STANDARD.encode(cursor.into_inner());
+    Ok(format!("data:image/png;base64,{}", encoded))
+}
+
+fn image_to_clipboard_data(image: image::DynamicImage) -> Result<ImageData<'static>, String> {
+    let image = image.to_rgba8();
+
+    let width = usize::try_from(image.width()).map_err(|_| "图片宽度无效".to_string())?;
+    let height = usize::try_from(image.height()).map_err(|_| "图片高度无效".to_string())?;
+
+    Ok(ImageData {
+        width,
+        height,
+        bytes: Cow::Owned(image.into_raw()),
+    })
+}
+
+fn prepare_saved_image(
+    image_base64: &str,
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+) -> Result<SavedImage, String> {
+    let image_bytes = decode_base64_bytes(image_base64)?;
+    let (final_file_name, image_path) = save_received_image(&image_bytes, file_name, mime_type)?;
+    let image =
+        image::load_from_memory(&image_bytes).map_err(|e| format!("无法读取图片数据: {}", e))?;
+    let thumbnail_data_url = build_thumbnail_data_url(&image)?;
+    let clipboard_image = image_to_clipboard_data(image)?;
+
+    Ok(SavedImage {
+        file_name: final_file_name,
+        image_path,
+        thumbnail_data_url,
+        clipboard_image,
+    })
+}
+
+fn set_clipboard_image(image_data: ImageData<'static>) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("无法访问剪贴板: {}", e))?;
+    clipboard
+        .set_image(image_data)
+        .map_err(|e| format!("无法写入图片到剪贴板: {}", e))
 }

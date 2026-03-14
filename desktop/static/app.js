@@ -8,9 +8,12 @@ const HEARTBEAT_TIMEOUT = 10000;
 const RECONNECT_INTERVAL = 3000;
 const HISTORY_KEY = 'voicedrop_history';
 const SETTINGS_KEY = 'voicedrop_settings';
+const MAX_IMAGE_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_FILE_TRANSFER_BYTES = 32 * 1024 * 1024;
 
 // ---- 状态 ----
 const connections = {}; // key = device.id, value = { ws, authenticated, hostname, ... }
+let pendingSharedContent = null;
 
 // ---- DOM 缓存 ----
 const $ = (id) => document.getElementById(id);
@@ -22,6 +25,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     initNavigation();
     initSettingsButton();
     initHistoryActions();
+    initNativeShareInbox();
+    await loadPendingSharedContent();
 });
 
 // ---- 持久化存储（Tauri 文件系统）----
@@ -234,6 +239,12 @@ function renderSendCards(devices) {
                     <button class="send-btn aux-btn enter-btn" id="enterbtn-${dev.id}" disabled>回车</button>
                 </div>
                 <button class="send-btn combo-btn" id="sendenterbtn-${dev.id}" disabled>发送并回车</button>
+                <div class="send-actions media-actions">
+                    <button class="send-btn image-btn" id="imagebtn-${dev.id}" disabled>传图到剪贴板</button>
+                    <button class="send-btn image-btn" id="filebtn-${dev.id}" disabled>传文件到下载</button>
+                </div>
+                <input type="file" id="imageinput-${dev.id}" accept="image/*" class="hidden-file-input">
+                <input type="file" id="fileinput-${dev.id}" class="hidden-file-input">
             </div>
         `;
         container.appendChild(card);
@@ -242,11 +253,47 @@ function renderSendCards(devices) {
         const sendBtn = card.querySelector(`#sendbtn-${dev.id}`);
         const enterBtn = card.querySelector(`#enterbtn-${dev.id}`);
         const sendEnterBtn = card.querySelector(`#sendenterbtn-${dev.id}`);
+        const imageBtn = card.querySelector(`#imagebtn-${dev.id}`);
+        const fileBtn = card.querySelector(`#filebtn-${dev.id}`);
+        const imageInput = card.querySelector(`#imageinput-${dev.id}`);
+        const fileInput = card.querySelector(`#fileinput-${dev.id}`);
         const input = card.querySelector('textarea');
 
         sendBtn.addEventListener('click', () => sendText(dev.id));
         enterBtn.addEventListener('click', () => sendEnter(dev.id));
         sendEnterBtn.addEventListener('click', () => sendTextAndEnter(dev.id));
+        imageBtn.addEventListener('click', () => {
+            if (pendingSharedContent) {
+                if (!pendingSharedContent.isImage) {
+                    showToast('当前共享内容不是图片，请使用“传文件到下载”');
+                    return;
+                }
+                sendPendingSharedImage(dev.id);
+                return;
+            }
+            imageInput.click();
+        });
+        fileBtn.addEventListener('click', () => {
+            if (pendingSharedContent) {
+                sendPendingSharedFile(dev.id);
+                return;
+            }
+            fileInput.click();
+        });
+        imageInput.addEventListener('change', async (event) => {
+            const [file] = event.target.files || [];
+            event.target.value = '';
+            if (file) {
+                await sendSelectedImage(dev.id, file);
+            }
+        });
+        fileInput.addEventListener('change', async (event) => {
+            const [file] = event.target.files || [];
+            event.target.value = '';
+            if (file) {
+                await sendSelectedFile(dev.id, file);
+            }
+        });
         input.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -385,6 +432,19 @@ function showView(viewId) {
     if (viewId === 'history-view') {
         renderHistory();
     }
+}
+
+function activateNavButton(buttonId) {
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+    const button = $(buttonId);
+    if (button) {
+        button.classList.add('active');
+    }
+}
+
+function focusSendView() {
+    showView('send-view');
+    activateNavButton('nav-send-btn');
 }
 
 // ============================================
@@ -539,6 +599,8 @@ function updateDeviceUI(deviceId, status, detail) {
     const sendBtn = $(`sendbtn-${deviceId}`);
     const enterBtn = $(`enterbtn-${deviceId}`);
     const sendEnterBtn = $(`sendenterbtn-${deviceId}`);
+    const imageBtn = $(`imagebtn-${deviceId}`);
+    const fileBtn = $(`filebtn-${deviceId}`);
 
     if (!dot || !card) return; // 设备卡片可能不存在
 
@@ -553,6 +615,8 @@ function updateDeviceUI(deviceId, status, detail) {
             if (sendBtn) sendBtn.disabled = false;
             if (enterBtn) enterBtn.disabled = false;
             if (sendEnterBtn) sendEnterBtn.disabled = false;
+            if (imageBtn) imageBtn.disabled = false;
+            if (fileBtn) fileBtn.disabled = false;
             if (detail) name.textContent = detail;
             break;
         case 'connecting':
@@ -561,6 +625,8 @@ function updateDeviceUI(deviceId, status, detail) {
             if (sendBtn) sendBtn.disabled = true;
             if (enterBtn) enterBtn.disabled = true;
             if (sendEnterBtn) sendEnterBtn.disabled = true;
+            if (imageBtn) imageBtn.disabled = true;
+            if (fileBtn) fileBtn.disabled = true;
             break;
         case 'error':
             dot.classList.add('error');
@@ -569,6 +635,8 @@ function updateDeviceUI(deviceId, status, detail) {
             if (sendBtn) sendBtn.disabled = true;
             if (enterBtn) enterBtn.disabled = true;
             if (sendEnterBtn) sendEnterBtn.disabled = true;
+            if (imageBtn) imageBtn.disabled = true;
+            if (fileBtn) fileBtn.disabled = true;
             break;
         case 'disconnected':
         default:
@@ -576,6 +644,8 @@ function updateDeviceUI(deviceId, status, detail) {
             if (sendBtn) sendBtn.disabled = true;
             if (enterBtn) enterBtn.disabled = true;
             if (sendEnterBtn) sendEnterBtn.disabled = true;
+            if (imageBtn) imageBtn.disabled = true;
+            if (fileBtn) fileBtn.disabled = true;
             break;
     }
 }
@@ -588,9 +658,13 @@ function setActionButtonsDisabled(deviceId, disabled) {
     const sendBtn = $(`sendbtn-${deviceId}`);
     const enterBtn = $(`enterbtn-${deviceId}`);
     const sendEnterBtn = $(`sendenterbtn-${deviceId}`);
+    const imageBtn = $(`imagebtn-${deviceId}`);
+    const fileBtn = $(`filebtn-${deviceId}`);
     if (sendBtn) sendBtn.disabled = disabled;
     if (enterBtn) enterBtn.disabled = disabled;
     if (sendEnterBtn) sendEnterBtn.disabled = disabled;
+    if (imageBtn) imageBtn.disabled = disabled;
+    if (fileBtn) fileBtn.disabled = disabled;
 }
 
 async function sendDeviceAction(deviceId, {
@@ -601,6 +675,8 @@ async function sendDeviceAction(deviceId, {
     clearInput = false,
     historyEntry = null,
     failureToast = false,
+    successToast = '',
+    timeoutMs = 5000,
 }) {
     const conn = connections[deviceId];
     const btn = $(buttonId);
@@ -624,13 +700,16 @@ async function sendDeviceAction(deviceId, {
                     conn._sendCallback = null;
                     reject(new Error('超时'));
                 }
-            }, 5000);
+            }, timeoutMs);
         });
 
         if (result.status === 'ok') {
             if (historyEntry) {
                 historyEntry.status = 'success';
                 updateHistory(historyEntry);
+            }
+            if (successToast) {
+                showToast(successToast);
             }
             btn.classList.add('success');
             btn.textContent = '✓';
@@ -746,6 +825,406 @@ async function sendTextAndEnter(deviceId) {
         historyEntry.status = 'success';
         updateHistory(historyEntry);
         input.value = '';
+    }
+}
+
+function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
+        reader.readAsDataURL(file);
+    });
+}
+
+function getTargetName(deviceId) {
+    const conn = connections[deviceId];
+    const devices = getDevices();
+    const dev = devices.find(d => d.id === deviceId);
+    return conn?.hostname || (dev ? dev.name : deviceId);
+}
+
+function createThumbnailDataUrl(sourceDataUrl, outputType = 'image/jpeg') {
+    return new Promise((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => {
+            const maxEdge = 180;
+            const scale = Math.min(maxEdge / image.width, maxEdge / image.height, 1);
+            const width = Math.max(1, Math.round(image.width * scale));
+            const height = Math.max(1, Math.round(image.height * scale));
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const context = canvas.getContext('2d');
+
+            if (!context) {
+                reject(new Error('无法创建图片预览'));
+                return;
+            }
+
+            context.drawImage(image, 0, 0, width, height);
+            resolve(canvas.toDataURL(outputType, 0.82));
+        };
+        image.onerror = () => reject(new Error('无法生成图片预览'));
+        image.src = sourceDataUrl;
+    });
+}
+
+async function sendSelectedImage(deviceId, file) {
+    const conn = connections[deviceId];
+    if (!file || !conn || !conn.authenticated || !conn.ws) return;
+
+    if (!file.type || !file.type.startsWith('image/')) {
+        showToast('请选择图片文件');
+        return;
+    }
+
+    if (file.size > MAX_IMAGE_FILE_BYTES) {
+        showToast('图片过大，请选择 10MB 以内的图片');
+        return;
+    }
+
+    const targetName = getTargetName(deviceId);
+    const displayText = `[图片] ${file.name}`;
+
+    const historyEntry = {
+        id: Date.now(),
+        timestamp: getLocalTimestamp(),
+        text: displayText,
+        target: deviceId,
+        targetName,
+        status: 'pending',
+        kind: 'image',
+        fileName: file.name,
+        mimeType: file.type,
+    };
+    addHistory(historyEntry);
+
+    try {
+        const dataUrl = await readFileAsDataUrl(file);
+        const commaIndex = String(dataUrl).indexOf(',');
+        if (commaIndex === -1) {
+            throw new Error('图片编码失败');
+        }
+
+        try {
+            historyEntry.thumbnailDataUrl = await createThumbnailDataUrl(
+                dataUrl,
+                file.type === 'image/png' ? 'image/png' : 'image/jpeg'
+            );
+            updateHistory(historyEntry);
+        } catch (previewError) {
+            console.warn('生成缩略图失败，继续发送原图:', previewError);
+        }
+
+        const imageBase64 = String(dataUrl).slice(commaIndex + 1);
+        await sendDeviceAction(deviceId, {
+            action: 'image_clipboard',
+            payload: {
+                file_name: file.name,
+                mime_type: file.type,
+                image_base64: imageBase64,
+            },
+            buttonId: `imagebtn-${deviceId}`,
+            pendingText: '传图中...',
+            historyEntry,
+            failureToast: true,
+            successToast: '图片已放入 Mac 剪贴板',
+            timeoutMs: 20000,
+        });
+    } catch (error) {
+        historyEntry.status = 'failed';
+        updateHistory(historyEntry);
+        showToast(`图片发送失败：${error.message}`);
+    }
+}
+
+async function sendSelectedFile(deviceId, file) {
+    const conn = connections[deviceId];
+    if (!file || !conn || !conn.authenticated || !conn.ws) return;
+
+    if (file.size > MAX_FILE_TRANSFER_BYTES) {
+        showToast('文件过大，请选择 32MB 以内的文件');
+        return;
+    }
+
+    const targetName = getTargetName(deviceId);
+    const historyEntry = {
+        id: Date.now(),
+        timestamp: getLocalTimestamp(),
+        text: `[文件] ${file.name}`,
+        target: deviceId,
+        targetName,
+        status: 'pending',
+        kind: 'file',
+        fileName: file.name,
+        mimeType: file.type || 'application/octet-stream',
+    };
+    addHistory(historyEntry);
+
+    try {
+        const dataUrl = await readFileAsDataUrl(file);
+        const commaIndex = String(dataUrl).indexOf(',');
+        if (commaIndex === -1) {
+            throw new Error('文件编码失败');
+        }
+
+        const fileBase64 = String(dataUrl).slice(commaIndex + 1);
+        await sendDeviceAction(deviceId, {
+            action: 'file_download',
+            payload: {
+                file_name: file.name,
+                mime_type: file.type || 'application/octet-stream',
+                file_base64: fileBase64,
+            },
+            buttonId: `filebtn-${deviceId}`,
+            pendingText: '传文件中...',
+            historyEntry,
+            failureToast: true,
+            successToast: '文件已保存到 Mac 下载文件夹',
+            timeoutMs: 45000,
+        });
+    } catch (error) {
+        historyEntry.status = 'failed';
+        updateHistory(historyEntry);
+        showToast(`文件传输失败：${error.message}`);
+    }
+}
+
+function normalizePendingSharedContent(raw) {
+    if (!raw) {
+        return null;
+    }
+
+    let data = raw;
+    if (typeof raw === 'string') {
+        try {
+            data = JSON.parse(raw);
+        } catch {
+            return null;
+        }
+    }
+
+    if (!data || !data.displayName) {
+        return null;
+    }
+
+    return {
+        displayName: data.displayName,
+        mimeType: data.mimeType || 'application/octet-stream',
+        sizeBytes: Number(data.sizeBytes || 0),
+        isImage: Boolean(data.isImage),
+    };
+}
+
+function formatFileSize(sizeBytes) {
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+        return '';
+    }
+    if (sizeBytes < 1024) {
+        return `${sizeBytes} B`;
+    }
+    if (sizeBytes < 1024 * 1024) {
+        return `${(sizeBytes / 1024).toFixed(1)} KB`;
+    }
+    return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderPendingSharedContent() {
+    const card = $('share-inbox');
+    const title = $('share-inbox-title');
+    const hint = $('share-inbox-hint');
+    if (!card || !title || !hint) return;
+
+    if (!pendingSharedContent) {
+        card.classList.add('hidden');
+        title.textContent = '';
+        hint.textContent = '';
+        return;
+    }
+
+    const sizeText = formatFileSize(pendingSharedContent.sizeBytes);
+    title.textContent = pendingSharedContent.displayName;
+    hint.textContent = pendingSharedContent.isImage
+        ? `图片已从系统分享导入${sizeText ? ` · ${sizeText}` : ''}，现在可直接点任意设备的“传图到剪贴板”或“传文件到下载”。`
+        : `文件已从系统分享导入${sizeText ? ` · ${sizeText}` : ''}，现在可直接点任意设备的“传文件到下载”。`;
+    card.classList.remove('hidden');
+}
+
+function clearPendingSharedContentState({ silent = false } = {}) {
+    if (window.NativeShare && window.NativeShare.clearPendingSharedContent) {
+        try {
+            window.NativeShare.clearPendingSharedContent();
+        } catch (error) {
+            console.warn('清理共享内容失败', error);
+        }
+    }
+    pendingSharedContent = null;
+    renderPendingSharedContent();
+    if (!silent) {
+        showToast('已清除共享内容');
+    }
+}
+
+function setPendingSharedContent(raw, { announce = false } = {}) {
+    const normalized = normalizePendingSharedContent(raw);
+    if (!normalized) {
+        return;
+    }
+    pendingSharedContent = normalized;
+    renderPendingSharedContent();
+    focusSendView();
+    if (announce) {
+        showToast(`已接收共享内容：${normalized.displayName}`);
+    }
+}
+
+async function loadPendingSharedContent() {
+    if (!window.NativeShare || !window.NativeShare.getPendingSharedContent) {
+        return;
+    }
+
+    try {
+        const raw = window.NativeShare.getPendingSharedContent();
+        if (raw) {
+            setPendingSharedContent(raw);
+        } else {
+            renderPendingSharedContent();
+        }
+    } catch (error) {
+        console.warn('读取共享内容失败', error);
+    }
+}
+
+function initNativeShareInbox() {
+    const clearBtn = $('clear-share-btn');
+    if (clearBtn) {
+        clearBtn.addEventListener('click', () => clearPendingSharedContentState());
+    }
+
+    window.addEventListener('native-incoming-share', (event) => {
+        setPendingSharedContent(event.detail, { announce: true });
+    });
+}
+
+function readPendingSharedContentBase64() {
+    if (!window.NativeShare || !window.NativeShare.readPendingSharedContentBase64) {
+        throw new Error('当前环境不支持系统分享内容读取');
+    }
+
+    const base64 = window.NativeShare.readPendingSharedContentBase64();
+    if (!base64) {
+        throw new Error('共享内容已失效，请重新分享一次');
+    }
+
+    return base64;
+}
+
+async function sendPendingSharedImage(deviceId) {
+    const conn = connections[deviceId];
+    if (!pendingSharedContent || !pendingSharedContent.isImage || !conn || !conn.authenticated || !conn.ws) {
+        return;
+    }
+
+    const shared = pendingSharedContent;
+    const targetName = getTargetName(deviceId);
+    const historyEntry = {
+        id: Date.now(),
+        timestamp: getLocalTimestamp(),
+        text: `[图片] ${shared.displayName}`,
+        target: deviceId,
+        targetName,
+        status: 'pending',
+        kind: 'image',
+        fileName: shared.displayName,
+        mimeType: shared.mimeType,
+    };
+    addHistory(historyEntry);
+
+    try {
+        const imageBase64 = readPendingSharedContentBase64();
+        const dataUrl = `data:${shared.mimeType};base64,${imageBase64}`;
+
+        try {
+            historyEntry.thumbnailDataUrl = await createThumbnailDataUrl(
+                dataUrl,
+                shared.mimeType === 'image/png' ? 'image/png' : 'image/jpeg'
+            );
+            updateHistory(historyEntry);
+        } catch (previewError) {
+            console.warn('生成共享图片缩略图失败，继续发送原图:', previewError);
+        }
+
+        const result = await sendDeviceAction(deviceId, {
+            action: 'image_clipboard',
+            payload: {
+                file_name: shared.displayName,
+                mime_type: shared.mimeType,
+                image_base64: imageBase64,
+            },
+            buttonId: `imagebtn-${deviceId}`,
+            pendingText: '传图中...',
+            historyEntry,
+            failureToast: true,
+            successToast: '图片已放入 Mac 剪贴板',
+            timeoutMs: 20000,
+        });
+
+        if (result.ok) {
+            clearPendingSharedContentState({ silent: true });
+        }
+    } catch (error) {
+        historyEntry.status = 'failed';
+        updateHistory(historyEntry);
+        showToast(`共享图片发送失败：${error.message}`);
+    }
+}
+
+async function sendPendingSharedFile(deviceId) {
+    const conn = connections[deviceId];
+    if (!pendingSharedContent || !conn || !conn.authenticated || !conn.ws) {
+        return;
+    }
+
+    const shared = pendingSharedContent;
+    const targetName = getTargetName(deviceId);
+    const historyEntry = {
+        id: Date.now(),
+        timestamp: getLocalTimestamp(),
+        text: `[文件] ${shared.displayName}`,
+        target: deviceId,
+        targetName,
+        status: 'pending',
+        kind: 'file',
+        fileName: shared.displayName,
+        mimeType: shared.mimeType,
+    };
+    addHistory(historyEntry);
+
+    try {
+        const fileBase64 = readPendingSharedContentBase64();
+        const result = await sendDeviceAction(deviceId, {
+            action: 'file_download',
+            payload: {
+                file_name: shared.displayName,
+                mime_type: shared.mimeType,
+                file_base64: fileBase64,
+            },
+            buttonId: `filebtn-${deviceId}`,
+            pendingText: '传文件中...',
+            historyEntry,
+            failureToast: true,
+            successToast: '文件已保存到 Mac 下载文件夹',
+            timeoutMs: 45000,
+        });
+
+        if (result.ok) {
+            clearPendingSharedContentState({ silent: true });
+        }
+    } catch (error) {
+        historyEntry.status = 'failed';
+        updateHistory(historyEntry);
+        showToast(`共享文件发送失败：${error.message}`);
     }
 }
 
@@ -1087,14 +1566,41 @@ function renderHistory() {
     list.innerHTML = filtered.map((h, i) => {
         const time = formatTime(h.timestamp);
         const statusIcon = h.status === 'success' ? '已送达' : h.status === 'failed' ? '失败' : '发送中';
+        const title = h.kind === 'image'
+            ? '图片记录'
+            : h.kind === 'file'
+                ? '文件记录'
+                : '点击复制';
+        const thumbnail = h.thumbnailDataUrl || h.thumbnail_data_url;
+        const content = h.kind === 'image' && thumbnail
+            ? `
+                <div class="history-image-row">
+                    <img class="history-thumb" src="${thumbnail}" alt="${escapeHtml(h.fileName || h.file_name || h.text || '图片')}">
+                    <div class="history-image-meta">
+                        <div class="history-text">${escapeHtml(h.text)}</div>
+                        <div class="history-image-hint">已发送到 Mac 剪贴板</div>
+                    </div>
+                </div>
+            `
+            : h.kind === 'file'
+                ? `
+                    <div class="history-image-row history-file-row">
+                        <div class="history-file-badge">文件</div>
+                        <div class="history-image-meta">
+                            <div class="history-text">${escapeHtml(h.text)}</div>
+                            <div class="history-image-hint">已保存到 Mac 下载文件夹</div>
+                        </div>
+                    </div>
+                `
+            : `<div class="history-text">${escapeHtml(h.text)}</div>`;
         return `
-            <div class="history-item" data-idx="${i}" style="cursor:pointer" title="点击复制">
+            <div class="history-item" data-idx="${i}" style="cursor:pointer" title="${title}">
                 <div class="history-item-header">
                     <span class="history-time">${time}</span>
                     <span class="history-target">${h.targetName || h.target}</span>
                     <span class="history-status">${statusIcon}</span>
                 </div>
-                <div class="history-text">${escapeHtml(h.text)}</div>
+                ${content}
             </div>
         `;
     }).join('');
@@ -1102,7 +1608,16 @@ function renderHistory() {
     // 点击复制
     list.querySelectorAll('.history-item').forEach((item, i) => {
         item.addEventListener('click', () => {
-            const text = filtered[i].text;
+            const entry = filtered[i];
+            if (entry.kind === 'image') {
+                showToast('图片记录不支持复制');
+                return;
+            }
+            if (entry.kind === 'file') {
+                showToast('文件记录不支持复制');
+                return;
+            }
+            const text = entry.text;
             writeClipboard(text).then(() => {
                 showToast('已复制');
             }).catch(() => {

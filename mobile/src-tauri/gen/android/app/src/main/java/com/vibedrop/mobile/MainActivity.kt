@@ -6,11 +6,14 @@ import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.provider.OpenableColumns
 import android.provider.Settings
+import android.util.Base64
 import android.util.Log
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
@@ -29,9 +32,26 @@ class MainActivity : TauriActivity() {
     private const val TAG = "VibeDrop"
   }
 
+  private data class PendingSharedContent(
+    val cachePath: String,
+    val displayName: String,
+    val mimeType: String,
+    val sizeBytes: Long,
+    val isImage: Boolean
+  ) {
+    fun toJson(): JSONObject = JSONObject().apply {
+      put("cachePath", cachePath)
+      put("displayName", displayName)
+      put("mimeType", mimeType)
+      put("sizeBytes", sizeBytes)
+      put("isImage", isImage)
+    }
+  }
+
   private var appWebView: WebView? = null
   private var pendingExportFilename: String? = null
   private var pendingExportData: String? = null
+  private var pendingSharedContent: PendingSharedContent? = null
 
   private val exportDocumentLauncher = registerForActivityResult(
     ActivityResultContracts.CreateDocument("application/json")
@@ -93,6 +113,7 @@ class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    handleIncomingShare(intent)
 
     // Android 13+ 请求通知权限
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -115,6 +136,12 @@ class MainActivity : TauriActivity() {
     window.decorView.postDelayed({ checkPermissionsOnce() }, 2000)
   }
 
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent)
+    handleIncomingShare(intent)
+  }
+
   /**
    * WebView 创建后注入 JS Bridge，让前端可以调用原生剪贴板写入
    * JS 端调用：window.NativeClipboard.writeText("文字")
@@ -125,6 +152,7 @@ class MainActivity : TauriActivity() {
     webView.addJavascriptInterface(ClipboardBridge(this), "NativeClipboard")
     webView.addJavascriptInterface(ShareBridge(), "NativeShare")
     Log.d(TAG, "JS Bridge NativeClipboard 已注入")
+    emitPendingShareIfAvailable()
   }
 
   /**
@@ -203,6 +231,31 @@ class MainActivity : TauriActivity() {
           )
         }
       }
+    }
+
+    @JavascriptInterface
+    fun getPendingSharedContent(): String {
+      return pendingSharedContent?.toJson()?.toString() ?: ""
+    }
+
+    @JavascriptInterface
+    fun readPendingSharedContentBase64(): String {
+      val sharedContent = pendingSharedContent ?: return ""
+      return try {
+        Base64.encodeToString(File(sharedContent.cachePath).readBytes(), Base64.NO_WRAP)
+      } catch (e: Exception) {
+        Log.e(TAG, "读取共享内容失败", e)
+        ""
+      }
+    }
+
+    @JavascriptInterface
+    fun clearPendingSharedContent() {
+      pendingSharedContent?.let { content ->
+        runCatching { File(content.cachePath).delete() }
+          .onFailure { Log.w(TAG, "清理共享缓存失败", it) }
+      }
+      pendingSharedContent = null
     }
   }
 
@@ -287,6 +340,108 @@ class MainActivity : TauriActivity() {
   private fun sanitizeFilename(filename: String): String {
     val cleaned = filename.replace(Regex("""[\\/:*?"<>|]"""), "_").trim()
     return if (cleaned.isNotEmpty()) cleaned else "vibedrop_history.json"
+  }
+
+  private fun handleIncomingShare(intent: Intent?) {
+    if (intent?.action != Intent.ACTION_SEND) {
+      return
+    }
+
+    val sharedUri = extractSharedUri(intent) ?: run {
+      Log.w(TAG, "收到系统分享，但未找到文件 URI")
+      return
+    }
+
+    try {
+      val mimeType = intent.type ?: contentResolver.getType(sharedUri) ?: "application/octet-stream"
+      val displayName = resolveSharedDisplayName(sharedUri, mimeType)
+      val cachedFile = copySharedContentToCache(sharedUri, displayName)
+
+      pendingSharedContent?.let { previous ->
+        runCatching { File(previous.cachePath).delete() }
+          .onFailure { Log.w(TAG, "清理旧的共享缓存失败", it) }
+      }
+
+      pendingSharedContent = PendingSharedContent(
+        cachePath = cachedFile.absolutePath,
+        displayName = cachedFile.name,
+        mimeType = mimeType,
+        sizeBytes = cachedFile.length(),
+        isImage = mimeType.startsWith("image/")
+      )
+
+      Log.d(TAG, "已接收系统分享: ${cachedFile.name} ($mimeType)")
+      emitPendingShareIfAvailable()
+    } catch (e: Exception) {
+      Log.e(TAG, "处理系统分享失败", e)
+    }
+  }
+
+  private fun extractSharedUri(intent: Intent): Uri? {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)?.let { return it }
+    } else {
+      @Suppress("DEPRECATION")
+      (intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri)?.let { return it }
+    }
+
+    return intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+  }
+
+  private fun resolveSharedDisplayName(uri: Uri, mimeType: String): String {
+    val queriedName = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+      ?.use { cursor: Cursor ->
+        if (cursor.moveToFirst()) {
+          val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+          if (index >= 0) cursor.getString(index) else null
+        } else {
+          null
+        }
+      }
+
+    val fallbackName = if (mimeType.startsWith("image/")) "shared-image" else "shared-file"
+    return sanitizeFilename(queriedName ?: uri.lastPathSegment ?: fallbackName)
+  }
+
+  private fun copySharedContentToCache(uri: Uri, displayName: String): File {
+    val sharedDir = File(cacheDir, "incoming-shared").apply { mkdirs() }
+    val targetFile = uniqueCacheFile(sharedDir, displayName)
+
+    contentResolver.openInputStream(uri)?.use { input ->
+      targetFile.outputStream().use { output ->
+        input.copyTo(output)
+      }
+    } ?: throw IllegalStateException("无法读取共享文件")
+
+    return targetFile
+  }
+
+  private fun uniqueCacheFile(dir: File, preferredName: String): File {
+    val sanitized = sanitizeFilename(preferredName)
+    val preferred = File(dir, sanitized)
+    if (!preferred.exists()) {
+      return preferred
+    }
+
+    val stem = preferred.nameWithoutExtension.ifBlank { "shared-file" }
+    val extension = preferred.extension
+    var index = 1
+    while (true) {
+      val candidateName = if (extension.isBlank()) {
+        "$stem ($index)"
+      } else {
+        "$stem ($index).$extension"
+      }
+      val candidate = File(dir, candidateName)
+      if (!candidate.exists()) {
+        return candidate
+      }
+      index += 1
+    }
+  }
+
+  private fun emitPendingShareIfAvailable() {
+    pendingSharedContent?.let { emitBridgeEvent("native-incoming-share", it.toJson()) }
   }
 
   private fun emitBridgeEvent(eventName: String, payload: JSONObject) {
