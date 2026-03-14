@@ -457,4 +457,5 @@ cp vibedrop-mobile/src/style.css  安卓发送mac输入文字app/static/style.cs
 
 ## 许可证
 
-私有项目。
+[MIT License](LICENSE) — 完全开源，自由使用。
+
