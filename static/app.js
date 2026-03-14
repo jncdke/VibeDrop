@@ -98,12 +98,70 @@ function initSettingsButton() {
         document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
     });
 
+    // 返回按钮（不保存）
+    $('settings-back-btn').addEventListener('click', () => {
+        loadSettings(); // 恢复原来的值，丢弃修改
+        showView('send-view');
+        $('nav-send-btn').classList.add('active');
+    });
+
+    // 测试连接（不保存，只测试当前填写的值）
+    $('test-connection-btn').addEventListener('click', () => {
+        testConnection();
+    });
+
     $('save-settings-btn').addEventListener('click', () => {
         saveSettings();
         disconnectAll();
         showView('send-view');
         $('nav-send-btn').classList.add('active');
         connectAll();
+    });
+}
+
+function testConnection() {
+    const resultDiv = $('test-result');
+    resultDiv.style.display = 'block';
+    resultDiv.innerHTML = '⏳ 正在测试...';
+    resultDiv.style.color = '#a0a0c0';
+
+    const ip1 = $('mac1-ip').value.trim();
+    const port1 = $('mac1-port').value.trim() || '9001';
+    const pin1 = $('mac1-pin').value.trim();
+    const ip2 = $('mac2-ip').value.trim();
+    const port2 = $('mac2-port').value.trim() || '9001';
+    const pin2 = $('mac2-pin').value.trim();
+
+    let results = [];
+
+    function testOne(name, ip, port, pin) {
+        return new Promise((resolve) => {
+            if (!ip) { resolve(`${name}: ⏭ 未配置`); return; }
+            const ws = new WebSocket(`ws://${ip}:${port}/ws`);
+            const timeout = setTimeout(() => { ws.close(); resolve(`${name}: ❌ 连接超时`); }, 3000);
+            ws.onopen = () => {
+                ws.send(JSON.stringify({ action: 'auth', pin }));
+            };
+            ws.onmessage = (e) => {
+                clearTimeout(timeout);
+                const data = JSON.parse(e.data);
+                ws.close();
+                if (data.status === 'ok') {
+                    resolve(`${name}: ✅ 连接成功 (${data.hostname})`);
+                } else {
+                    resolve(`${name}: ❌ ${data.error || 'PIN 错误'}`);
+                }
+            };
+            ws.onerror = () => { clearTimeout(timeout); resolve(`${name}: ❌ 无法连接`); };
+        });
+    }
+
+    Promise.all([
+        testOne('Mac 1', ip1, port1, pin1),
+        testOne('Mac 2', ip2, port2, pin2),
+    ]).then(res => {
+        resultDiv.innerHTML = res.join('<br>');
+        resultDiv.style.color = '#e0e0ff';
     });
 }
 
