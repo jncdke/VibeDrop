@@ -251,8 +251,8 @@ function connectMac(macId, ip, port, pin) {
 
         // 剪贴板同步（Mac → 手机）
         if (data.action === 'clipboard') {
-            if (data.text && navigator.clipboard) {
-                navigator.clipboard.writeText(data.text).then(() => {
+            if (data.text) {
+                writeClipboard(data.text).then(() => {
                     showToast('📋 已同步到剪贴板');
                 }).catch(() => {
                     showToast('⚠️ 剪贴板写入失败');
@@ -632,11 +632,11 @@ function renderHistory() {
     list.querySelectorAll('.history-item').forEach((item, i) => {
         item.addEventListener('click', () => {
             const text = history[i].text;
-            if (navigator.clipboard) {
-                navigator.clipboard.writeText(text).then(() => {
-                    showToast('已复制 ✓');
-                });
-            }
+            writeClipboard(text).then(() => {
+                showToast('已复制 ✓');
+            }).catch(() => {
+                showToast('⚠️ 复制失败');
+            });
         });
     });
 }
@@ -660,6 +660,19 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ---- 剪贴板写入（Tauri 原生优先，浏览器 API 兜底）----
+async function writeClipboard(text) {
+    // Tauri 原生插件（不受前台/聚焦限制）
+    if (window.__TAURI__ && window.__TAURI__.clipboardManager) {
+        return window.__TAURI__.clipboardManager.writeText(text);
+    }
+    // 浏览器 API 兜底（需要页面聚焦）
+    if (navigator.clipboard) {
+        return navigator.clipboard.writeText(text);
+    }
+    throw new Error('无可用剪贴板 API');
 }
 
 // ---- Toast 提示 ----
