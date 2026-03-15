@@ -284,6 +284,11 @@ cargo tauri build
 ./scripts/deploy-desktop.sh
 ```
 
+桌面端和 Android 端现在共用一张主图：
+
+- 根目录 `图标.jpg` 作为 V1 原始图标源
+- 部署脚本会在构建前自动重建各端需要的 PNG / ICO / ICNS / Android launcher 资源
+
 注意：
 - 桌面端辅助功能授权依赖稳定的 bundle identifier，当前固定为 `com.vibedrop.desktop`
 - 不要手动把 `.app` 拖来拖去或自己 `cp` 覆盖安装，统一走 `./scripts/deploy-desktop.sh`
@@ -293,6 +298,9 @@ cargo tauri build
 常用参数：
 
 ```bash
+# 只重装和重启，不重新生成图标、不重新编译
+./scripts/deploy-desktop.sh --skip-icons --skip-build
+
 # 只重装和重启，不重新编译
 ./scripts/deploy-desktop.sh --skip-build
 
@@ -370,11 +378,31 @@ adb shell am start -n com.vibedrop.mobile/.MainActivity
 ./scripts/deploy-android.sh
 ```
 
+这个脚本现在会在构建前自动读取根目录的 V1 原图 `图标.jpg`，并重新生成：
+
+- 根目录 `图标.jpg` 会先被转换成最新的：
+- `mobile/src/icon.png`
+- `mobile/src/icon-192.png`
+- `mobile/src/icon-512.png`
+- `desktop/src/icon.png`
+- `desktop/static/icon.png`
+- `desktop/static/icon-192.png`
+- `desktop/static/icon-512.png`
+- `mobile/src-tauri/icons/{32x32,64x64,128x128,128x128@2x,icon.png}`
+- `desktop/src-tauri/icons/{32x32,64x64,128x128,128x128@2x,icon.png,icon.ico,icon.icns}`
+- `mobile/src-tauri/icons/{icon.ico,icon.icns}`
+- Android launcher 的各个 `mipmap-*` 图标资源
+
+也就是说，以后你只需要改一张源图 `图标.jpg`，再运行部署脚本即可。
+
 常用参数：
 
 ```bash
 # 多设备时指定序列号
 ./scripts/deploy-android.sh --device 3B6F4FE910B8KRLS
+
+# 只想重装 APK，不重新生成图标
+./scripts/deploy-android.sh --skip-icons
 
 # 如果同时改了 mobile/src 共享前端，顺手同步到 desktop/static
 ./scripts/deploy-android.sh --sync-static

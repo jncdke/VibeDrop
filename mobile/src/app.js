@@ -10,10 +10,29 @@ const HISTORY_KEY = 'voicedrop_history';
 const SETTINGS_KEY = 'voicedrop_settings';
 const MAX_IMAGE_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_FILE_TRANSFER_BYTES = 32 * 1024 * 1024;
+const DEFAULT_HISTORY_FILTERS = {
+    device: 'all',
+    quickTime: 'all',
+    startDate: '',
+    endDate: '',
+    timeRange: 'all',
+    startTime: '',
+    endTime: '',
+    kind: 'all',
+    status: 'all',
+};
 
 // ---- 状态 ----
 const connections = {}; // key = device.id, value = { ws, authenticated, hostname, ... }
 let pendingSharedContent = null;
+let currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS };
+let historyDatePickerState = {
+    field: null,
+    month: null,
+    availableDates: new Set(),
+    minDate: '',
+    maxDate: '',
+};
 
 // ---- DOM 缓存 ----
 const $ = (id) => document.getElementById(id);
@@ -25,6 +44,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     initNavigation();
     initSettingsButton();
     initHistoryActions();
+    initHistoryFilterControls();
     initNativeShareInbox();
     await loadPendingSharedContent();
 });
@@ -309,7 +329,7 @@ function renderSendCards(devices) {
 
 function renderHistoryFilters(devices) {
     const container = $('history-filter-btns');
-    container.innerHTML = '<button class="filter-btn active" data-filter="all">全部</button>';
+    container.innerHTML = '<button class="filter-btn" data-filter="all">全部</button>';
 
     devices.forEach(dev => {
         if (!dev.ip) return;
@@ -323,12 +343,15 @@ function renderHistoryFilters(devices) {
     // 绑定事件
     container.querySelectorAll('.filter-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-            container.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            currentFilter = btn.dataset.filter;
+            currentHistoryFilters.device = btn.dataset.filter;
+            renderDeviceFilterState();
+            renderHistoryDateInputs();
             renderHistory();
         });
     });
+
+    renderDeviceFilterState();
+    renderHistoryDateInputs();
 }
 
 // ============================================
@@ -445,6 +468,384 @@ function activateNavButton(buttonId) {
 function focusSendView() {
     showView('send-view');
     activateNavButton('nav-send-btn');
+}
+
+function initHistoryFilterControls() {
+    const timeContainer = $('history-time-filter-btns');
+    if (timeContainer) {
+        timeContainer.querySelectorAll('.filter-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const value = btn.dataset.timeFilter;
+                if (value === 'custom') {
+                    openHistoryFilterSheet();
+                    return;
+                }
+                currentHistoryFilters.quickTime = value;
+                renderTimeFilterState();
+                renderHistory();
+            });
+        });
+    }
+
+    $('history-filter-close-btn')?.addEventListener('click', closeHistoryFilterSheet);
+    $('history-filter-reset-btn')?.addEventListener('click', () => {
+        currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS, device: currentHistoryFilters.device };
+        syncHistoryFilterForm();
+        renderDeviceFilterState();
+        renderTimeFilterState();
+        renderHistory();
+        closeHistoryFilterSheet();
+    });
+    $('history-filter-apply-btn')?.addEventListener('click', applyHistoryFilterForm);
+    $('history-filter-modal')?.addEventListener('click', (event) => {
+        if (event.target === $('history-filter-modal')) {
+            closeHistoryFilterSheet();
+        }
+    });
+
+    $('history-time-range')?.addEventListener('change', () => {
+        syncCustomTimeInputsState();
+        renderHistoryDateInputs();
+    });
+    $('history-start-time')?.addEventListener('input', renderHistoryDateInputs);
+    $('history-end-time')?.addEventListener('input', renderHistoryDateInputs);
+    $('history-kind-filter')?.addEventListener('change', renderHistoryDateInputs);
+    $('history-status-filter')?.addEventListener('change', renderHistoryDateInputs);
+    $('history-start-date-trigger')?.addEventListener('click', () => openHistoryDatePicker('startDate'));
+    $('history-end-date-trigger')?.addEventListener('click', () => openHistoryDatePicker('endDate'));
+    $('history-date-picker-close-btn')?.addEventListener('click', closeHistoryDatePicker);
+    $('history-date-picker-done-btn')?.addEventListener('click', closeHistoryDatePicker);
+    $('history-date-picker-clear-btn')?.addEventListener('click', clearHistoryDateField);
+    $('history-date-picker-prev-btn')?.addEventListener('click', () => shiftHistoryDatePickerMonth(-1));
+    $('history-date-picker-next-btn')?.addEventListener('click', () => shiftHistoryDatePickerMonth(1));
+    $('history-date-picker-modal')?.addEventListener('click', (event) => {
+        if (event.target === $('history-date-picker-modal')) {
+            closeHistoryDatePicker();
+        }
+    });
+
+    syncHistoryFilterForm();
+    renderTimeFilterState();
+}
+
+function openHistoryFilterSheet() {
+    syncHistoryFilterForm();
+    $('history-filter-modal')?.classList.remove('hidden');
+}
+
+function closeHistoryFilterSheet() {
+    $('history-filter-modal')?.classList.add('hidden');
+}
+
+function syncHistoryFilterForm() {
+    const {
+        startDate,
+        endDate,
+        timeRange,
+        startTime,
+        endTime,
+        kind,
+        status,
+    } = currentHistoryFilters;
+
+    if ($('history-start-date')) $('history-start-date').value = startDate;
+    if ($('history-end-date')) $('history-end-date').value = endDate;
+    if ($('history-time-range')) $('history-time-range').value = timeRange;
+    if ($('history-start-time')) $('history-start-time').value = startTime;
+    if ($('history-end-time')) $('history-end-time').value = endTime;
+    if ($('history-kind-filter')) $('history-kind-filter').value = kind;
+    if ($('history-status-filter')) $('history-status-filter').value = status;
+    syncCustomTimeInputsState();
+    renderHistoryDateInputs();
+}
+
+function syncCustomTimeInputsState() {
+    const custom = $('history-time-range')?.value === 'custom';
+    if ($('history-start-time')) $('history-start-time').disabled = !custom;
+    if ($('history-end-time')) $('history-end-time').disabled = !custom;
+}
+
+function applyHistoryFilterForm() {
+    const startDate = $('history-start-date')?.value || '';
+    const endDate = $('history-end-date')?.value || '';
+    const timeRange = $('history-time-range')?.value || 'all';
+    const startTime = $('history-start-time')?.value || '';
+    const endTime = $('history-end-time')?.value || '';
+    const kind = $('history-kind-filter')?.value || 'all';
+    const status = $('history-status-filter')?.value || 'all';
+
+    if (startDate && endDate && startDate > endDate) {
+        showToast('开始日期不能晚于结束日期');
+        return;
+    }
+
+    if (timeRange === 'custom' && startTime && endTime && startTime > endTime) {
+        showToast('开始时间不能晚于结束时间');
+        return;
+    }
+
+    currentHistoryFilters = {
+        ...currentHistoryFilters,
+        quickTime: startDate || endDate
+            ? 'custom'
+            : (currentHistoryFilters.quickTime === 'custom' ? 'all' : currentHistoryFilters.quickTime),
+        startDate,
+        endDate,
+        timeRange,
+        startTime: timeRange === 'custom' ? startTime : '',
+        endTime: timeRange === 'custom' ? endTime : '',
+        kind,
+        status,
+    };
+
+    renderTimeFilterState();
+    renderHistory();
+    closeHistoryFilterSheet();
+}
+
+function renderDeviceFilterState() {
+    $('history-filter-btns')?.querySelectorAll('.filter-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.filter === currentHistoryFilters.device);
+    });
+}
+
+function renderTimeFilterState() {
+    $('history-time-filter-btns')?.querySelectorAll('.filter-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.timeFilter === currentHistoryFilters.quickTime);
+    });
+}
+
+function renderHistoryDateInputs() {
+    const availability = getHistoryDateAvailability();
+    const startDate = $('history-start-date')?.value || '';
+    const endDate = $('history-end-date')?.value || '';
+
+    if ($('history-start-date-label')) {
+        $('history-start-date-label').textContent = startDate ? formatHistoryDateLabel(startDate) : '选择开始日期';
+    }
+    if ($('history-end-date-label')) {
+        $('history-end-date-label').textContent = endDate ? formatHistoryDateLabel(endDate) : '选择结束日期';
+    }
+
+    const hasAvailableDates = availability.availableDates.size > 0;
+    if ($('history-start-date-trigger')) $('history-start-date-trigger').disabled = !hasAvailableDates;
+    if ($('history-end-date-trigger')) $('history-end-date-trigger').disabled = !hasAvailableDates;
+
+    const hint = $('history-date-availability');
+    if (!hint) return;
+
+    if (!hasAvailableDates) {
+        hint.classList.remove('hidden');
+        hint.textContent = '当前条件下没有可选日期。';
+        return;
+    }
+
+    hint.classList.remove('hidden');
+    hint.textContent = `有记录日期：${formatHistoryDateLabel(availability.minDate)} 至 ${formatHistoryDateLabel(availability.maxDate)}，不可选日期会置灰。`;
+}
+
+function readHistoryFilterDraft() {
+    const timeRange = $('history-time-range')?.value || currentHistoryFilters.timeRange || 'all';
+    return {
+        ...currentHistoryFilters,
+        quickTime: 'all',
+        startDate: '',
+        endDate: '',
+        timeRange,
+        startTime: timeRange === 'custom' ? ($('history-start-time')?.value || '') : '',
+        endTime: timeRange === 'custom' ? ($('history-end-time')?.value || '') : '',
+        kind: $('history-kind-filter')?.value || currentHistoryFilters.kind || 'all',
+        status: $('history-status-filter')?.value || currentHistoryFilters.status || 'all',
+    };
+}
+
+function getHistoryDateAvailability() {
+    const history = getHistory();
+    const filters = readHistoryFilterDraft();
+    const availableDates = new Set();
+    let minDate = '';
+    let maxDate = '';
+
+    history.forEach((entry) => {
+        if (filters.device !== 'all' && entry.target !== filters.device) {
+            return;
+        }
+
+        const entryDate = new Date(entry.timestamp);
+        if (Number.isNaN(entryDate.getTime())) {
+            return;
+        }
+
+        if (!matchesTimeRange(entryDate, filters)) {
+            return;
+        }
+
+        if (!matchesKind(entry, filters) || !matchesStatus(entry, filters)) {
+            return;
+        }
+
+        const dayKey = formatDateKey(entryDate);
+        availableDates.add(dayKey);
+        if (!minDate || dayKey < minDate) minDate = dayKey;
+        if (!maxDate || dayKey > maxDate) maxDate = dayKey;
+    });
+
+    return { availableDates, minDate, maxDate };
+}
+
+function openHistoryDatePicker(field) {
+    const availability = getHistoryDateAvailability();
+    if (availability.availableDates.size === 0) {
+        showToast('当前条件下没有可选日期');
+        return;
+    }
+
+    historyDatePickerState = {
+        field,
+        availableDates: availability.availableDates,
+        minDate: availability.minDate,
+        maxDate: availability.maxDate,
+        month: getHistoryPickerInitialMonth(field, availability),
+    };
+
+    const title = field === 'startDate' ? '选择开始日期' : '选择结束日期';
+    if ($('history-date-picker-title')) $('history-date-picker-title').textContent = title;
+    if ($('history-date-picker-subtitle')) {
+        $('history-date-picker-subtitle').textContent = `仅显示有记录的日期。范围：${formatHistoryDateLabel(availability.minDate)} 至 ${formatHistoryDateLabel(availability.maxDate)}`;
+    }
+
+    renderHistoryDatePicker();
+    $('history-date-picker-modal')?.classList.remove('hidden');
+}
+
+function getHistoryPickerInitialMonth(field, availability) {
+    const currentValue = field === 'startDate'
+        ? $('history-start-date')?.value
+        : $('history-end-date')?.value;
+    const fallback = currentValue || availability.maxDate || formatDateKey(new Date());
+    const [year, month] = fallback.split('-').map(Number);
+    return new Date(year, (month || 1) - 1, 1);
+}
+
+function closeHistoryDatePicker() {
+    $('history-date-picker-modal')?.classList.add('hidden');
+    historyDatePickerState = {
+        field: null,
+        month: null,
+        availableDates: new Set(),
+        minDate: '',
+        maxDate: '',
+    };
+}
+
+function clearHistoryDateField() {
+    if (!historyDatePickerState.field) return;
+    const inputId = historyDatePickerState.field === 'startDate' ? 'history-start-date' : 'history-end-date';
+    if ($(inputId)) {
+        $(inputId).value = '';
+    }
+    renderHistoryDateInputs();
+    closeHistoryDatePicker();
+}
+
+function shiftHistoryDatePickerMonth(delta) {
+    if (!historyDatePickerState.month) return;
+    historyDatePickerState.month = new Date(
+        historyDatePickerState.month.getFullYear(),
+        historyDatePickerState.month.getMonth() + delta,
+        1
+    );
+    renderHistoryDatePicker();
+}
+
+function renderHistoryDatePicker() {
+    const grid = $('history-date-picker-grid');
+    const monthLabel = $('history-date-picker-month-label');
+    if (!grid || !monthLabel || !historyDatePickerState.month) return;
+
+    const month = historyDatePickerState.month;
+    const year = month.getFullYear();
+    const monthIndex = month.getMonth();
+    monthLabel.textContent = `${year}年${monthIndex + 1}月`;
+
+    const firstDay = new Date(year, monthIndex, 1);
+    const startOffset = (firstDay.getDay() + 6) % 7;
+    const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+    const cells = [];
+
+    for (let i = 0; i < startOffset; i += 1) {
+        cells.push('<span class="history-date-cell spacer" aria-hidden="true"></span>');
+    }
+
+    const selectedValue = historyDatePickerState.field === 'startDate'
+        ? $('history-start-date')?.value
+        : $('history-end-date')?.value;
+    const todayKey = formatDateKey(new Date());
+
+    for (let day = 1; day <= daysInMonth; day += 1) {
+        const dayKey = `${year}-${pad2(monthIndex + 1)}-${pad2(day)}`;
+        const available = historyDatePickerState.availableDates.has(dayKey);
+        const isSelected = dayKey === selectedValue;
+        const isToday = dayKey === todayKey;
+        const className = [
+            'history-date-cell',
+            available ? 'available' : 'disabled',
+            isSelected ? 'active' : '',
+            isToday ? 'today' : '',
+        ].filter(Boolean).join(' ');
+
+        cells.push(`
+            <button
+                type="button"
+                class="${className}"
+                data-date-value="${dayKey}"
+                ${available ? '' : 'disabled'}
+            >${day}</button>
+        `);
+    }
+
+    grid.innerHTML = cells.join('');
+    grid.querySelectorAll('.history-date-cell.available').forEach((button) => {
+        button.addEventListener('click', () => {
+            const value = button.dataset.dateValue;
+            const inputId = historyDatePickerState.field === 'startDate' ? 'history-start-date' : 'history-end-date';
+            if ($(inputId)) {
+                $(inputId).value = value;
+            }
+            renderHistoryDateInputs();
+            closeHistoryDatePicker();
+        });
+    });
+
+    updateHistoryDatePickerNavState();
+}
+
+function updateHistoryDatePickerNavState() {
+    const prevBtn = $('history-date-picker-prev-btn');
+    const nextBtn = $('history-date-picker-next-btn');
+    if (!prevBtn || !nextBtn || !historyDatePickerState.month) return;
+
+    const currentMonthKey = formatMonthKey(historyDatePickerState.month);
+    const minMonthKey = historyDatePickerState.minDate ? historyDatePickerState.minDate.slice(0, 7) : '';
+    const maxMonthKey = historyDatePickerState.maxDate ? historyDatePickerState.maxDate.slice(0, 7) : '';
+
+    prevBtn.disabled = Boolean(minMonthKey) && currentMonthKey <= minMonthKey;
+    nextBtn.disabled = Boolean(maxMonthKey) && currentMonthKey >= maxMonthKey;
+}
+
+function formatMonthKey(date) {
+    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}`;
+}
+
+function formatDateKey(date) {
+    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+function formatHistoryDateLabel(value) {
+    if (!value) return '';
+    const [year, month, day] = String(value).split('-').map(Number);
+    if (!year || !month || !day) return value;
+    return `${year}年${month}月${day}日`;
 }
 
 // ============================================
@@ -757,18 +1158,12 @@ async function sendText(deviceId) {
 
     if (!text || !conn || !conn.authenticated || !conn.ws) return;
 
-    // 查找设备名称
-    const devices = getDevices();
-    const dev = devices.find(d => d.id === deviceId);
-    const targetName = conn.hostname || (dev ? dev.name : deviceId);
-
     const historyEntry = {
         id: Date.now(),
         timestamp: getLocalTimestamp(),
         text: text,
-        target: deviceId,
-        targetName: targetName,
         status: 'pending',
+        ...buildHistoryTargetMeta(deviceId),
     };
     addHistory(historyEntry);
 
@@ -797,17 +1192,12 @@ async function sendTextAndEnter(deviceId) {
 
     if (!text || !conn || !conn.authenticated || !conn.ws) return;
 
-    const devices = getDevices();
-    const dev = devices.find(d => d.id === deviceId);
-    const targetName = conn.hostname || (dev ? dev.name : deviceId);
-
     const historyEntry = {
         id: Date.now(),
         timestamp: getLocalTimestamp(),
         text,
-        target: deviceId,
-        targetName,
         status: 'pending',
+        ...buildHistoryTargetMeta(deviceId),
     };
     addHistory(historyEntry);
 
@@ -841,7 +1231,23 @@ function getTargetName(deviceId) {
     const conn = connections[deviceId];
     const devices = getDevices();
     const dev = devices.find(d => d.id === deviceId);
-    return conn?.hostname || (dev ? dev.name : deviceId);
+    return (dev ? dev.name : '') || conn?.hostname || deviceId;
+}
+
+function getTargetDeviceName(deviceId) {
+    const conn = connections[deviceId];
+    return conn?.hostname || '';
+}
+
+function buildHistoryTargetMeta(deviceId) {
+    const targetAlias = getTargetName(deviceId);
+    const targetDeviceName = getTargetDeviceName(deviceId);
+    return {
+        target: deviceId,
+        targetName: targetAlias || targetDeviceName || deviceId,
+        targetAlias,
+        targetDeviceName,
+    };
 }
 
 function createThumbnailDataUrl(sourceDataUrl, outputType = 'image/jpeg') {
@@ -884,19 +1290,17 @@ async function sendSelectedImage(deviceId, file) {
         return;
     }
 
-    const targetName = getTargetName(deviceId);
     const displayText = `[图片] ${file.name}`;
 
     const historyEntry = {
         id: Date.now(),
         timestamp: getLocalTimestamp(),
         text: displayText,
-        target: deviceId,
-        targetName,
         status: 'pending',
         kind: 'image',
         fileName: file.name,
         mimeType: file.type,
+        ...buildHistoryTargetMeta(deviceId),
     };
     addHistory(historyEntry);
 
@@ -948,17 +1352,15 @@ async function sendSelectedFile(deviceId, file) {
         return;
     }
 
-    const targetName = getTargetName(deviceId);
     const historyEntry = {
         id: Date.now(),
         timestamp: getLocalTimestamp(),
         text: `[文件] ${file.name}`,
-        target: deviceId,
-        targetName,
         status: 'pending',
         kind: 'file',
         fileName: file.name,
         mimeType: file.type || 'application/octet-stream',
+        ...buildHistoryTargetMeta(deviceId),
     };
     addHistory(historyEntry);
 
@@ -1127,17 +1529,15 @@ async function sendPendingSharedImage(deviceId) {
     }
 
     const shared = pendingSharedContent;
-    const targetName = getTargetName(deviceId);
     const historyEntry = {
         id: Date.now(),
         timestamp: getLocalTimestamp(),
         text: `[图片] ${shared.displayName}`,
-        target: deviceId,
-        targetName,
         status: 'pending',
         kind: 'image',
         fileName: shared.displayName,
         mimeType: shared.mimeType,
+        ...buildHistoryTargetMeta(deviceId),
     };
     addHistory(historyEntry);
 
@@ -1187,17 +1587,15 @@ async function sendPendingSharedFile(deviceId) {
     }
 
     const shared = pendingSharedContent;
-    const targetName = getTargetName(deviceId);
     const historyEntry = {
         id: Date.now(),
         timestamp: getLocalTimestamp(),
         text: `[文件] ${shared.displayName}`,
-        target: deviceId,
-        targetName,
         status: 'pending',
         kind: 'file',
         fileName: shared.displayName,
         mimeType: shared.mimeType,
+        ...buildHistoryTargetMeta(deviceId),
     };
     addHistory(historyEntry);
 
@@ -1234,7 +1632,22 @@ async function sendPendingSharedFile(deviceId) {
 
 function getHistory() {
     const data = localStorage.getItem(HISTORY_KEY);
-    return data ? JSON.parse(data) : [];
+    const history = data ? JSON.parse(data) : [];
+    let changed = false;
+    const hydrated = history.map((entry) => {
+        const normalized = hydrateHistoryEntry(entry);
+        if (JSON.stringify(normalized) !== JSON.stringify(entry)) {
+            changed = true;
+        }
+        return normalized;
+    });
+
+    if (changed) {
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(hydrated));
+        persistHistory();
+    }
+
+    return hydrated;
 }
 
 function addHistory(entry) {
@@ -1271,21 +1684,122 @@ function getLocalTimestamp(value = new Date()) {
     return `${year}-${month}-${day}T${hour}:${minute}:${second}.${millisecond}${sign}${offsetHour}:${offsetMinute}`;
 }
 
-function buildHistoryExportData(history) {
-    return history.map(entry => ({
+function looksLikeInternalDeviceId(value) {
+    return typeof value === 'string' && /^dev(?:[_-]|$)/.test(value);
+}
+
+function looksLikeTargetHost(value) {
+    if (typeof value !== 'string' || !value) {
+        return false;
+    }
+    return value.includes('.local')
+        || value.includes('.lan')
+        || /^(\d{1,3}\.){3}\d{1,3}$/.test(value)
+        || value.includes(':');
+}
+
+function hydrateHistoryEntry(entry) {
+    const storedTarget = typeof entry.target === 'string' ? entry.target : '';
+    const storedTargetName = typeof entry.targetName === 'string' ? entry.targetName : '';
+    const storedTargetAlias = typeof entry.targetAlias === 'string' ? entry.targetAlias : '';
+    const storedTargetHost = typeof entry.targetDeviceName === 'string'
+        ? entry.targetDeviceName
+        : (typeof entry.targetHost === 'string' ? entry.targetHost : '');
+    const targetId = entry.targetId
+        || entry.deviceId
+        || (looksLikeInternalDeviceId(storedTarget) ? storedTarget : '');
+
+    const devices = getDevices();
+    const device = targetId ? devices.find((item) => item.id === targetId) : null;
+
+    const targetAlias = [
+        storedTargetAlias,
+        device?.name || '',
+        !looksLikeInternalDeviceId(storedTarget) && !looksLikeTargetHost(storedTarget) ? storedTarget : '',
+        !looksLikeInternalDeviceId(storedTargetName) && !looksLikeTargetHost(storedTargetName) ? storedTargetName : '',
+    ].find(Boolean) || '';
+
+    const targetDeviceName = [
+        storedTargetHost,
+        looksLikeTargetHost(storedTargetName) ? storedTargetName : '',
+        looksLikeTargetHost(storedTarget) ? storedTarget : '',
+        targetId ? getTargetDeviceName(targetId) : '',
+    ].find(Boolean) || '';
+
+    const displayTarget = targetAlias || targetDeviceName || targetId || storedTarget || storedTargetName || '未知设备';
+
+    return {
         ...entry,
-        timestamp: getLocalTimestamp(entry.timestamp),
-    }));
+        target: targetId || storedTarget || displayTarget,
+        targetName: displayTarget,
+        targetAlias,
+        targetDeviceName,
+    };
+}
+
+function resolveHistoryExportTarget(entry) {
+    return entry.targetAlias || entry.targetName || entry.targetDeviceName || '未知设备';
+}
+
+function buildHistoryExportData(history) {
+    return history.map((entry) => {
+        const hydrated = hydrateHistoryEntry(entry);
+        const targetAlias = resolveHistoryExportTarget(hydrated);
+        const targetHost = hydrated.targetDeviceName || '';
+        const {
+            target: _targetId,
+            targetName,
+            targetAlias: _targetAlias,
+            targetDeviceName: _targetDeviceName,
+            ...rest
+        } = hydrated;
+
+        return {
+            ...rest,
+            timestamp: getLocalTimestamp(hydrated.timestamp),
+            target: targetAlias,
+            ...(targetHost && targetHost !== targetAlias ? { targetHost } : {}),
+        };
+    });
 }
 
 function normalizeImportedHistoryEntry(entry) {
     const timestampSource = entry.timestamp_iso || entry.timestamp;
     const normalizedTimestamp = getLocalTimestamp(timestampSource);
+    const targetAlias = entry.targetAlias || entry.targetName || entry.target || '';
+    const targetDeviceName = entry.targetDeviceName || entry.targetHost || entry.hostname || '';
+    const targetId = entry.targetId
+        || entry.deviceId
+        || (typeof entry.target === 'string' && /^dev[_-]/.test(entry.target) ? entry.target : '')
+        || resolveHistoryImportTargetId(targetAlias, targetDeviceName)
+        || targetAlias
+        || targetDeviceName
+        || '';
 
     return {
         ...entry,
         timestamp: normalizedTimestamp,
+        target: targetId,
+        targetName: targetAlias || targetDeviceName || targetId || '未知设备',
+        targetAlias,
+        targetDeviceName,
     };
+}
+
+function resolveHistoryImportTargetId(targetAlias, targetDeviceName) {
+    const devices = getDevices();
+    const aliasMatch = devices.find((device) => device.name === targetAlias);
+    if (aliasMatch) {
+        return aliasMatch.id;
+    }
+
+    for (const [deviceId, conn] of Object.entries(connections)) {
+        if (conn?.hostname && conn.hostname === targetDeviceName) {
+            return deviceId;
+        }
+    }
+
+    return '';
 }
 
 function waitForNativeBridgeEvent(eventName, invokeNative) {
@@ -1467,8 +1981,6 @@ function clearHistory() {
 
 // ---- 历史 UI ----
 
-let currentFilter = 'all';
-
 function initHistoryActions() {
     $('clear-history-btn').addEventListener('click', () => {
         if (confirm('确定清空所有发送历史？')) {
@@ -1554,18 +2066,25 @@ function renderHistory() {
     if (!list) return;
     const history = getHistory();
 
-    const filtered = currentFilter === 'all'
-        ? history
-        : history.filter(h => h.target === currentFilter);
+    if (history.length === 0) {
+        renderHistoryFilterSummary();
+        list.innerHTML = '<p class="empty-hint">暂无发送记录</p>';
+        return;
+    }
+
+    const filtered = filterHistoryEntries(history);
+    renderHistoryFilterSummary();
 
     if (filtered.length === 0) {
-        list.innerHTML = '<p class="empty-hint">暂无发送记录</p>';
+        list.innerHTML = '<p class="empty-hint">没有符合筛选条件的记录</p>';
         return;
     }
 
     list.innerHTML = filtered.map((h, i) => {
         const time = formatTime(h.timestamp);
         const statusIcon = h.status === 'success' ? '已送达' : h.status === 'failed' ? '失败' : '发送中';
+        const primaryTarget = getHistoryPrimaryTargetLabel(h);
+        const secondaryTarget = getHistorySecondaryTargetLabel(h);
         const title = h.kind === 'image'
             ? '图片记录'
             : h.kind === 'file'
@@ -1597,7 +2116,10 @@ function renderHistory() {
             <div class="history-item" data-idx="${i}" style="cursor:pointer" title="${title}">
                 <div class="history-item-header">
                     <span class="history-time">${time}</span>
-                    <span class="history-target">${h.targetName || h.target}</span>
+                    <div class="history-target-group">
+                        <span class="history-target">${escapeHtml(primaryTarget)}</span>
+                        ${secondaryTarget ? `<span class="history-target-detail">${escapeHtml(secondaryTarget)}</span>` : ''}
+                    </div>
                     <span class="history-status">${statusIcon}</span>
                 </div>
                 ${content}
@@ -1635,6 +2157,227 @@ function formatTime(isoString) {
     if (isToday) return `今天 ${time}`;
     const date = d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
     return `${date} ${time}`;
+}
+
+function filterHistoryEntries(history, filters = currentHistoryFilters) {
+    return history.filter((entry) => {
+        if (filters.device !== 'all' && entry.target !== filters.device) {
+            return false;
+        }
+
+        const entryDate = new Date(entry.timestamp);
+        if (Number.isNaN(entryDate.getTime())) {
+            return false;
+        }
+
+        if (!matchesQuickTimeFilter(entryDate, filters)) {
+            return false;
+        }
+
+        if (!matchesCustomDateRange(entryDate, filters)) {
+            return false;
+        }
+
+        if (!matchesTimeRange(entryDate, filters)) {
+            return false;
+        }
+
+        if (!matchesKind(entry, filters)) {
+            return false;
+        }
+
+        if (!matchesStatus(entry, filters)) {
+            return false;
+        }
+
+        return true;
+    });
+}
+
+function matchesQuickTimeFilter(entryDate, filters = currentHistoryFilters) {
+    const quick = filters.quickTime;
+    if (quick === 'all' || quick === 'custom') {
+        return true;
+    }
+
+    const now = new Date();
+    if (quick === 'today') {
+        return entryDate.toDateString() === now.toDateString();
+    }
+
+    const days = quick === '7d' ? 7 : 30;
+    const threshold = new Date(now);
+    threshold.setHours(0, 0, 0, 0);
+    threshold.setDate(threshold.getDate() - (days - 1));
+    return entryDate >= threshold;
+}
+
+function matchesCustomDateRange(entryDate, filters = currentHistoryFilters) {
+    if (filters.quickTime !== 'custom') {
+        return true;
+    }
+
+    const { startDate, endDate } = filters;
+    if (!startDate && !endDate) {
+        return true;
+    }
+
+    const entryDay = `${entryDate.getFullYear()}-${pad2(entryDate.getMonth() + 1)}-${pad2(entryDate.getDate())}`;
+    if (startDate && entryDay < startDate) {
+        return false;
+    }
+    if (endDate && entryDay > endDate) {
+        return false;
+    }
+    return true;
+}
+
+function matchesTimeRange(entryDate, filters = currentHistoryFilters) {
+    const { timeRange, startTime, endTime } = filters;
+    if (timeRange === 'all') {
+        return true;
+    }
+
+    const minutes = entryDate.getHours() * 60 + entryDate.getMinutes();
+    const presets = {
+        morning: [6 * 60, 11 * 60 + 59],
+        afternoon: [12 * 60, 17 * 60 + 59],
+        evening: [18 * 60, 23 * 60 + 59],
+        night: [0, 5 * 60 + 59],
+    };
+
+    if (timeRange !== 'custom') {
+        const [start, end] = presets[timeRange] || [0, 24 * 60 - 1];
+        return minutes >= start && minutes <= end;
+    }
+
+    if (!startTime && !endTime) {
+        return true;
+    }
+
+    const startMinutes = startTime ? parseClockMinutes(startTime) : 0;
+    const endMinutes = endTime ? parseClockMinutes(endTime) : 24 * 60 - 1;
+    return minutes >= startMinutes && minutes <= endMinutes;
+}
+
+function parseClockMinutes(value) {
+    const [hour = '0', minute = '0'] = String(value).split(':');
+    return Number(hour) * 60 + Number(minute);
+}
+
+function matchesKind(entry, filters = currentHistoryFilters) {
+    if (filters.kind === 'all') {
+        return true;
+    }
+    const kind = entry.kind || 'text';
+    return kind === filters.kind;
+}
+
+function matchesStatus(entry, filters = currentHistoryFilters) {
+    if (filters.status === 'all') {
+        return true;
+    }
+    return (entry.status || 'success') === filters.status;
+}
+
+function renderHistoryFilterSummary() {
+    const toolbar = $('history-toolbar');
+    const summary = $('history-filter-summary');
+    if (!summary) return;
+
+    const labels = [];
+    const deviceLabel = getHistoryDeviceLabel(currentHistoryFilters.device);
+    if (deviceLabel) labels.push(deviceLabel);
+
+    const quickTimeLabels = {
+        today: '今天',
+        '7d': '近7天',
+        '30d': '近30天',
+        custom: '自定义日期',
+    };
+    if (currentHistoryFilters.quickTime !== 'all') {
+        labels.push(quickTimeLabels[currentHistoryFilters.quickTime] || '自定义日期');
+    }
+    if (currentHistoryFilters.quickTime === 'custom' && (currentHistoryFilters.startDate || currentHistoryFilters.endDate)) {
+        labels.push(`${currentHistoryFilters.startDate || '开始'} - ${currentHistoryFilters.endDate || '结束'}`);
+    }
+
+    const timeRangeLabels = {
+        morning: '上午',
+        afternoon: '下午',
+        evening: '晚上',
+        night: '凌晨',
+        custom: '自定义时段',
+    };
+    if (currentHistoryFilters.timeRange !== 'all') {
+        if (currentHistoryFilters.timeRange === 'custom') {
+            labels.push(`${currentHistoryFilters.startTime || '00:00'} - ${currentHistoryFilters.endTime || '23:59'}`);
+        } else {
+            labels.push(timeRangeLabels[currentHistoryFilters.timeRange]);
+        }
+    }
+
+    const kindLabels = {
+        text: '文字',
+        image: '图片',
+        file: '文件',
+    };
+    if (currentHistoryFilters.kind !== 'all') {
+        labels.push(kindLabels[currentHistoryFilters.kind]);
+    }
+
+    const statusLabels = {
+        success: '成功',
+        failed: '失败',
+        pending: '发送中',
+    };
+    if (currentHistoryFilters.status !== 'all') {
+        labels.push(statusLabels[currentHistoryFilters.status]);
+    }
+
+    if (labels.length === 0) {
+        toolbar?.classList.add('hidden');
+        summary.classList.add('hidden');
+        summary.innerHTML = '';
+        return;
+    }
+
+    toolbar?.classList.remove('hidden');
+    summary.classList.remove('hidden');
+    summary.innerHTML = `
+        <div class="history-filter-chip-list">
+            ${labels.map(label => `<span class="history-filter-chip">${escapeHtml(label)}</span>`).join('')}
+        </div>
+        <button class="history-filter-clear" id="history-filter-clear-btn">清除</button>
+    `;
+    $('history-filter-clear-btn')?.addEventListener('click', () => {
+        currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS };
+        renderDeviceFilterState();
+        renderTimeFilterState();
+        syncHistoryFilterForm();
+        renderHistory();
+    });
+}
+
+function getHistoryDeviceLabel(deviceId) {
+    if (deviceId === 'all') {
+        return '';
+    }
+    const devices = getDevices();
+    return devices.find(device => device.id === deviceId)?.name || deviceId;
+}
+
+function getHistoryPrimaryTargetLabel(entry) {
+    return entry.targetAlias || entry.targetName || entry.targetDeviceName || entry.target || '未知设备';
+}
+
+function getHistorySecondaryTargetLabel(entry) {
+    const primary = getHistoryPrimaryTargetLabel(entry);
+    const secondary = entry.targetDeviceName || '';
+    if (!secondary || secondary === primary) {
+        return '';
+    }
+    return secondary;
 }
 
 function escapeHtml(text) {

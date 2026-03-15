@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DESKTOP_DIR="$ROOT_DIR/desktop"
+ICON_GENERATOR="$ROOT_DIR/scripts/generate-app-icons.py"
 
 APP_NAME="${APP_NAME:-VibeDrop.app}"
 APP_BUNDLE_NAME="${APP_BUNDLE_NAME:-VibeDrop}"
@@ -22,14 +23,16 @@ LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchS
 
 SKIP_BUILD=0
 NO_OPEN=0
+SKIP_ICONS=0
 
 usage() {
   cat <<'EOF'
 Usage: ./scripts/deploy-desktop.sh [options]
 
-Builds the macOS app bundle, installs it to /Applications, and relaunches it.
+Regenerates app icon assets, builds the macOS app bundle, installs it to /Applications, and relaunches it.
 
 Options:
+  --skip-icons   Reuse existing generated icon assets
   --skip-build   Reuse the existing app bundle and only reinstall/relaunch
   --no-open      Do not relaunch the app after installation
   -h, --help     Show this help
@@ -58,6 +61,12 @@ fail() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
+
+regenerate_icons() {
+  [[ -f "$ICON_GENERATOR" ]] || fail "Icon generator not found: $ICON_GENERATOR"
+  log "Regenerating icon assets from 图标.jpg"
+  python3 "$ICON_GENERATOR"
 }
 
 bundle_identifier() {
@@ -182,6 +191,10 @@ open_app() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --skip-icons)
+      SKIP_ICONS=1
+      shift
+      ;;
     --skip-build)
       SKIP_BUILD=1
       shift
@@ -207,6 +220,7 @@ require_cmd pkill
 require_cmd open
 require_cmd codesign
 require_cmd security
+require_cmd python3
 [[ -x "$PLIST_BUDDY" ]] || fail "Missing PlistBuddy: $PLIST_BUDDY"
 [[ -x "$LSREGISTER" ]] || fail "Missing lsregister: $LSREGISTER"
 
@@ -223,6 +237,9 @@ else
 fi
 
 if [[ $SKIP_BUILD -eq 0 ]]; then
+  if [[ $SKIP_ICONS -eq 0 ]]; then
+    regenerate_icons
+  fi
   build_app
 fi
 

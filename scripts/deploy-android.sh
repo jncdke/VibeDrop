@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 MOBILE_DIR="$ROOT_DIR/mobile"
 DESKTOP_STATIC_DIR="$ROOT_DIR/desktop/static"
+ICON_GENERATOR="$ROOT_DIR/scripts/generate-app-icons.py"
 
 PACKAGE_NAME="${PACKAGE_NAME:-com.vibedrop.mobile}"
 MAIN_ACTIVITY="${MAIN_ACTIVITY:-.MainActivity}"
@@ -20,15 +21,17 @@ DEVICE_SERIAL="${ADB_SERIAL:-}"
 SYNC_STATIC=0
 SKIP_BUILD=0
 SKIP_INSTALL=0
+SKIP_ICONS=0
 
 usage() {
   cat <<'EOF'
 Usage: ./scripts/deploy-android.sh [options]
 
-Builds, signs, installs, and restarts the Android app on a connected device.
+Regenerates app icon assets, builds, signs, installs, and restarts the Android app.
 
 Options:
   --device <serial>   Use the specified ADB device serial
+  --skip-icons        Skip regenerating icons from 图标.jpg
   --sync-static       Sync mobile/src shared frontend files into desktop/static first
   --skip-build        Reuse the existing unsigned APK and only sign/install
   --skip-install      Stop after signing the APK
@@ -56,6 +59,12 @@ fail() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
+
+regenerate_icons() {
+  [[ -f "$ICON_GENERATOR" ]] || fail "Icon generator not found: $ICON_GENERATOR"
+  log "Regenerating icon assets from 图标.jpg"
+  python3 "$ICON_GENERATOR"
 }
 
 sync_static_assets() {
@@ -123,6 +132,10 @@ while [[ $# -gt 0 ]]; do
       DEVICE_SERIAL="$2"
       shift 2
       ;;
+    --skip-icons)
+      SKIP_ICONS=1
+      shift
+      ;;
     --sync-static)
       SYNC_STATIC=1
       shift
@@ -147,8 +160,13 @@ done
 
 require_cmd cargo
 require_cmd adb
+require_cmd python3
 
 [[ -f "$KEYSTORE_PATH" ]] || fail "Keystore not found: $KEYSTORE_PATH"
+
+if [[ $SKIP_BUILD -eq 0 && $SKIP_ICONS -eq 0 ]]; then
+  regenerate_icons
+fi
 
 if [[ $SYNC_STATIC -eq 1 ]]; then
   sync_static_assets

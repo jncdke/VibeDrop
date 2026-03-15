@@ -74,11 +74,137 @@
                 <div class="history-filter" id="history-filter-btns">
                     <button class="filter-btn active" data-filter="all">全部</button>
                 </div>
+                <div class="history-filter history-time-filter" id="history-time-filter-btns">
+                    <button class="filter-btn active" data-time-filter="all">全部时间</button>
+                    <button class="filter-btn" data-time-filter="today">今天</button>
+                    <button class="filter-btn" data-time-filter="7d">近7天</button>
+                    <button class="filter-btn" data-time-filter="30d">近30天</button>
+                    <button class="filter-btn" data-time-filter="custom">自定义</button>
+                </div>
+                <div id="history-toolbar" class="history-toolbar hidden">
+                    <div id="history-filter-summary" class="history-filter-summary hidden"></div>
+                </div>
             </div>
             <div id="history-list" class="history-list">
                 <p class="empty-hint">暂无发送记录</p>
             </div>
         </section>
+
+        <div id="history-filter-modal" class="sheet-backdrop hidden" role="dialog" aria-modal="true">
+            <div class="sheet-card history-filter-sheet">
+                <div class="sheet-handle"></div>
+                <div class="sheet-header">
+                    <div>
+                        <h3>高级筛选</h3>
+                        <p class="hint">按日期、时间段、类型和状态筛选历史记录。</p>
+                    </div>
+                    <button id="history-filter-close-btn" class="icon-btn share-clear-btn" title="关闭">关闭</button>
+                </div>
+
+                <div class="sheet-section">
+                    <label for="history-start-date-trigger">开始日期</label>
+                    <input id="history-start-date" type="hidden">
+                    <button id="history-start-date-trigger" type="button" class="sheet-picker-btn">
+                        <span id="history-start-date-label">选择开始日期</span>
+                        <span class="sheet-picker-caret">选择</span>
+                    </button>
+                </div>
+
+                <div class="sheet-section">
+                    <label for="history-end-date-trigger">结束日期</label>
+                    <input id="history-end-date" type="hidden">
+                    <button id="history-end-date-trigger" type="button" class="sheet-picker-btn">
+                        <span id="history-end-date-label">选择结束日期</span>
+                        <span class="sheet-picker-caret">选择</span>
+                    </button>
+                    <p id="history-date-availability" class="sheet-field-hint hidden"></p>
+                </div>
+
+                <div class="sheet-section">
+                    <label for="history-time-range">时间范围</label>
+                    <select id="history-time-range">
+                        <option value="all">全天</option>
+                        <option value="morning">上午 06:00 - 11:59</option>
+                        <option value="afternoon">下午 12:00 - 17:59</option>
+                        <option value="evening">晚上 18:00 - 23:59</option>
+                        <option value="night">凌晨 00:00 - 05:59</option>
+                        <option value="custom">自定义时段</option>
+                    </select>
+                </div>
+
+                <div class="sheet-time-grid">
+                    <div class="sheet-section">
+                        <label for="history-start-time">开始时间</label>
+                        <input id="history-start-time" type="time" disabled>
+                    </div>
+                    <div class="sheet-section">
+                        <label for="history-end-time">结束时间</label>
+                        <input id="history-end-time" type="time" disabled>
+                    </div>
+                </div>
+
+                <div class="sheet-section">
+                    <label for="history-kind-filter">记录类型</label>
+                    <select id="history-kind-filter">
+                        <option value="all">全部类型</option>
+                        <option value="text">文字</option>
+                        <option value="image">图片</option>
+                        <option value="file">文件</option>
+                    </select>
+                </div>
+
+                <div class="sheet-section">
+                    <label for="history-status-filter">发送状态</label>
+                    <select id="history-status-filter">
+                        <option value="all">全部状态</option>
+                        <option value="success">成功</option>
+                        <option value="failed">失败</option>
+                        <option value="pending">发送中</option>
+                    </select>
+                </div>
+
+                <div class="sheet-actions">
+                    <button id="history-filter-reset-btn" class="secondary-btn">重置</button>
+                    <button id="history-filter-apply-btn" class="primary-btn">应用筛选</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="history-date-picker-modal" class="sheet-backdrop hidden" role="dialog" aria-modal="true">
+            <div class="sheet-card history-date-picker-card">
+                <div class="sheet-handle"></div>
+                <div class="sheet-header">
+                    <div>
+                        <h3 id="history-date-picker-title">选择日期</h3>
+                        <p id="history-date-picker-subtitle" class="hint">仅可选择当前条件下存在记录的日期。</p>
+                    </div>
+                    <button id="history-date-picker-close-btn" class="icon-btn share-clear-btn" title="关闭">关闭</button>
+                </div>
+
+                <div class="history-date-picker-nav">
+                    <button id="history-date-picker-prev-btn" type="button" class="history-date-picker-nav-btn" aria-label="上个月">‹</button>
+                    <div id="history-date-picker-month-label" class="history-date-picker-month-label">2026年3月</div>
+                    <button id="history-date-picker-next-btn" type="button" class="history-date-picker-nav-btn" aria-label="下个月">›</button>
+                </div>
+
+                <div class="history-date-picker-weekdays">
+                    <span>一</span>
+                    <span>二</span>
+                    <span>三</span>
+                    <span>四</span>
+                    <span>五</span>
+                    <span>六</span>
+                    <span>日</span>
+                </div>
+
+                <div id="history-date-picker-grid" class="history-date-picker-grid"></div>
+
+                <div class="sheet-actions">
+                    <button id="history-date-picker-clear-btn" class="secondary-btn">清除日期</button>
+                    <button id="history-date-picker-done-btn" class="primary-btn">完成</button>
+                </div>
+            </div>
+        </div>
 
         <!-- 底部导航栏 -->
         <nav id="bottom-nav">
