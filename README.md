@@ -425,6 +425,51 @@ cp mobile/src/style.css  desktop/static/style.css
 
 ---
 
+## GitHub Actions
+
+仓库现在带了两条自动化流水线：
+
+- `.github/workflows/ci.yml`
+  每次 `push` / `pull_request` 都会自动执行：
+  - 从根目录 `图标.jpg` 重建图标资源
+  - `cargo check` 桌面端
+  - `cargo tauri android build --debug --target aarch64` 验证 Android 工程
+
+- `.github/workflows/release.yml`
+  每次 push 一个 `v*` tag 时自动执行：
+  - 重建图标资源
+  - 构建 Android Release APK
+  - 构建 macOS DMG
+  - 生成 `SHA256SUMS`
+  - 自动创建 / 更新 GitHub Release
+
+标准发布方式：
+
+```bash
+git tag v0.1.4
+git push origin v0.1.4
+```
+
+Android 自动签名是可选的。想让 Release 里直接得到**可安装**的签名 APK，需要在 GitHub 仓库设置里配置以下 Secrets：
+
+- `ANDROID_KEYSTORE_BASE64`
+  把 `~/.android/vibedrop.keystore` 做 base64 后存进去
+- `ANDROID_KEYSTORE_PASSWORD`
+  keystore 密码
+- `ANDROID_KEY_PASSWORD`
+  如果 key 密码和 keystore 密码不同，再单独配置；相同可不配
+
+如果这些 Secrets 没配，Release workflow 仍然会产出 Android APK，但文件名会带 `-unsigned`，只能作为构建产物，不能直接正常安装覆盖。
+
+这套做法就是比较标准的工程实践：
+
+- 本地脚本负责你自己日常开发、快速部署到真机
+- GitHub Actions 负责远程自动校验、自动打包、自动发布
+- `tag` 对应 `release`
+- 构建产物和校验文件都能回溯到具体提交
+
+---
+
 ## 配置
 
 ### 环境变量（Mac 端）

@@ -1,0 +1,196 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: macos-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: python3 -m pip install --upgrade pip pillow
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;29.0.14206865"
+
+      - name: Export Android environment
+        run: |
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            desktop/src-tauri -> target
+            mobile/src-tauri -> target
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Generate app icons
+        run: ./scripts/generate-app-icons.py
+
+      - name: Verify tag matches app versions
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          grep -q "version = \"$VERSION\"" desktop/src-tauri/Cargo.toml
+          grep -q "version = \"$VERSION\"" mobile/src-tauri/Cargo.toml
+          python3 -c '
+          import json
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          for rel_path in [
+              "desktop/src-tauri/tauri.conf.json",
+              "mobile/src-tauri/tauri.conf.json",
+          ]:
+              data = json.loads(Path(rel_path).read_text())
+              if data["version"] != version:
+                  raise SystemExit(f"{rel_path} has version {data['version']!r}, expected {version!r}")
+          ' "$VERSION"
+
+      - name: Build Android release bundle
+        working-directory: mobile
+        run: cargo tauri android build --target aarch64
+
+      - name: Prepare Android asset
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          UNSIGNED_APK="mobile/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
+          mkdir -p release-assets
+
+          if [[ -n "${ANDROID_KEYSTORE_BASE64}" && -n "${ANDROID_KEYSTORE_PASSWORD}" ]]; then
+            KEYSTORE_PATH="$RUNNER_TEMP/vibedrop-release.keystore"
+            export KEYSTORE_PATH
+            python3 -c "import base64, os; from pathlib import Path; Path(os.environ['KEYSTORE_PATH']).write_bytes(base64.b64decode(os.environ['ANDROID_KEYSTORE_BASE64']))"
+
+            APKSIGNER="$(find "$ANDROID_SDK_ROOT/build-tools" -type f -name apksigner | sort | tail -1)"
+            [[ -n "$APKSIGNER" ]]
+
+            SIGNED_APK="release-assets/VibeDrop_${VERSION}_android_universal.apk"
+            if [[ -n "${ANDROID_KEY_PASSWORD}" ]]; then
+              "$APKSIGNER" sign \
+                --ks "$KEYSTORE_PATH" \
+                --ks-pass "env:ANDROID_KEYSTORE_PASSWORD" \
+                --key-pass "env:ANDROID_KEY_PASSWORD" \
+                --out "$SIGNED_APK" \
+                "$UNSIGNED_APK"
+            else
+              "$APKSIGNER" sign \
+                --ks "$KEYSTORE_PATH" \
+                --ks-pass "env:ANDROID_KEYSTORE_PASSWORD" \
+                --out "$SIGNED_APK" \
+                "$UNSIGNED_APK"
+            fi
+            echo "ANDROID_ASSET=$SIGNED_APK" >> "$GITHUB_ENV"
+            echo "ANDROID_ASSET_LABEL=VibeDrop for Android" >> "$GITHUB_ENV"
+          else
+            UNSIGNED_RELEASE_APK="release-assets/VibeDrop_${VERSION}_android_universal-unsigned.apk"
+            cp "$UNSIGNED_APK" "$UNSIGNED_RELEASE_APK"
+            echo "ANDROID_ASSET=$UNSIGNED_RELEASE_APK" >> "$GITHUB_ENV"
+            echo "ANDROID_ASSET_LABEL=VibeDrop for Android (unsigned)" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build macOS DMG
+        working-directory: desktop
+        run: cargo tauri build
+
+      - name: Prepare macOS asset
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG_PATH="$(find desktop/src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' | head -n 1)"
+          [[ -n "$DMG_PATH" ]]
+          MACOS_ASSET="release-assets/VibeDrop_${VERSION}_macos.dmg"
+          cp "$DMG_PATH" "$MACOS_ASSET"
+          echo "MACOS_ASSET=$MACOS_ASSET" >> "$GITHUB_ENV"
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          CHECKSUM_FILE="release-assets/VibeDrop_${VERSION}_SHA256SUMS.txt"
+          shasum -a 256 \
+            "$ANDROID_ASSET" \
+            "$MACOS_ASSET" \
+            > "$CHECKSUM_FILE"
+          echo "CHECKSUM_ASSET=$CHECKSUM_FILE" >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibedrop-release-${{ github.ref_name }}
+          path: release-assets/*
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          TITLE="VibeDrop ${TAG}"
+          MAC_ARG="${MACOS_ASSET}#VibeDrop for macOS"
+          ANDROID_ARG="${ANDROID_ASSET}#${ANDROID_ASSET_LABEL}"
+          CHECKSUM_ARG="${CHECKSUM_ASSET}#VibeDrop SHA-256 checksums"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$MAC_ARG" "$ANDROID_ARG" "$CHECKSUM_ARG" --clobber
+            gh release edit "$TAG" --title "$TITLE" --draft=false --latest
+          else
+            gh release create "$TAG" "$MAC_ARG" "$ANDROID_ARG" "$CHECKSUM_ARG" \
+              --title "$TITLE" \
+              --generate-notes \
+              --verify-tag \
+              --latest
+          fi
