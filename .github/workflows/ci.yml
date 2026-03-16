@@ -27,6 +27,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Install Python dependencies
         run: python3 -m pip install --upgrade pip pillow
 
@@ -70,6 +75,17 @@ jobs:
 
       - name: Generate app icons
         run: ./scripts/generate-app-icons.py
+
+      - name: Verify shared frontend sync
+        run: |
+          cmp -s mobile/src/app.js desktop/static/app.js
+          cmp -s mobile/src/index.html desktop/static/index.html
+          cmp -s mobile/src/style.css desktop/static/style.css
+
+      - name: Check frontend scripts
+        run: |
+          node --check mobile/src/app.js
+          node --check desktop/src/main.js
 
       - name: Check desktop crate
         working-directory: desktop

@@ -14,19 +14,34 @@ class KeepAliveService : Service() {
     companion object {
         const val CHANNEL_ID = "vibedrop_sync"
         const val NOTIFICATION_ID = 1
+        const val ACTION_REFRESH_BACKGROUND_CLIPBOARD = "com.vibedrop.mobile.action.REFRESH_BACKGROUND_CLIPBOARD"
     }
+
+    private var backgroundClipboardSyncManager: BackgroundClipboardSyncManager? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
+        backgroundClipboardSyncManager = BackgroundClipboardSyncManager(this).also {
+            it.reloadConfig()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_REFRESH_BACKGROUND_CLIPBOARD) {
+            backgroundClipboardSyncManager?.reloadConfig()
+        }
         return START_STICKY // 被杀掉后自动重启
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        backgroundClipboardSyncManager?.shutdown()
+        backgroundClipboardSyncManager = null
+        super.onDestroy()
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

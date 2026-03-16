@@ -5,6 +5,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 DESKTOP_DIR="$ROOT_DIR/desktop"
 ICON_GENERATOR="$ROOT_DIR/scripts/generate-app-icons.py"
+FINDER_WORKFLOW_INSTALLER="$ROOT_DIR/scripts/install-finder-send-workflow.py"
+SHARE_EXTENSION_GENERATOR="$ROOT_DIR/scripts/generate-share-extension-project.rb"
+SHARE_EXTENSION_PROJECT="$ROOT_DIR/desktop/share-extension/VibeDropShare.xcodeproj"
+SHARE_EXTENSION_TARGET="${SHARE_EXTENSION_TARGET:-VibeDropShare}"
+SHARE_EXTENSION_BUILD_DIR="$ROOT_DIR/desktop/share-extension/build/Release"
+SHARE_EXTENSION_PRODUCT_PATH="$SHARE_EXTENSION_BUILD_DIR/VibeDropShare.appex"
+SHARE_EXTENSION_ENTITLEMENTS="$ROOT_DIR/desktop/share-extension/VibeDropShare/VibeDropShare.entitlements"
+SHARE_EXTENSION_INSTALL_PATH_SUFFIX="Contents/PlugIns/VibeDropShare.appex"
 
 APP_NAME="${APP_NAME:-VibeDrop.app}"
 APP_BUNDLE_NAME="${APP_BUNDLE_NAME:-VibeDrop}"
@@ -20,6 +28,7 @@ DEST_APP_PATH="$INSTALL_DIR/$APP_NAME"
 BUILT_APP_PATH="$DESKTOP_DIR/src-tauri/target/release/bundle/macos/$APP_NAME"
 PLIST_BUDDY="/usr/libexec/PlistBuddy"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+PLUGINKIT="/usr/bin/pluginkit"
 
 SKIP_BUILD=0
 NO_OPEN=0
@@ -63,10 +72,24 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
 }
 
+ensure_share_extension_project() {
+  [[ -f "$SHARE_EXTENSION_GENERATOR" ]] || fail "Share extension generator not found: $SHARE_EXTENSION_GENERATOR"
+  if [[ ! -d "$SHARE_EXTENSION_PROJECT" ]]; then
+    log "Generating Share Extension Xcode project"
+    ruby "$SHARE_EXTENSION_GENERATOR"
+  fi
+}
+
 regenerate_icons() {
   [[ -f "$ICON_GENERATOR" ]] || fail "Icon generator not found: $ICON_GENERATOR"
   log "Regenerating icon assets from 图标.jpg"
   python3 "$ICON_GENERATOR"
+}
+
+install_finder_workflow() {
+  [[ -f "$FINDER_WORKFLOW_INSTALLER" ]] || fail "Finder workflow installer not found: $FINDER_WORKFLOW_INSTALLER"
+  log "Installing Finder service workflow"
+  python3 "$FINDER_WORKFLOW_INSTALLER"
 }
 
 bundle_identifier() {
@@ -100,23 +123,58 @@ build_app() {
   )
 }
 
+build_share_extension() {
+  ensure_share_extension_project
+  [[ -f "$SHARE_EXTENSION_ENTITLEMENTS" ]] || fail "Share extension entitlements not found: $SHARE_EXTENSION_ENTITLEMENTS"
+  log "Building macOS Share Extension"
+  rm -rf "$SHARE_EXTENSION_BUILD_DIR"
+  xcodebuild \
+    -project "$SHARE_EXTENSION_PROJECT" \
+    -scheme "$SHARE_EXTENSION_TARGET" \
+    -configuration Release \
+    CODE_SIGNING_ALLOWED=NO \
+    CONFIGURATION_BUILD_DIR="$SHARE_EXTENSION_BUILD_DIR" \
+    build
+  [[ -d "$SHARE_EXTENSION_PRODUCT_PATH" ]] || fail "Built Share Extension not found: $SHARE_EXTENSION_PRODUCT_PATH"
+}
+
 sign_app() {
   local app_path="$1"
   local identity="$2"
   [[ -d "$app_path" ]] || fail "App bundle not found for signing: $app_path"
   if [[ "$identity" == "-" ]]; then
-    log "Applying ad-hoc bundle signature to $app_path"
-    codesign --force --deep --sign - "$app_path"
+    log "Applying bundle signature to $app_path"
+    codesign --force --sign - "$app_path"
     return
   fi
 
   log "Signing $app_path with identity $identity"
   if [[ -f "$KEYCHAIN_PATH" ]]; then
-    codesign --force --deep --keychain "$KEYCHAIN_PATH" --sign "$identity" "$app_path"
+    codesign --force --keychain "$KEYCHAIN_PATH" --sign "$identity" "$app_path"
     return
   fi
 
-  codesign --force --deep --sign "$identity" "$app_path"
+  codesign --force --sign "$identity" "$app_path"
+}
+
+sign_share_extension() {
+  local appex_path="$1"
+  local identity="$2"
+  [[ -d "$appex_path" ]] || fail "Share Extension bundle not found for signing: $appex_path"
+
+  if [[ "$identity" == "-" ]]; then
+    log "Signing Share Extension with ad-hoc identity"
+    codesign --force --sign - --entitlements "$SHARE_EXTENSION_ENTITLEMENTS" "$appex_path"
+    return
+  fi
+
+  log "Signing Share Extension with identity $identity"
+  if [[ -f "$KEYCHAIN_PATH" ]]; then
+    codesign --force --keychain "$KEYCHAIN_PATH" --sign "$identity" --entitlements "$SHARE_EXTENSION_ENTITLEMENTS" "$appex_path"
+    return
+  fi
+
+  codesign --force --sign "$identity" --entitlements "$SHARE_EXTENSION_ENTITLEMENTS" "$appex_path"
 }
 
 verify_app() {
@@ -170,10 +228,32 @@ refresh_launch_services() {
   "$LSREGISTER" -f "$app_path" >/dev/null
 }
 
+register_share_extension() {
+  local appex_path="$1"
+  [[ -x "$PLUGINKIT" ]] || return 0
+  [[ -d "$appex_path" ]] || return 0
+  log "Registering Share Extension $appex_path"
+  "$PLUGINKIT" -a "$appex_path" >/dev/null || true
+}
+
 install_app() {
   [[ -d "$BUILT_APP_PATH" ]] || fail "Built app bundle not found: $BUILT_APP_PATH"
   log "Installing $APP_NAME to $DEST_APP_PATH"
   ditto "$BUILT_APP_PATH" "$DEST_APP_PATH"
+}
+
+embed_share_extension() {
+  local app_path="$1"
+  local plugins_dir="$app_path/Contents/PlugIns"
+  local installed_appex="$app_path/$SHARE_EXTENSION_INSTALL_PATH_SUFFIX"
+
+  [[ -d "$app_path" ]] || fail "App bundle not found for Share Extension embed: $app_path"
+  [[ -d "$SHARE_EXTENSION_PRODUCT_PATH" ]] || fail "Built Share Extension not found: $SHARE_EXTENSION_PRODUCT_PATH"
+
+  log "Embedding Share Extension into $app_path"
+  mkdir -p "$plugins_dir"
+  rm -rf "$installed_appex"
+  ditto "$SHARE_EXTENSION_PRODUCT_PATH" "$installed_appex"
 }
 
 stop_running_app() {
@@ -221,6 +301,8 @@ require_cmd open
 require_cmd codesign
 require_cmd security
 require_cmd python3
+require_cmd ruby
+require_cmd xcodebuild
 [[ -x "$PLIST_BUDDY" ]] || fail "Missing PlistBuddy: $PLIST_BUDDY"
 [[ -x "$LSREGISTER" ]] || fail "Missing lsregister: $LSREGISTER"
 
@@ -241,18 +323,25 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
     regenerate_icons
   fi
   build_app
+  build_share_extension
 fi
 
 validate_app_identifier "$BUILT_APP_PATH"
+embed_share_extension "$BUILT_APP_PATH"
+sign_share_extension "$BUILT_APP_PATH/$SHARE_EXTENSION_INSTALL_PATH_SUFFIX" "$SIGNING_IDENTITY"
 sign_app "$BUILT_APP_PATH" "$SIGNING_IDENTITY"
 verify_app "$BUILT_APP_PATH"
 
 stop_running_app
 install_app
 validate_app_identifier "$DEST_APP_PATH"
+embed_share_extension "$DEST_APP_PATH"
+sign_share_extension "$DEST_APP_PATH/$SHARE_EXTENSION_INSTALL_PATH_SUFFIX" "$SIGNING_IDENTITY"
 sign_app "$DEST_APP_PATH" "$SIGNING_IDENTITY"
 verify_app "$DEST_APP_PATH"
 refresh_launch_services "$DEST_APP_PATH"
+register_share_extension "$DEST_APP_PATH/$SHARE_EXTENSION_INSTALL_PATH_SUFFIX"
+install_finder_workflow
 
 if [[ $NO_OPEN -eq 0 ]]; then
   open_app

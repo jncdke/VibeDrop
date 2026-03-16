@@ -1,10 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::{
+        ConnectInfo,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path as AxumPath, State as AxumState,
+    },
+    http::StatusCode,
     response::IntoResponse,
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 
 use arboard::ImageData;
@@ -15,17 +20,22 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
 use std::io::Cursor;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, WebviewWindowBuilder, WindowEvent,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::time::{timeout, Duration};
 use tower_http::services::ServeDir;
 use tracing::{error, info, warn};
+use walkdir::WalkDir;
+use zip::write::FileOptions;
 
 // ---- 数据结构 ----
 
@@ -34,6 +44,18 @@ struct ClientMessage {
     action: String,
     #[serde(default)]
     pin: Option<String>,
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(default)]
+    device_name: Option<String>,
+    #[serde(default)]
+    can_receive_files: Option<bool>,
+    #[serde(default)]
+    base_device_id: Option<String>,
+    #[serde(default)]
+    receives_clipboard: Option<bool>,
+    #[serde(default)]
+    device_role: Option<String>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
@@ -44,6 +66,12 @@ struct ClientMessage {
     image_base64: Option<String>,
     #[serde(default)]
     file_base64: Option<String>,
+    #[serde(default)]
+    transfer_id: Option<String>,
+    #[serde(default)]
+    saved_path: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +132,138 @@ struct ServiceInfo {
     port: u16,
     pin: String,
     running: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ConnectedClientInfo {
+    id: String,
+    name: String,
+    can_receive_files: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DesktopTransferLaunch {
+    transfer_id: String,
+    client_id: String,
+    client_name: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DesktopTransferEvent {
+    transfer_id: String,
+    client_id: String,
+    client_name: String,
+    file_name: String,
+    status: String,
+    progress: f64,
+    sent_bytes: u64,
+    total_bytes: u64,
+    is_archive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct PairRequestInfo {
+    request_id: String,
+    client_id: String,
+    client_name: String,
+    code: String,
+    requested_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PairRequestPayload {
+    client_id: String,
+    client_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoverResponse {
+    kind: String,
+    server_id: String,
+    hostname: String,
+    ip: String,
+    port: u16,
+    protocol_version: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct PairRequestAccepted {
+    request_id: String,
+    code: String,
+    hostname: String,
+    expires_in_secs: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PairRequestStatusResponse {
+    status: String,
+    request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalShareExtensionRequest {
+    paths: Vec<String>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalShareExtensionAccepted {
+    status: String,
+    transfer_id: String,
+    client_id: String,
+    client_name: String,
+}
+
+#[derive(Clone)]
+struct ConnectedClient {
+    session_id: u64,
+    id: String,
+    base_id: String,
+    name: String,
+    can_receive_files: bool,
+    receives_clipboard: bool,
+    sender: mpsc::UnboundedSender<String>,
+}
+
+struct PreparedDesktopTransfer {
+    source_path: PathBuf,
+    file_name: String,
+    mime_type: String,
+    total_bytes: u64,
+    is_archive: bool,
+    cleanup_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+#[derive(Debug, Clone)]
+struct PairRequestEntry {
+    request_id: String,
+    client_id: String,
+    client_name: String,
+    code: String,
+    requested_at: chrono::DateTime<chrono::Local>,
+    status: PairRequestStatus,
 }
 
 // ---- Tauri 命令 ----
@@ -176,17 +336,408 @@ fn load_history_entries() -> Vec<HistoryEntry> {
     entries
 }
 
+#[tauri::command]
+fn list_connected_clients(ws_state: tauri::State<'_, Arc<WsState>>) -> Vec<ConnectedClientInfo> {
+    connected_clients_snapshot(ws_state.inner())
+}
+
+#[tauri::command]
+async fn send_dropped_paths(
+    client_id: String,
+    paths: Vec<String>,
+    ws_state: tauri::State<'_, Arc<WsState>>,
+    app: AppHandle,
+) -> Result<DesktopTransferLaunch, String> {
+    if paths.is_empty() {
+        return Err("没有可发送的文件".to_string());
+    }
+
+    let path_bufs: Vec<PathBuf> = paths
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect();
+
+    if path_bufs.is_empty() {
+        return Err("拖入的路径不存在或不可访问".to_string());
+    }
+
+    let client = {
+        let clients = ws_state
+            .clients
+            .lock()
+            .map_err(|_| "连接状态不可用".to_string())?;
+        let client = clients
+            .get(&client_id)
+            .cloned()
+            .ok_or_else(|| "目标手机已断开，请重新选择".to_string())?;
+        if !client.can_receive_files {
+            return Err("该设备当前不支持接收文件".to_string());
+        }
+        client
+    };
+
+    let transfer_seq = ws_state.transfer_counter.fetch_add(1, Ordering::Relaxed);
+    let transfer_id = format!(
+        "desktop-{}-{}",
+        chrono::Local::now().format("%Y%m%d%H%M%S"),
+        transfer_seq
+    );
+    let client_name = client.name.clone();
+
+    let ws_state_clone = ws_state.inner().clone();
+    let app_handle = app.clone();
+    let transfer_id_for_task = transfer_id.clone();
+    tauri::async_runtime::spawn(async move {
+        run_desktop_outbound_transfer(
+            ws_state_clone,
+            app_handle,
+            client,
+            transfer_id_for_task,
+            path_bufs,
+        )
+        .await;
+    });
+
+    Ok(DesktopTransferLaunch {
+        transfer_id,
+        client_id: client_id.clone(),
+        client_name,
+    })
+}
+
+#[tauri::command]
+fn list_pair_requests(ws_state: tauri::State<'_, Arc<WsState>>) -> Vec<PairRequestInfo> {
+    pair_requests_snapshot(ws_state.inner())
+}
+
+#[tauri::command]
+fn approve_pair_request(
+    request_id: String,
+    ws_state: tauri::State<'_, Arc<WsState>>,
+) -> Result<(), String> {
+    set_pair_request_status(ws_state.inner(), &request_id, PairRequestStatus::Approved)
+}
+
+#[tauri::command]
+fn reject_pair_request(
+    request_id: String,
+    ws_state: tauri::State<'_, Arc<WsState>>,
+) -> Result<(), String> {
+    set_pair_request_status(ws_state.inner(), &request_id, PairRequestStatus::Rejected)
+}
+
+#[tauri::command]
+fn set_preferred_share_client(
+    client_id: String,
+    ws_state: tauri::State<'_, Arc<WsState>>,
+) -> Result<(), String> {
+    let normalized = client_id.trim().to_string();
+    let mut preferred = ws_state
+        .preferred_share_client
+        .lock()
+        .map_err(|_| "无法更新默认分享目标".to_string())?;
+
+    if normalized.is_empty() {
+        *preferred = None;
+    } else {
+        *preferred = Some(normalized);
+    }
+
+    Ok(())
+}
+
+async fn discover_handler(AxumState(state): AxumState<ServerState>) -> Json<DiscoverResponse> {
+    Json(DiscoverResponse {
+        kind: "desktop".to_string(),
+        server_id: state.app.server_id,
+        hostname: state.app.hostname,
+        ip: state.app.ip,
+        port: state.app.port,
+        protocol_version: DISCOVERY_PROTOCOL_VERSION,
+    })
+}
+
+async fn request_pairing_handler(
+    AxumState(state): AxumState<ServerState>,
+    Json(payload): Json<PairRequestPayload>,
+) -> Result<Json<PairRequestAccepted>, (StatusCode, Json<serde_json::Value>)> {
+    let client_id = payload.client_id.trim();
+    let client_name = payload.client_name.trim();
+    if client_id.is_empty() || client_name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "缺少客户端标识" })),
+        ));
+    }
+
+    let accepted = {
+        let mut requests = state.ws.pair_requests.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "配对队列不可用" })),
+            )
+        })?;
+
+        prune_pair_requests_locked(&mut requests);
+
+        if let Some(existing) = requests.values().find(|entry| {
+            entry.client_id == client_id && entry.status == PairRequestStatus::Pending
+        }) {
+            PairRequestAccepted {
+                request_id: existing.request_id.clone(),
+                code: existing.code.clone(),
+                hostname: state.app.hostname.clone(),
+                expires_in_secs: PAIR_REQUEST_TTL_SECS as u64,
+            }
+        } else {
+            let sequence = state.ws.pair_counter.fetch_add(1, Ordering::Relaxed);
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(sequence);
+            let request_id = format!("pair-{}-{}", sequence, seed % 100000);
+            let code = format!("{:06}", (seed ^ (sequence * 7919)) % 1_000_000);
+            let entry = PairRequestEntry {
+                request_id: request_id.clone(),
+                client_id: client_id.to_string(),
+                client_name: client_name.to_string(),
+                code: code.clone(),
+                requested_at: chrono::Local::now(),
+                status: PairRequestStatus::Pending,
+            };
+            requests.insert(request_id.clone(), entry);
+
+            PairRequestAccepted {
+                request_id,
+                code,
+                hostname: state.app.hostname.clone(),
+                expires_in_secs: PAIR_REQUEST_TTL_SECS as u64,
+            }
+        }
+    };
+
+    broadcast_pair_requests(&state.ws);
+    focus_main_window(&state.ws);
+
+    Ok(Json(accepted))
+}
+
+async fn pair_status_handler(
+    AxumState(state): AxumState<ServerState>,
+    AxumPath(request_id): AxumPath<String>,
+) -> Json<PairRequestStatusResponse> {
+    let status = pair_request_status_snapshot(&state.ws, &request_id);
+    Json(match status {
+        Some(PairRequestStatus::Pending) => PairRequestStatusResponse {
+            status: "pending".to_string(),
+            request_id,
+            server_id: None,
+            hostname: None,
+            ip: None,
+            port: None,
+            pin: None,
+            error: None,
+        },
+        Some(PairRequestStatus::Approved) => PairRequestStatusResponse {
+            status: "approved".to_string(),
+            request_id,
+            server_id: Some(state.app.server_id),
+            hostname: Some(state.app.hostname),
+            ip: Some(state.app.ip),
+            port: Some(state.app.port),
+            pin: Some(state.app.pin),
+            error: None,
+        },
+        Some(PairRequestStatus::Rejected) => PairRequestStatusResponse {
+            status: "rejected".to_string(),
+            request_id,
+            server_id: None,
+            hostname: None,
+            ip: None,
+            port: None,
+            pin: None,
+            error: Some("桌面端拒绝了配对请求".to_string()),
+        },
+        None => PairRequestStatusResponse {
+            status: "expired".to_string(),
+            request_id,
+            server_id: None,
+            hostname: None,
+            ip: None,
+            port: None,
+            pin: None,
+            error: Some("配对请求已过期，请重新发起".to_string()),
+        },
+    })
+}
+
+async fn local_share_extension_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    AxumState(state): AxumState<ServerState>,
+    Json(payload): Json<LocalShareExtensionRequest>,
+) -> Result<Json<LocalShareExtensionAccepted>, (StatusCode, Json<serde_json::Value>)> {
+    if !remote_addr.ip().is_loopback() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "仅允许本机共享扩展调用" })),
+        ));
+    }
+
+    let path_bufs = payload
+        .paths
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if path_bufs.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "没有可发送的文件或文件夹" })),
+        ));
+    }
+
+    let Some(client) = resolve_finder_share_target_client(&state.ws) else {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "当前没有支持接收文件的手机在线设备" })),
+        ));
+    };
+
+    let app_handle = state
+        .ws
+        .app_handle
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "桌面端窗口尚未就绪，请先打开 VibeDrop" })),
+            )
+        })?;
+
+    let transfer_id = format!(
+        "share-extension-{}",
+        state.ws.transfer_counter.fetch_add(1, Ordering::Relaxed)
+    );
+    let file_name = summarize_paths_for_ui(&path_bufs);
+    let detail = match payload.source.as_deref() {
+        Some("finder-share-extension") => "来自 Finder 共享".to_string(),
+        Some(source) if !source.trim().is_empty() => format!("来自 {}", source),
+        _ => "来自 Finder 共享".to_string(),
+    };
+
+    emit_desktop_transfer_event(
+        &app_handle,
+        &DesktopTransferEvent {
+            transfer_id: transfer_id.clone(),
+            client_id: client.id.clone(),
+            client_name: client.name.clone(),
+            file_name,
+            status: "preparing".to_string(),
+            progress: 0.0,
+            sent_bytes: 0,
+            total_bytes: 0,
+            is_archive: path_bufs.len() > 1 || path_bufs.iter().any(|path| path.is_dir()),
+            detail: Some(detail),
+        },
+    );
+
+    let transfer_id_for_prepare = transfer_id.clone();
+    let path_bufs_for_prepare = path_bufs.clone();
+    let prepared = match tauri::async_runtime::spawn_blocking(move || {
+        prepare_share_extension_transfer(&path_bufs_for_prepare, &transfer_id_for_prepare)
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => {
+            emit_desktop_transfer_event(
+                &app_handle,
+                &DesktopTransferEvent {
+                    transfer_id: transfer_id.clone(),
+                    client_id: client.id.clone(),
+                    client_name: client.name.clone(),
+                    file_name: summarize_paths_for_ui(&path_bufs),
+                    status: "error".to_string(),
+                    progress: 0.0,
+                    sent_bytes: 0,
+                    total_bytes: 0,
+                    is_archive: path_bufs.len() > 1 || path_bufs.iter().any(|path| path.is_dir()),
+                    detail: Some(error.clone()),
+                },
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            ));
+        }
+        Err(join_error) => {
+            let message = format!("准备共享文件失败: {}", join_error);
+            emit_desktop_transfer_event(
+                &app_handle,
+                &DesktopTransferEvent {
+                    transfer_id: transfer_id.clone(),
+                    client_id: client.id.clone(),
+                    client_name: client.name.clone(),
+                    file_name: summarize_paths_for_ui(&path_bufs),
+                    status: "error".to_string(),
+                    progress: 0.0,
+                    sent_bytes: 0,
+                    total_bytes: 0,
+                    is_archive: path_bufs.len() > 1 || path_bufs.iter().any(|path| path.is_dir()),
+                    detail: Some(message.clone()),
+                },
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": message })),
+            ));
+        }
+    };
+
+    tauri::async_runtime::spawn(run_prepared_desktop_outbound_transfer(
+        Arc::clone(&state.ws),
+        app_handle,
+        client.clone(),
+        transfer_id.clone(),
+        prepared,
+    ));
+    focus_main_window(&state.ws);
+
+    Ok(Json(LocalShareExtensionAccepted {
+        status: "accepted".to_string(),
+        transfer_id,
+        client_id: client.id,
+        client_name: client.name,
+    }))
+}
+
 // ---- 应用状态 ----
 
+#[derive(Clone)]
 struct AppState {
+    server_id: String,
     pin: String,
     hostname: String,
     ip: String,
     port: u16,
 }
 
+#[derive(Clone)]
+struct ServerState {
+    app: AppState,
+    ws: Arc<WsState>,
+}
+
 const MIN_WINDOW_WIDTH: f64 = 320.0;
 const MIN_WINDOW_HEIGHT: f64 = 420.0;
+const DESKTOP_TO_MOBILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DESKTOP_TO_MOBILE_CHUNK_BYTES: usize = 192 * 1024;
+const DESKTOP_TO_MOBILE_ACK_TIMEOUT_SECS: u64 = 90;
+const PAIR_REQUEST_TTL_SECS: i64 = 120;
+const DISCOVERY_PROTOCOL_VERSION: u16 = 1;
 
 impl HistoryEntry {
     fn text_entry(text: &str, client_ip: &str) -> Self {
@@ -207,6 +758,10 @@ impl HistoryEntry {
 
 fn main() {
     tracing_subscriber::fmt::init();
+
+    let server_id_path = dirs_log_dir().join("server-id");
+    let server_id = std::env::var("VIBEDROP_SERVER_ID")
+        .unwrap_or_else(|_| load_or_create_stable_id(&server_id_path, "desktop"));
 
     // PIN 持久化：保存到 ~/.vibedrop/pin，重启不变
     let pin_path = dirs_log_dir().join("pin");
@@ -280,6 +835,7 @@ fn main() {
     });
 
     let state = AppState {
+        server_id: server_id.clone(),
         pin: pin.clone(),
         hostname: hostname.clone(),
         ip: ip.clone(),
@@ -308,8 +864,7 @@ fn main() {
     let ws_pin = pin.clone();
     let ws_hostname = hostname.clone();
     let ws_input_tx = input_tx.clone();
-    let app_handle: Arc<std::sync::Mutex<Option<AppHandle>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let app_handle: Arc<Mutex<Option<AppHandle>>> = Arc::new(Mutex::new(None));
     let app_handle_ws = Arc::clone(&app_handle);
     let ws_static_dir = static_dir.clone();
 
@@ -338,6 +893,28 @@ fn main() {
         }
     });
 
+    let ws_state = Arc::new(WsState {
+        pin: ws_pin,
+        hostname: ws_hostname,
+        input_tx: ws_input_tx,
+        app_handle: app_handle_ws,
+        clipboard_tx,
+        clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        preferred_share_client: Arc::new(Mutex::new(None)),
+        pair_requests: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        pending_transfers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        session_counter: AtomicU64::new(1),
+        pair_counter: AtomicU64::new(1),
+        transfer_counter: AtomicU64::new(1),
+    });
+    let ws_state_for_server = Arc::clone(&ws_state);
+    let server_state = ServerState {
+        app: state.clone(),
+        ws: Arc::clone(&ws_state_for_server),
+    };
+
+    start_finder_share_request_worker(Arc::clone(&ws_state));
+
     // 启动 HTTP 服务器（后台）
     let ws_port = port;
     std::thread::spawn(move || {
@@ -347,25 +924,23 @@ fn main() {
             .unwrap();
 
         rt.block_on(async {
-            let shared = Arc::new(WsState {
-                pin: ws_pin,
-                hostname: ws_hostname,
-                input_tx: ws_input_tx,
-                app_handle: app_handle_ws,
-                clipboard_tx,
-            });
-
-            let shared_clone = Arc::clone(&shared);
             let app = Router::new()
-                .route("/ws", get(move |ws| ws_handler(ws, shared_clone)))
-                .fallback_service(ServeDir::new(ws_static_dir));
+                .route("/ws", get(ws_handler))
+                .route("/discover", get(discover_handler))
+                .route("/pair/request", post(request_pairing_handler))
+                .route("/pair/status/{request_id}", get(pair_status_handler))
+                .route("/share-extension/paths", post(local_share_extension_handler))
+                .fallback_service(ServeDir::new(ws_static_dir))
+                .with_state(server_state);
 
             let http_addr = format!("0.0.0.0:{}", ws_port);
             info!("HTTP 服务启动在 {}", http_addr);
             let listener = tokio::net::TcpListener::bind(&http_addr)
                 .await
                 .unwrap_or_else(|_| panic!("无法绑定端口 {}", ws_port));
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
         });
     });
 
@@ -373,6 +948,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(state)
+        .manage(ws_state)
         .on_window_event(|window, event| {
             if window.label() != "main" {
                 return;
@@ -412,7 +988,13 @@ fn main() {
             check_accessibility,
             open_accessibility_settings,
             load_history_entries,
-            open_history_path
+            open_history_path,
+            list_connected_clients,
+            list_pair_requests,
+            approve_pair_request,
+            reject_pair_request,
+            set_preferred_share_client,
+            send_dropped_paths
         ])
         .setup(move |app| {
             if let Some(window_config) = app.config().app.windows.first().cloned() {
@@ -493,21 +1075,43 @@ struct WsState {
     pin: String,
     hostname: String,
     input_tx: mpsc::Sender<InputRequest>,
-    app_handle: Arc<std::sync::Mutex<Option<AppHandle>>>,
+    app_handle: Arc<Mutex<Option<AppHandle>>>,
     clipboard_tx: broadcast::Sender<String>,
+    clients: Arc<Mutex<std::collections::HashMap<String, ConnectedClient>>>,
+    preferred_share_client: Arc<Mutex<Option<String>>>,
+    pair_requests: Arc<Mutex<std::collections::HashMap<String, PairRequestEntry>>>,
+    pending_transfers:
+        Arc<Mutex<std::collections::HashMap<String, oneshot::Sender<Result<String, String>>>>>,
+    session_counter: AtomicU64,
+    pair_counter: AtomicU64,
+    transfer_counter: AtomicU64,
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, state: Arc<WsState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+#[derive(Debug, Deserialize)]
+struct QueuedFinderShareRequest {
+    paths: Vec<String>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    AxumState(state): AxumState<ServerState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, Arc::clone(&state.ws)))
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     info!("新的 WebSocket 连接");
     let mut authenticated = false;
+    let session_id = state.session_counter.fetch_add(1, Ordering::Relaxed);
+    let mut authenticated_client: Option<(String, u64)> = None;
+    let mut current_receives_clipboard = false;
 
     // 拆分 WebSocket 为 sender/receiver，以便同时接收客户端消息和广播剪贴板
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut clipboard_rx = state.clipboard_tx.subscribe();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<String>();
 
     loop {
         tokio::select! {
@@ -534,7 +1138,46 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                 if let Some(pin) = &client_msg.pin {
                                     if pin == &state.pin {
                                         authenticated = true;
-                                        info!("客户端认证成功");
+                                        let client_id = client_msg
+                                            .device_id
+                                            .clone()
+                                            .filter(|value| !value.trim().is_empty())
+                                            .unwrap_or_else(|| format!("client-{session_id}"));
+                                        let client_name = client_msg
+                                            .device_name
+                                            .clone()
+                                            .filter(|value| !value.trim().is_empty())
+                                            .unwrap_or_else(|| format!("手机 {session_id}"));
+                                        let base_id = client_msg
+                                            .base_device_id
+                                            .clone()
+                                            .filter(|value| !value.trim().is_empty())
+                                            .unwrap_or_else(|| client_id.clone());
+                                        let can_receive_files = client_msg.can_receive_files.unwrap_or(false);
+                                        let receives_clipboard = client_msg.receives_clipboard.unwrap_or(false);
+                                        let device_role = client_msg
+                                            .device_role
+                                            .as_deref()
+                                            .unwrap_or("primary");
+                                        current_receives_clipboard = receives_clipboard;
+                                        if let Ok(mut clients) = state.clients.lock() {
+                                            clients.insert(
+                                                client_id.clone(),
+                                                ConnectedClient {
+                                                    session_id,
+                                                    id: client_id.clone(),
+                                                    base_id,
+                                                    name: client_name.clone(),
+                                                    can_receive_files,
+                                                    receives_clipboard,
+                                                    sender: outgoing_tx.clone(),
+                                                },
+                                            );
+                                        }
+                                        authenticated_client = Some((client_id, session_id));
+                                        broadcast_connected_clients(&state);
+
+                                        info!("客户端认证成功: {} ({})", client_name, device_role);
                                         let reply = ServerMessage {
                                             status: "ok".to_string(),
                                             hostname: Some(state.hostname.clone()),
@@ -549,6 +1192,51 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                             error: Some("PIN 码错误".to_string()),
                                         };
                                         let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    }
+                                }
+                            }
+
+                            "incoming_file_saved" => {
+                                if !authenticated {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("未认证".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                }
+
+                                if let Some(transfer_id) = client_msg.transfer_id.as_deref() {
+                                    if let Ok(mut pending) = state.pending_transfers.lock() {
+                                        if let Some(done_tx) = pending.remove(transfer_id) {
+                                            let saved_path = client_msg.saved_path.clone().unwrap_or_default();
+                                            let _ = done_tx.send(Ok(saved_path));
+                                        }
+                                    }
+                                }
+                            }
+
+                            "incoming_file_error" => {
+                                if !authenticated {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("未认证".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                }
+
+                                if let Some(transfer_id) = client_msg.transfer_id.as_deref() {
+                                    if let Ok(mut pending) = state.pending_transfers.lock() {
+                                        if let Some(done_tx) = pending.remove(transfer_id) {
+                                            let message = client_msg
+                                                .error
+                                                .clone()
+                                                .unwrap_or_else(|| "手机端保存失败".to_string());
+                                            let _ = done_tx.send(Err(message));
+                                        }
                                     }
                                 }
                             }
@@ -840,10 +1528,28 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                     _ => {}
                 }
             }
+            outgoing = outgoing_rx.recv() => {
+                match outgoing {
+                    Some(payload) => {
+                        if ws_sender.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
             // 接收剪贴板广播，转发给已认证的客户端
             clipboard_text = clipboard_rx.recv() => {
                 if authenticated {
                     if let Ok(text) = clipboard_text {
+                        let send_to_explicit_receivers_only = state
+                            .clients
+                            .lock()
+                            .map(|clients| clients.values().any(|client| client.receives_clipboard))
+                            .unwrap_or(false);
+                        if send_to_explicit_receivers_only && !current_receives_clipboard {
+                            continue;
+                        }
                         let msg = serde_json::json!({
                             "action": "clipboard",
                             "text": text
@@ -854,7 +1560,914 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
             }
         }
     }
+
+    if let Some((client_id, client_session_id)) = authenticated_client {
+        if let Ok(mut clients) = state.clients.lock() {
+            let should_remove = clients
+                .get(&client_id)
+                .map(|client| client.session_id == client_session_id)
+                .unwrap_or(false);
+            if should_remove {
+                clients.remove(&client_id);
+            }
+        }
+        broadcast_connected_clients(&state);
+    }
     info!("WebSocket 连接关闭");
+}
+
+fn connected_clients_snapshot(state: &Arc<WsState>) -> Vec<ConnectedClientInfo> {
+    let mut clients = state
+        .clients
+        .lock()
+        .map(|clients| {
+            let mut grouped = std::collections::HashMap::<String, ConnectedClientInfo>::new();
+            for client in clients.values() {
+                let entry = grouped
+                    .entry(client.base_id.clone())
+                    .or_insert_with(|| ConnectedClientInfo {
+                        id: client.base_id.clone(),
+                        name: client.name.clone(),
+                        can_receive_files: client.can_receive_files,
+                    });
+                if entry.name.trim().is_empty() {
+                    entry.name = client.name.clone();
+                }
+                if client.can_receive_files {
+                    entry.can_receive_files = true;
+                }
+            }
+            grouped.into_values().collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    clients.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    clients
+}
+
+fn broadcast_connected_clients(state: &Arc<WsState>) {
+    let clients = connected_clients_snapshot(state);
+    if let Ok(guard) = state.app_handle.lock() {
+        if let Some(handle) = guard.as_ref() {
+            let _ = handle.emit("connected-clients-changed", &clients);
+        }
+    }
+}
+
+fn focus_main_window(state: &Arc<WsState>) {
+    if let Ok(guard) = state.app_handle.lock() {
+        if let Some(handle) = guard.as_ref() {
+            if let Some(window) = handle.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+    }
+}
+
+fn prune_pair_requests_locked(requests: &mut std::collections::HashMap<String, PairRequestEntry>) {
+    let now = chrono::Local::now();
+    requests.retain(|_, entry| (now - entry.requested_at).num_seconds() < PAIR_REQUEST_TTL_SECS);
+}
+
+fn pair_requests_snapshot(state: &Arc<WsState>) -> Vec<PairRequestInfo> {
+    let mut requests = state
+        .pair_requests
+        .lock()
+        .map(|mut requests| {
+            prune_pair_requests_locked(&mut requests);
+            requests
+                .values()
+                .filter(|entry| entry.status == PairRequestStatus::Pending)
+                .map(|entry| PairRequestInfo {
+                    request_id: entry.request_id.clone(),
+                    client_id: entry.client_id.clone(),
+                    client_name: entry.client_name.clone(),
+                    code: entry.code.clone(),
+                    requested_at: entry.requested_at.to_rfc3339(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    requests.sort_by(|a, b| b.requested_at.cmp(&a.requested_at));
+    requests
+}
+
+fn broadcast_pair_requests(state: &Arc<WsState>) {
+    let requests = pair_requests_snapshot(state);
+    if let Ok(guard) = state.app_handle.lock() {
+        if let Some(handle) = guard.as_ref() {
+            let _ = handle.emit("pair-requests-changed", &requests);
+        }
+    }
+}
+
+fn set_pair_request_status(
+    state: &Arc<WsState>,
+    request_id: &str,
+    status: PairRequestStatus,
+) -> Result<(), String> {
+    let updated = {
+        let mut requests = state
+            .pair_requests
+            .lock()
+            .map_err(|_| "配对请求队列不可用".to_string())?;
+        prune_pair_requests_locked(&mut requests);
+        let Some(entry) = requests.get_mut(request_id) else {
+            return Err("配对请求不存在或已过期".to_string());
+        };
+        entry.status = status;
+        true
+    };
+
+    if updated {
+        broadcast_pair_requests(state);
+    }
+    Ok(())
+}
+
+fn pair_request_status_snapshot(
+    state: &Arc<WsState>,
+    request_id: &str,
+) -> Option<PairRequestStatus> {
+    state.pair_requests.lock().ok().and_then(|mut requests| {
+        prune_pair_requests_locked(&mut requests);
+        requests.get(request_id).map(|entry| entry.status)
+    })
+}
+
+fn start_finder_share_request_worker(state: Arc<WsState>) {
+    std::thread::spawn(move || {
+        let queue_dir = finder_share_requests_dir();
+        let _ = fs::create_dir_all(&queue_dir);
+
+        loop {
+            process_pending_finder_share_requests(&state);
+            std::thread::sleep(std::time::Duration::from_millis(900));
+        }
+    });
+}
+
+fn process_pending_finder_share_requests(state: &Arc<WsState>) {
+    let Ok(app_handle) = state.app_handle.lock().map(|guard| guard.clone()) else {
+        return;
+    };
+    let Some(app_handle) = app_handle else {
+        return;
+    };
+
+    let Some(client) = resolve_finder_share_target_client(state) else {
+        return;
+    };
+
+    let queue_dir = finder_share_requests_dir();
+    let Ok(entries) = fs::read_dir(&queue_dir) else {
+        return;
+    };
+
+    let mut pending_files = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    pending_files.sort();
+
+    for request_path in pending_files {
+        let request = match load_finder_share_request(&request_path) {
+            Ok(request) if !request.paths.is_empty() => request,
+            Ok(_) | Err(_) => {
+                let _ = fs::remove_file(&request_path);
+                continue;
+            }
+        };
+
+        let share_paths = request
+            .paths
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        if share_paths.is_empty() {
+            let _ = fs::remove_file(&request_path);
+            continue;
+        }
+
+        let transfer_id = format!(
+            "finder-share-{}",
+            state.transfer_counter.fetch_add(1, Ordering::Relaxed)
+        );
+        let file_name = summarize_paths_for_ui(&share_paths);
+        let detail = match request.source.as_deref() {
+            Some("finder-service") => "来自 Finder 右键发送".to_string(),
+            Some(source) if !source.trim().is_empty() => format!("来自 {}", source),
+            _ => "来自 Finder 发送".to_string(),
+        };
+
+        if fs::remove_file(&request_path).is_err() {
+            continue;
+        }
+
+        emit_desktop_transfer_event(
+            &app_handle,
+            &DesktopTransferEvent {
+                transfer_id: transfer_id.clone(),
+                client_id: client.id.clone(),
+                client_name: client.name.clone(),
+                file_name,
+                status: "preparing".to_string(),
+                progress: 0.0,
+                sent_bytes: 0,
+                total_bytes: 0,
+                is_archive: share_paths.len() > 1 || share_paths.iter().any(|path| path.is_dir()),
+                detail: Some(detail),
+            },
+        );
+
+        tauri::async_runtime::spawn(run_desktop_outbound_transfer(
+            Arc::clone(state),
+            app_handle.clone(),
+            client.clone(),
+            transfer_id,
+            share_paths,
+        ));
+        focus_main_window(state);
+        break;
+    }
+}
+
+fn resolve_finder_share_target_client(state: &Arc<WsState>) -> Option<ConnectedClient> {
+    let preferred_id = state
+        .preferred_share_client
+        .lock()
+        .ok()
+        .and_then(|value| value.clone());
+
+    let clients = state.clients.lock().ok()?;
+    if let Some(preferred_id) = preferred_id {
+        if let Some(client) = clients
+            .get(&preferred_id)
+            .filter(|client| client.can_receive_files)
+        {
+            return Some(client.clone());
+        }
+    }
+
+    let mut file_ready_clients = clients
+        .values()
+        .filter(|client| client.can_receive_files)
+        .cloned()
+        .collect::<Vec<_>>();
+    file_ready_clients.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    file_ready_clients.into_iter().next()
+}
+
+fn load_finder_share_request(path: &Path) -> Result<QueuedFinderShareRequest, String> {
+    let payload =
+        std::fs::read_to_string(path).map_err(|error| format!("无法读取共享请求: {}", error))?;
+    serde_json::from_str::<QueuedFinderShareRequest>(&payload)
+        .map_err(|error| format!("共享请求无效: {}", error))
+}
+
+fn emit_desktop_transfer_event(app: &AppHandle, event: &DesktopTransferEvent) {
+    let _ = app.emit("desktop-transfer-progress", event);
+}
+
+async fn run_desktop_outbound_transfer(
+    state: Arc<WsState>,
+    app: AppHandle,
+    client: ConnectedClient,
+    transfer_id: String,
+    paths: Vec<PathBuf>,
+) {
+    emit_desktop_transfer_event(
+        &app,
+        &DesktopTransferEvent {
+            transfer_id: transfer_id.clone(),
+            client_id: client.id.clone(),
+            client_name: client.name.clone(),
+            file_name: summarize_paths_for_ui(&paths),
+            status: "preparing".to_string(),
+            progress: 0.0,
+            sent_bytes: 0,
+            total_bytes: 0,
+            is_archive: false,
+            detail: Some("正在准备发送内容".to_string()),
+        },
+    );
+
+    let transfer_id_for_prepare = transfer_id.clone();
+    let prepared = match tauri::async_runtime::spawn_blocking(move || {
+        prepare_desktop_transfer(&paths, &transfer_id_for_prepare)
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => {
+            emit_desktop_transfer_event(
+                &app,
+                &DesktopTransferEvent {
+                    transfer_id,
+                    client_id: client.id.clone(),
+                    client_name: client.name.clone(),
+                    file_name: "拖拽内容".to_string(),
+                    status: "error".to_string(),
+                    progress: 0.0,
+                    sent_bytes: 0,
+                    total_bytes: 0,
+                    is_archive: false,
+                    detail: Some(error),
+                },
+            );
+            return;
+        }
+        Err(join_error) => {
+            emit_desktop_transfer_event(
+                &app,
+                &DesktopTransferEvent {
+                    transfer_id,
+                    client_id: client.id.clone(),
+                    client_name: client.name.clone(),
+                    file_name: "拖拽内容".to_string(),
+                    status: "error".to_string(),
+                    progress: 0.0,
+                    sent_bytes: 0,
+                    total_bytes: 0,
+                    is_archive: false,
+                    detail: Some(format!("准备文件失败: {}", join_error)),
+                },
+            );
+            return;
+        }
+    };
+
+    run_prepared_desktop_outbound_transfer(state, app, client, transfer_id, prepared).await;
+}
+
+async fn run_prepared_desktop_outbound_transfer(
+    state: Arc<WsState>,
+    app: AppHandle,
+    client: ConnectedClient,
+    transfer_id: String,
+    prepared: PreparedDesktopTransfer,
+) {
+
+    emit_desktop_transfer_event(
+        &app,
+        &DesktopTransferEvent {
+            transfer_id: transfer_id.clone(),
+            client_id: client.id.clone(),
+            client_name: client.name.clone(),
+            file_name: prepared.file_name.clone(),
+            status: "sending".to_string(),
+            progress: 0.0,
+            sent_bytes: 0,
+            total_bytes: prepared.total_bytes,
+            is_archive: prepared.is_archive,
+            detail: Some(if prepared.is_archive {
+                "文件夹/多文件已打包为 ZIP，开始发送".to_string()
+            } else {
+                "开始发送到手机".to_string()
+            }),
+        },
+    );
+
+    let (done_tx, done_rx) = oneshot::channel();
+    if let Ok(mut pending) = state.pending_transfers.lock() {
+        pending.insert(transfer_id.clone(), done_tx);
+    } else {
+        cleanup_temp_transfer(&prepared);
+        emit_desktop_transfer_event(
+            &app,
+            &DesktopTransferEvent {
+                transfer_id,
+                client_id: client.id.clone(),
+                client_name: client.name.clone(),
+                file_name: prepared.file_name,
+                status: "error".to_string(),
+                progress: 0.0,
+                sent_bytes: 0,
+                total_bytes: prepared.total_bytes,
+                is_archive: prepared.is_archive,
+                detail: Some("发送状态初始化失败".to_string()),
+            },
+        );
+        return;
+    }
+
+    let start_message = serde_json::json!({
+        "action": "incoming_file_start",
+        "transfer_id": transfer_id.clone(),
+        "file_name": prepared.file_name.clone(),
+        "mime_type": prepared.mime_type.clone(),
+        "size_bytes": prepared.total_bytes,
+        "is_archive": prepared.is_archive,
+    });
+
+    if client.sender.send(start_message.to_string()).is_err() {
+        let _ = state
+            .pending_transfers
+            .lock()
+            .map(|mut pending| pending.remove(&transfer_id));
+        cleanup_temp_transfer(&prepared);
+        emit_desktop_transfer_event(
+            &app,
+            &DesktopTransferEvent {
+                transfer_id,
+                client_id: client.id.clone(),
+                client_name: client.name.clone(),
+                file_name: prepared.file_name,
+                status: "error".to_string(),
+                progress: 0.0,
+                sent_bytes: 0,
+                total_bytes: prepared.total_bytes,
+                is_archive: prepared.is_archive,
+                detail: Some("手机连接已断开".to_string()),
+            },
+        );
+        return;
+    }
+
+    let mut file = match fs::File::open(&prepared.source_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = state
+                .pending_transfers
+                .lock()
+                .map(|mut pending| pending.remove(&transfer_id));
+            cleanup_temp_transfer(&prepared);
+            emit_desktop_transfer_event(
+                &app,
+                &DesktopTransferEvent {
+                    transfer_id,
+                    client_id: client.id.clone(),
+                    client_name: client.name.clone(),
+                    file_name: prepared.file_name,
+                    status: "error".to_string(),
+                    progress: 0.0,
+                    sent_bytes: 0,
+                    total_bytes: prepared.total_bytes,
+                    is_archive: prepared.is_archive,
+                    detail: Some(format!("无法读取待发送文件: {}", error)),
+                },
+            );
+            return;
+        }
+    };
+
+    let mut sent_bytes = 0u64;
+    let mut buffer = vec![0u8; DESKTOP_TO_MOBILE_CHUNK_BYTES];
+
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = state
+                    .pending_transfers
+                    .lock()
+                    .map(|mut pending| pending.remove(&transfer_id));
+                cleanup_temp_transfer(&prepared);
+                emit_desktop_transfer_event(
+                    &app,
+                    &DesktopTransferEvent {
+                        transfer_id,
+                        client_id: client.id.clone(),
+                        client_name: client.name.clone(),
+                        file_name: prepared.file_name,
+                        status: "error".to_string(),
+                        progress: 0.0,
+                        sent_bytes,
+                        total_bytes: prepared.total_bytes,
+                        is_archive: prepared.is_archive,
+                        detail: Some(format!("发送过程中读取文件失败: {}", error)),
+                    },
+                );
+                return;
+            }
+        };
+
+        if read == 0 {
+            break;
+        }
+
+        let chunk_message = serde_json::json!({
+            "action": "incoming_file_chunk",
+            "transfer_id": transfer_id.clone(),
+            "chunk_base64": BASE64_STANDARD.encode(&buffer[..read]),
+        });
+
+        if client.sender.send(chunk_message.to_string()).is_err() {
+            let _ = state
+                .pending_transfers
+                .lock()
+                .map(|mut pending| pending.remove(&transfer_id));
+            cleanup_temp_transfer(&prepared);
+            emit_desktop_transfer_event(
+                &app,
+                &DesktopTransferEvent {
+                    transfer_id,
+                    client_id: client.id.clone(),
+                    client_name: client.name.clone(),
+                    file_name: prepared.file_name,
+                    status: "error".to_string(),
+                    progress: sent_bytes as f64 / prepared.total_bytes.max(1) as f64,
+                    sent_bytes,
+                    total_bytes: prepared.total_bytes,
+                    is_archive: prepared.is_archive,
+                    detail: Some("手机连接在发送过程中断开".to_string()),
+                },
+            );
+            return;
+        }
+
+        sent_bytes += read as u64;
+        emit_desktop_transfer_event(
+            &app,
+            &DesktopTransferEvent {
+                transfer_id: transfer_id.clone(),
+                client_id: client.id.clone(),
+                client_name: client.name.clone(),
+                file_name: prepared.file_name.clone(),
+                status: "sending".to_string(),
+                progress: sent_bytes as f64 / prepared.total_bytes.max(1) as f64,
+                sent_bytes,
+                total_bytes: prepared.total_bytes,
+                is_archive: prepared.is_archive,
+                detail: Some("正在发送到手机".to_string()),
+            },
+        );
+    }
+
+    let complete_message = serde_json::json!({
+        "action": "incoming_file_complete",
+        "transfer_id": transfer_id.clone(),
+    });
+
+    if client.sender.send(complete_message.to_string()).is_err() {
+        let _ = state
+            .pending_transfers
+            .lock()
+            .map(|mut pending| pending.remove(&transfer_id));
+        cleanup_temp_transfer(&prepared);
+        emit_desktop_transfer_event(
+            &app,
+            &DesktopTransferEvent {
+                transfer_id,
+                client_id: client.id.clone(),
+                client_name: client.name.clone(),
+                file_name: prepared.file_name,
+                status: "error".to_string(),
+                progress: 1.0,
+                sent_bytes: prepared.total_bytes,
+                total_bytes: prepared.total_bytes,
+                is_archive: prepared.is_archive,
+                detail: Some("文件已传出，但手机未确认接收完成".to_string()),
+            },
+        );
+        return;
+    }
+
+    let final_result = timeout(
+        Duration::from_secs(DESKTOP_TO_MOBILE_ACK_TIMEOUT_SECS),
+        done_rx,
+    )
+    .await;
+    let _ = state
+        .pending_transfers
+        .lock()
+        .map(|mut pending| pending.remove(&transfer_id));
+    cleanup_temp_transfer(&prepared);
+
+    match final_result {
+        Ok(Ok(Ok(saved_path))) => {
+            emit_desktop_transfer_event(
+                &app,
+                &DesktopTransferEvent {
+                    transfer_id,
+                    client_id: client.id,
+                    client_name: client.name,
+                    file_name: prepared.file_name,
+                    status: "success".to_string(),
+                    progress: 1.0,
+                    sent_bytes: prepared.total_bytes,
+                    total_bytes: prepared.total_bytes,
+                    is_archive: prepared.is_archive,
+                    detail: Some(format!("已保存到手机：{}", saved_path)),
+                },
+            );
+        }
+        Ok(Ok(Err(error))) => {
+            emit_desktop_transfer_event(
+                &app,
+                &DesktopTransferEvent {
+                    transfer_id,
+                    client_id: client.id,
+                    client_name: client.name,
+                    file_name: prepared.file_name,
+                    status: "error".to_string(),
+                    progress: 1.0,
+                    sent_bytes: prepared.total_bytes,
+                    total_bytes: prepared.total_bytes,
+                    is_archive: prepared.is_archive,
+                    detail: Some(error),
+                },
+            );
+        }
+        Ok(Err(_)) => {
+            emit_desktop_transfer_event(
+                &app,
+                &DesktopTransferEvent {
+                    transfer_id,
+                    client_id: client.id,
+                    client_name: client.name,
+                    file_name: prepared.file_name,
+                    status: "error".to_string(),
+                    progress: 1.0,
+                    sent_bytes: prepared.total_bytes,
+                    total_bytes: prepared.total_bytes,
+                    is_archive: prepared.is_archive,
+                    detail: Some("手机端确认回执异常".to_string()),
+                },
+            );
+        }
+        Err(_) => {
+            emit_desktop_transfer_event(
+                &app,
+                &DesktopTransferEvent {
+                    transfer_id,
+                    client_id: client.id,
+                    client_name: client.name,
+                    file_name: prepared.file_name,
+                    status: "error".to_string(),
+                    progress: 1.0,
+                    sent_bytes: prepared.total_bytes,
+                    total_bytes: prepared.total_bytes,
+                    is_archive: prepared.is_archive,
+                    detail: Some("等待手机保存结果超时".to_string()),
+                },
+            );
+        }
+    }
+}
+
+fn prepare_share_extension_transfer(
+    paths: &[PathBuf],
+    transfer_id: &str,
+) -> Result<PreparedDesktopTransfer, String> {
+    let existing_paths: Vec<PathBuf> = paths.iter().filter(|path| path.exists()).cloned().collect();
+    if existing_paths.is_empty() {
+        return Err("共享的文件不存在或已失效，请重新从 Finder 发起一次".to_string());
+    }
+
+    if existing_paths.len() != 1 || !existing_paths[0].is_file() {
+        return prepare_desktop_transfer(&existing_paths, transfer_id);
+    }
+
+    let source_path = existing_paths[0].clone();
+    let metadata = fs::metadata(&source_path).map_err(|e| format!("无法读取共享文件信息: {}", e))?;
+    if metadata.len() > DESKTOP_TO_MOBILE_MAX_BYTES {
+        return Err(format!(
+            "文件过大，请控制在 {}MB 以内",
+            DESKTOP_TO_MOBILE_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let file_name =
+        sanitize_file_name(source_path.file_name().and_then(|name| name.to_str()), "file.bin");
+    let temp_dir = outbound_transfer_temp_dir();
+    fs::create_dir_all(&temp_dir).map_err(|e| format!("无法创建共享暂存目录: {}", e))?;
+
+    let staged_path = temp_dir.join(format!("{transfer_id}-{}", file_name));
+    fs::copy(&source_path, &staged_path)
+        .map_err(|e| format!("无法暂存共享文件，请检查 Finder 共享权限: {}", e))?;
+
+    Ok(PreparedDesktopTransfer {
+        source_path: staged_path.clone(),
+        file_name,
+        mime_type: mime_guess::from_path(&source_path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string(),
+        total_bytes: metadata.len(),
+        is_archive: false,
+        cleanup_path: Some(staged_path),
+    })
+}
+
+fn cleanup_temp_transfer(prepared: &PreparedDesktopTransfer) {
+    if let Some(path) = prepared.cleanup_path.as_ref() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn prepare_desktop_transfer(
+    paths: &[PathBuf],
+    transfer_id: &str,
+) -> Result<PreparedDesktopTransfer, String> {
+    let existing_paths: Vec<PathBuf> = paths.iter().filter(|path| path.exists()).cloned().collect();
+    if existing_paths.is_empty() {
+        return Err("拖入的文件不存在或已被移走".to_string());
+    }
+
+    if existing_paths.len() == 1 && existing_paths[0].is_file() {
+        let path = existing_paths[0].clone();
+        let metadata = fs::metadata(&path).map_err(|e| format!("无法读取文件信息: {}", e))?;
+        if metadata.len() > DESKTOP_TO_MOBILE_MAX_BYTES {
+            return Err(format!(
+                "文件过大，请控制在 {}MB 以内",
+                DESKTOP_TO_MOBILE_MAX_BYTES / (1024 * 1024)
+            ));
+        }
+
+        let file_name =
+            sanitize_file_name(path.file_name().and_then(|name| name.to_str()), "file.bin");
+
+        return Ok(PreparedDesktopTransfer {
+            source_path: path.clone(),
+            file_name,
+            mime_type: mime_guess::from_path(&path)
+                .first_or_octet_stream()
+                .essence_str()
+                .to_string(),
+            total_bytes: metadata.len(),
+            is_archive: false,
+            cleanup_path: None,
+        });
+    }
+
+    let archive_file_name = if existing_paths.len() == 1 && existing_paths[0].is_dir() {
+        let folder_name = sanitize_file_name(
+            existing_paths[0].file_name().and_then(|name| name.to_str()),
+            "folder",
+        );
+        if folder_name.to_ascii_lowercase().ends_with(".zip") {
+            folder_name
+        } else {
+            format!("{folder_name}.zip")
+        }
+    } else {
+        format!(
+            "vibedrop-bundle-{}.zip",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        )
+    };
+
+    let temp_dir = outbound_transfer_temp_dir();
+    fs::create_dir_all(&temp_dir).map_err(|e| format!("无法创建临时目录: {}", e))?;
+    let archive_path = temp_dir.join(format!("{transfer_id}-{}", archive_file_name));
+    create_zip_archive(&existing_paths, &archive_path)?;
+
+    let archive_size = fs::metadata(&archive_path)
+        .map_err(|e| format!("无法读取打包结果: {}", e))?
+        .len();
+
+    if archive_size > DESKTOP_TO_MOBILE_MAX_BYTES {
+        let _ = fs::remove_file(&archive_path);
+        return Err(format!(
+            "打包后的 ZIP 过大，请控制在 {}MB 以内",
+            DESKTOP_TO_MOBILE_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+
+    Ok(PreparedDesktopTransfer {
+        source_path: archive_path.clone(),
+        file_name: archive_file_name,
+        mime_type: "application/zip".to_string(),
+        total_bytes: archive_size,
+        is_archive: true,
+        cleanup_path: Some(archive_path),
+    })
+}
+
+fn outbound_transfer_temp_dir() -> PathBuf {
+    dirs_log_dir().join("outbound-transfer-temp")
+}
+
+fn create_zip_archive(source_paths: &[PathBuf], archive_path: &Path) -> Result<(), String> {
+    let file = fs::File::create(archive_path).map_err(|e| format!("无法创建 ZIP 文件: {}", e))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let file_options = FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    let dir_options = FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .unix_permissions(0o755);
+
+    for source in source_paths {
+        let archive_root = PathBuf::from(sanitize_file_name(
+            source.file_name().and_then(|name| name.to_str()),
+            "item",
+        ));
+        append_path_to_zip(
+            &mut zip,
+            source,
+            &archive_root,
+            file_options.clone(),
+            dir_options.clone(),
+        )?;
+    }
+
+    zip.finish()
+        .map_err(|e| format!("完成 ZIP 打包失败: {}", e))?;
+    Ok(())
+}
+
+fn load_or_create_stable_id(path: &Path, prefix: &str) -> String {
+    if let Ok(saved) = std::fs::read_to_string(path) {
+        let saved = saved.trim().to_string();
+        if !saved.is_empty() {
+            return saved;
+        }
+    }
+
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let generated = format!("{}-{:x}{:x}", prefix, seed, std::process::id());
+    let _ = fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")));
+    let _ = std::fs::write(path, &generated);
+    generated
+}
+
+fn append_path_to_zip<W: Write + std::io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    source: &Path,
+    archive_root: &Path,
+    file_options: FileOptions,
+    dir_options: FileOptions,
+) -> Result<(), String> {
+    if source.is_file() {
+        let entry_name = zip_entry_name(archive_root);
+        zip.start_file(entry_name, file_options)
+            .map_err(|e| format!("写入 ZIP 文件头失败: {}", e))?;
+        let mut file = fs::File::open(source).map_err(|e| format!("无法读取文件: {}", e))?;
+        std::io::copy(&mut file, zip).map_err(|e| format!("写入 ZIP 失败: {}", e))?;
+        return Ok(());
+    }
+
+    let mut has_entries = false;
+    for entry in WalkDir::new(source) {
+        let entry = entry.map_err(|e| format!("遍历目录失败: {}", e))?;
+        let current_path = entry.path();
+        let relative = current_path
+            .strip_prefix(source)
+            .map_err(|e| format!("目录相对路径失败: {}", e))?;
+        let archive_path = if relative.as_os_str().is_empty() {
+            archive_root.to_path_buf()
+        } else {
+            archive_root.join(relative)
+        };
+        let archive_name = zip_entry_name(&archive_path);
+
+        if entry.file_type().is_dir() {
+            if !archive_name.is_empty() {
+                zip.add_directory(format!("{archive_name}/"), dir_options)
+                    .map_err(|e| format!("写入 ZIP 目录失败: {}", e))?;
+                has_entries = true;
+            }
+            continue;
+        }
+
+        if entry.file_type().is_file() {
+            zip.start_file(archive_name, file_options)
+                .map_err(|e| format!("写入 ZIP 文件头失败: {}", e))?;
+            let mut file =
+                fs::File::open(current_path).map_err(|e| format!("无法读取文件: {}", e))?;
+            std::io::copy(&mut file, zip).map_err(|e| format!("写入 ZIP 失败: {}", e))?;
+            has_entries = true;
+        }
+    }
+
+    if !has_entries {
+        let archive_name = zip_entry_name(archive_root);
+        zip.add_directory(format!("{archive_name}/"), dir_options)
+            .map_err(|e| format!("写入空目录失败: {}", e))?;
+    }
+
+    Ok(())
+}
+
+fn zip_entry_name(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn summarize_paths_for_ui(paths: &[PathBuf]) -> String {
+    if paths.len() == 1 {
+        return paths[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("拖拽内容")
+            .to_string();
+    }
+
+    format!("{} 个项目", paths.len())
+}
+
+fn finder_share_requests_dir() -> PathBuf {
+    dirs_log_dir().join("finder-share-requests")
 }
 
 fn dirs_log_dir() -> PathBuf {
@@ -1041,7 +2654,10 @@ fn save_received_image(
     Ok((final_file_name, image_path.to_string_lossy().to_string()))
 }
 
-fn save_downloaded_file(file_base64: &str, file_name: Option<&str>) -> Result<(String, String), String> {
+fn save_downloaded_file(
+    file_base64: &str,
+    file_name: Option<&str>,
+) -> Result<(String, String), String> {
     let file_bytes = decode_base64_bytes(file_base64)?;
     let dir = downloads_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("无法创建下载目录: {}", e))?;

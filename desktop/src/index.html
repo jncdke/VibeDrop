@@ -48,40 +48,158 @@
                     服务在线
                 </div>
             </header>
+            <div class="desktop-shell">
+                <div class="desktop-tabbar" role="tablist" aria-label="桌面视图切换">
+                    <button type="button" class="desktop-tab is-active" id="desktop-tab-overview" data-tab="overview" role="tab" aria-selected="true">概览</button>
+                    <button type="button" class="desktop-tab" id="desktop-tab-history" data-tab="history" role="tab" aria-selected="false">历史</button>
+                </div>
 
-            <section class="info-card">
-                <div class="info-row">
-                    <span class="info-label">主机名</span>
-                    <span class="info-value" id="hostname">加载中...</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">IP 地址</span>
-                    <span class="info-value copyable" id="ip-address" title="点击复制">加载中...</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">端口</span>
-                    <span class="info-value copyable" id="port" title="点击复制">加载中...</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">PIN</span>
-                    <span class="info-value mono copyable" id="pin" title="点击复制">加载中...</span>
-                </div>
-            </section>
+                <div class="desktop-scroll" id="desktop-scroll">
+                    <section class="desktop-page" id="desktop-page-overview" data-page="overview">
+                        <div class="overview-top-grid">
+                            <div class="overview-left-column">
+                                <section class="info-card host-card">
+                                    <div class="info-row">
+                                        <span class="info-label">主机名</span>
+                                        <span class="info-value" id="hostname">加载中...</span>
+                                    </div>
+                                    <p class="host-card-caption">推荐在手机端使用“附近电脑 + 验证码配对”。手动连接参数默认已隐藏。</p>
+                                </section>
 
-            <section class="info-card tip-card">
-                <p>在手机端填入上方 IP 地址、端口和 PIN，即可完成连接。</p>
-            </section>
+                                <details class="info-card advanced-connect-card">
+                                    <summary class="advanced-connect-summary">
+                                        <div class="advanced-connect-copy">
+                                            <h3>高级连接信息</h3>
+                                            <p>默认不需要。只有自动发现失败或排障时，才需要手动查看 IP、端口和 PIN。</p>
+                                        </div>
+                                        <span class="advanced-connect-toggle">手动连接</span>
+                                    </summary>
+                                    <div class="advanced-connect-body">
+                                        <div class="info-row">
+                                            <span class="info-label">IP 地址</span>
+                                            <span class="info-value copyable" id="ip-address" title="点击复制">加载中...</span>
+                                        </div>
+                                        <div class="info-row">
+                                            <span class="info-label">端口</span>
+                                            <span class="info-value copyable" id="port" title="点击复制">加载中...</span>
+                                        </div>
+                                        <div class="info-row">
+                                            <span class="info-label">PIN</span>
+                                            <span class="info-value mono copyable" id="pin" title="点击复制">加载中...</span>
+                                        </div>
+                                    </div>
+                                </details>
 
-            <section class="log-section">
-                <div class="log-header">
-                    <h2>最近收到</h2>
-                    <button id="btn-export-log" class="btn-small" title="导出备份">导出</button>
+                                <section class="info-card tip-card">
+                                    <p>手机端默认通过“附近电脑”发起配对，确认同一验证码后会自动保存并连接这台 Mac。</p>
+                                </section>
+                            </div>
+
+                            <div class="overview-right-column">
+                                <section class="connected-devices-card" aria-label="当前已连接设备">
+                                    <div class="connected-devices-header">
+                                        <div>
+                                            <h2>当前已连接设备</h2>
+                                            <p class="connected-devices-caption">这里展示已认证连接到这台 Mac 的移动端列表，以及它们是否支持接收文件。</p>
+                                        </div>
+                                        <span id="connected-devices-count" class="connected-devices-count">0</span>
+                                    </div>
+                                    <div id="connected-device-list" class="connected-device-list"></div>
+                                    <div id="connected-device-empty" class="connected-device-empty">
+                                        还没有设备连上来。手机端连接成功后，这里会实时显示。
+                                    </div>
+                                </section>
+
+                                <section class="pair-requests-card" aria-label="待确认配对请求">
+                                    <div class="pair-requests-header">
+                                        <div>
+                                            <h2>待确认配对</h2>
+                                            <p class="pair-requests-caption">手机端发起自动配对时，会在这里显示验证码和确认按钮。</p>
+                                        </div>
+                                        <span id="pair-requests-count" class="connected-devices-count">0</span>
+                                    </div>
+                                    <div id="pair-request-list" class="pair-request-list"></div>
+                                    <div id="pair-request-empty" class="connected-device-empty">
+                                        还没有新的配对请求。手机端扫描到这台 Mac 后发起配对，这里会实时出现。
+                                    </div>
+                                </section>
+                            </div>
+                        </div>
+
+                        <section class="drop-send-card" aria-label="发送到手机">
+                            <div class="drop-send-header">
+                                <div>
+                                    <h2>发送到手机</h2>
+                                    <p id="drop-send-caption" class="drop-send-caption">把 Finder 里的文件或文件夹拖进这个窗口，直接发到手机默认下载目录。</p>
+                                </div>
+                            </div>
+                            <div id="drop-client-row" class="drop-client-row"></div>
+                            <p id="drop-client-empty" class="drop-client-empty hidden">当前没有已连接的手机 App，先在手机端连上这台 Mac。</p>
+                            <div id="drop-zone" class="drop-zone">
+                                <div class="drop-zone-icon" aria-hidden="true">⇪</div>
+                                <div class="drop-zone-title">拖入文件或文件夹</div>
+                                <p class="drop-zone-desc">单文件原样发送；文件夹和多文件会自动打包成 ZIP，再落到手机下载目录。</p>
+                            </div>
+                            <div id="drop-transfer-list" class="drop-transfer-list hidden"></div>
+                        </section>
+
+                        <section class="heatmap-card" aria-label="接收热力图">
+                            <div class="heatmap-header">
+                                <div>
+                                    <h3>接收热力图</h3>
+                                    <p id="log-heatmap-caption" class="heatmap-caption">最近 7 天每小时收到的记录数量。点击方块查看历史页筛选结果。</p>
+                                </div>
+                                <button id="btn-clear-heatmap-filter" class="btn-small hidden" title="清除热力图筛选">清除筛选</button>
+                            </div>
+                            <div id="log-heatmap-stats" class="heatmap-stats"></div>
+                            <div class="heatmap-board">
+                                <div class="heatmap-axis" aria-hidden="true">
+                                    <div class="heatmap-axis-grid">
+                                        <span class="heatmap-axis-label is-top" style="--offset: 0%;">00:00</span>
+                                        <span class="heatmap-axis-label" style="--offset: 25%;">06:00</span>
+                                        <span class="heatmap-axis-label" style="--offset: 50%;">12:00</span>
+                                        <span class="heatmap-axis-label" style="--offset: 75%;">18:00</span>
+                                        <span class="heatmap-axis-label is-bottom" style="--offset: 100%;">24:00</span>
+                                    </div>
+                                </div>
+                                <div id="log-heatmap-grid" class="heatmap-grid"></div>
+                            </div>
+                        </section>
+                    </section>
+
+                    <section class="desktop-page hidden" id="desktop-page-history" data-page="history">
+                        <div class="history-panel-header">
+                            <div>
+                                <h2>最近收到</h2>
+                                <p class="history-panel-caption">完整查看桌面端接收到的文字、图片和文件记录，导出也集中放在这里。</p>
+                            </div>
+                            <button id="btn-export-log" class="btn-small" title="导出备份">导出</button>
+                        </div>
+
+                        <section id="history-filter-banner" class="history-filter-banner hidden">
+                            <div class="history-filter-banner-copy">
+                                <span class="history-filter-kicker">当前筛选</span>
+                                <p id="history-filter-text" class="history-filter-text"></p>
+                            </div>
+                            <button id="btn-clear-history-filter" class="btn-small" title="清除历史筛选">清除</button>
+                        </section>
+
+                        <div class="history-list-card">
+                            <div class="log-list" id="log-list">
+                                <p class="empty">等待接收...</p>
+                            </div>
+                        </div>
+                    </section>
                 </div>
-                <div class="log-list" id="log-list">
-                    <p class="empty">等待接收...</p>
-                </div>
-            </section>
+            </div>
         </section>
+    </div>
+
+    <div id="window-drop-overlay" class="window-drop-overlay hidden" aria-hidden="true">
+        <div class="window-drop-overlay-card">
+            <div class="window-drop-overlay-title">松手发送到手机</div>
+            <p id="window-drop-overlay-text" class="window-drop-overlay-text">单文件原样发送，文件夹会自动打包 ZIP。</p>
+        </div>
     </div>
 
     <script src="main.js"></script>

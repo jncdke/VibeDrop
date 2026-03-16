@@ -8,8 +8,17 @@ const HEARTBEAT_TIMEOUT = 10000;
 const RECONNECT_INTERVAL = 3000;
 const HISTORY_KEY = 'voicedrop_history';
 const SETTINGS_KEY = 'voicedrop_settings';
+const CLIENT_IDENTITY_KEY = 'vibedrop_client_identity';
 const MAX_IMAGE_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_FILE_TRANSFER_BYTES = 32 * 1024 * 1024;
+const HEATMAP_VISIBLE_DAYS = 5;
+const HEATMAP_RENDER_BUFFER_DAYS = 14;
+const HEATMAP_HOUR_SLOTS = 24;
+const HEATMAP_COLUMN_STEP = 52;
+const HEATMAP_DRAG_THRESHOLD = 8;
+const HEATMAP_INERTIA_MS = 180;
+const DESKTOP_DISCOVERY_DEFAULT_PORT = 9001;
+const DESKTOP_PAIRING_POLL_MS = 1200;
 const DEFAULT_HISTORY_FILTERS = {
     device: 'all',
     quickTime: 'all',
@@ -24,6 +33,7 @@ const DEFAULT_HISTORY_FILTERS = {
 
 // ---- 状态 ----
 const connections = {}; // key = device.id, value = { ws, authenticated, hostname, ... }
+const incomingDesktopTransfers = {};
 let pendingSharedContent = null;
 let currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS };
 let historyDatePickerState = {
@@ -33,20 +43,49 @@ let historyDatePickerState = {
     minDate: '',
     maxDate: '',
 };
+let historyHeatmapState = {
+    viewportEndDate: '',
+    rangeToken: '',
+    selectionDate: '',
+    selectionHour: null,
+    dragPointerId: null,
+    dragStartX: 0,
+    dragOffsetX: 0,
+    dragLastX: 0,
+    dragLastTime: 0,
+    dragVelocity: 0,
+    dragMoved: false,
+    dragMinOffsetX: 0,
+    dragMaxOffsetX: 0,
+    suppressCellClickUntil: 0,
+};
+let nearbyDesktopState = {
+    items: [],
+    scanning: false,
+    scanError: '',
+    pairing: null,
+    pollTimer: null,
+};
 
 // ---- DOM 缓存 ----
 const $ = (id) => document.getElementById(id);
+let clientIdentity = getClientIdentity();
 
 // ---- 初始化 ----
 document.addEventListener('DOMContentLoaded', async () => {
+    clientIdentity = getClientIdentity();
     await loadPersistentHistory(); // 从文件恢复历史（优先于 localStorage）
     loadSettings();
+    syncNativeBackgroundClipboardConfig(clientIdentity);
     initNavigation();
     initSettingsButton();
+    initNearbyDesktopDiscovery();
     initHistoryActions();
     initHistoryFilterControls();
+    initHistoryHeatmapInteractions();
     initNativeShareInbox();
     await loadPendingSharedContent();
+    void discoverNearbyDesktops({ silent: true, syncKnownDevices: true });
 });
 
 // ---- 持久化存储（Tauri 文件系统）----
@@ -64,6 +103,34 @@ function persistHistory() {
     if (!window.__TAURI__) return;
     const data = localStorage.getItem(HISTORY_KEY) || '[]';
     window.__TAURI__.core.invoke('save_history', { data }).catch(() => {});
+}
+
+function syncNativeBackgroundClipboardConfig(identity = clientIdentity) {
+    if (!window.NativeBackgroundClipboard || !window.NativeBackgroundClipboard.syncConfig) {
+        return;
+    }
+
+    try {
+        const devices = getDevices()
+            .filter((device) => device && device.id && device.ip && device.pin)
+            .map((device) => ({
+                id: device.id,
+                name: device.name || '设备',
+                ip: String(device.ip || '').trim(),
+                port: String(device.port || '9001').trim() || '9001',
+                pin: String(device.pin || '').trim(),
+            }));
+        const payload = JSON.stringify({
+            identity: identity ? {
+                id: identity.id,
+                name: identity.name,
+            } : null,
+            devices,
+        });
+        window.NativeBackgroundClipboard.syncConfig(payload);
+    } catch (error) {
+        console.warn('同步后台剪贴板配置失败', error);
+    }
 }
 
 // ============================================
@@ -107,6 +174,7 @@ function getDevices() {
 
 function saveDevices(devices) {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({ devices }));
+    syncNativeBackgroundClipboardConfig();
 }
 
 function newDeviceId() {
@@ -118,10 +186,93 @@ function ensureConnection(deviceId) {
         connections[deviceId] = {
             ws: null, authenticated: false, hostname: null,
             heartbeatTimer: null, timeoutTimer: null, reconnectTimer: null,
-            _sendCallback: null
+            _sendCallback: null,
+            incomingTransferQueue: Promise.resolve(),
         };
     }
     return connections[deviceId];
+}
+
+function getClientIdentity() {
+    const nativeInfo = getNativeDeviceInfo();
+
+    try {
+        const raw = localStorage.getItem(CLIENT_IDENTITY_KEY);
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && parsed.id) {
+                const identity = {
+                    id: parsed.id,
+                    name: buildClientDisplayName(parsed.id, nativeInfo) || parsed.name || buildClientDisplayName(parsed.id),
+                };
+                persistClientIdentity(identity);
+                return identity;
+            }
+        }
+    } catch (error) {
+        console.warn('读取客户端标识失败，使用新标识', error);
+    }
+
+    const id = `client_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const identity = {
+        id,
+        name: buildClientDisplayName(id, nativeInfo),
+    };
+    persistClientIdentity(identity);
+    return identity;
+}
+
+function persistClientIdentity(identity) {
+    try {
+        localStorage.setItem(CLIENT_IDENTITY_KEY, JSON.stringify(identity));
+        syncNativeBackgroundClipboardConfig(identity);
+    } catch (error) {
+        console.warn('保存客户端标识失败', error);
+    }
+}
+
+function getNativeDeviceInfo() {
+    if (!window.NativeDevice || !window.NativeDevice.getDeviceInfo) {
+        return null;
+    }
+
+    try {
+        const raw = window.NativeDevice.getDeviceInfo();
+        if (!raw) {
+            return null;
+        }
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (error) {
+        console.warn('读取原生设备信息失败', error);
+        return null;
+    }
+}
+
+function buildClientDisplayName(clientId, nativeInfo = null) {
+    const preferredName = nativeInfo?.friendlyName || nativeInfo?.marketName;
+    if (preferredName) {
+        return preferredName;
+    }
+
+    const suffix = String(clientId || '').slice(-4).toUpperCase();
+    const label = supportsNativeFileReceive() ? 'Android 手机' : '移动浏览器';
+    return suffix ? `${label} ${suffix}` : label;
+}
+
+function supportsNativeFileReceive() {
+    return Boolean(window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function');
+}
+
+function invokeNative(command, payload = {}) {
+    if (!supportsNativeFileReceive()) {
+        return Promise.reject(new Error('当前环境不支持原生命令'));
+    }
+    return window.__TAURI__.core.invoke(command, payload);
+}
+
+function supportsNearbyDesktopDiscovery() {
+    return supportsNativeFileReceive();
 }
 
 // ============================================
@@ -233,6 +384,418 @@ function renderDeviceCards(devices) {
 }
 
 // ============================================
+// 自动发现桌面端 / 配对
+// ============================================
+
+function initNearbyDesktopDiscovery() {
+    $('scan-nearby-desktops-btn')?.addEventListener('click', () => {
+        void discoverNearbyDesktops();
+    });
+
+    $('desktop-pairing-close-btn')?.addEventListener('click', closeDesktopPairingModal);
+    $('desktop-pairing-cancel-btn')?.addEventListener('click', closeDesktopPairingModal);
+    $('desktop-pairing-modal')?.addEventListener('click', (event) => {
+        if (event.target === $('desktop-pairing-modal')) {
+            closeDesktopPairingModal();
+        }
+    });
+
+    renderNearbyDesktops();
+}
+
+async function discoverNearbyDesktops({ silent = false, syncKnownDevices = false } = {}) {
+    if (!supportsNearbyDesktopDiscovery()) {
+        nearbyDesktopState.scanError = '当前浏览器模式不支持自动扫描，请继续使用手动 IP / PIN。';
+        nearbyDesktopState.items = [];
+        nearbyDesktopState.scanning = false;
+        renderNearbyDesktops();
+        return [];
+    }
+
+    nearbyDesktopState.scanning = true;
+    nearbyDesktopState.scanError = '';
+    renderNearbyDesktops();
+
+    try {
+        const discovered = await invokeNative('discover_desktops');
+        nearbyDesktopState.items = Array.isArray(discovered) ? discovered.map((item) => ({
+            ...item,
+            ip: item.ip || '',
+            hostname: item.hostname || '未命名电脑',
+            port: Number(item.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+            server_id: item.server_id || '',
+        })) : [];
+
+        if (syncKnownDevices && nearbyDesktopState.items.length) {
+            syncKnownDevicesWithDiscovery(nearbyDesktopState.items);
+        }
+        renderNearbyDesktops();
+        return nearbyDesktopState.items;
+    } catch (error) {
+        console.error('扫描附近电脑失败:', error);
+        nearbyDesktopState.items = [];
+        nearbyDesktopState.scanError = error?.message || String(error);
+        renderNearbyDesktops();
+        if (!silent) {
+            showToast(`扫描失败：${nearbyDesktopState.scanError}`);
+        }
+        return [];
+    } finally {
+        nearbyDesktopState.scanning = false;
+        renderNearbyDesktops();
+    }
+}
+
+function renderNearbyDesktops() {
+    const list = $('nearby-desktops-list');
+    const empty = $('nearby-desktops-empty');
+    const caption = $('nearby-desktops-caption');
+    const scanBtn = $('scan-nearby-desktops-btn');
+    if (!list || !empty || !caption || !scanBtn) return;
+
+    scanBtn.textContent = nearbyDesktopState.scanning ? '扫描中…' : '扫描';
+    scanBtn.disabled = nearbyDesktopState.scanning;
+
+    if (!supportsNearbyDesktopDiscovery()) {
+        list.innerHTML = '';
+        empty.textContent = '当前浏览器模式不支持局域网自动发现，请使用手动输入的方式连接桌面端。';
+        empty.classList.remove('hidden');
+        caption.textContent = '安装后的手机 App 支持自动扫描附近电脑；浏览器模式仅保留手动连接。';
+        return;
+    }
+
+    caption.textContent = nearbyDesktopState.scanning
+        ? '正在扫描当前局域网中的 VibeDrop 桌面端…'
+        : '自动扫描当前局域网中的 VibeDrop 桌面端，发起配对后即可保存并自动连接。';
+
+    const devices = getDevices();
+    const visibleItems = buildVisibleNearbyDesktops(devices);
+
+    if (!visibleItems.length) {
+        list.innerHTML = '';
+        empty.textContent = nearbyDesktopState.scanError
+            ? `扫描失败：${nearbyDesktopState.scanError}`
+            : nearbyDesktopState.scanning
+                ? '正在搜索附近电脑…'
+                : '还没有发现附近的桌面端。确认电脑端已打开，且与手机在同一局域网后再试。';
+        empty.classList.remove('hidden');
+        return;
+    }
+
+    empty.classList.add('hidden');
+    list.innerHTML = visibleItems.map((desktop) => {
+        const matched = resolveNearbyDesktopMatch(desktop, devices);
+        const isConnected = matched && connections[matched.id]?.authenticated;
+        const badgeText = isConnected ? '已连接' : matched ? '已配对' : '附近电脑';
+        const primaryLabel = isConnected ? '已连接' : matched ? '连接' : '请求配对';
+        const primaryClass = matched ? 'secondary-btn' : 'primary-btn';
+        const secondaryLabel = desktop.source === 'saved' ? '查看参数' : '填入配置';
+        const disabledAttr = nearbyDesktopState.pairing ? 'disabled' : '';
+
+        return `
+            <div class="nearby-desktop-item">
+                <div class="nearby-desktop-top">
+                    <div>
+                        <div class="nearby-desktop-name">${escapeHtml(desktop.hostname)}</div>
+                        <div class="nearby-desktop-meta">${escapeHtml(desktop.ip)}:${escapeHtml(String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT))}</div>
+                    </div>
+                    <span class="nearby-desktop-badge${matched ? ' is-paired' : ''}">${escapeHtml(badgeText)}</span>
+                </div>
+                <div class="nearby-desktop-actions">
+                    <button type="button" class="${primaryClass}" data-desktop-action="${matched ? 'connect' : 'pair'}" data-nearby-key="${escapeHtml(getNearbyDesktopKey(desktop))}" ${disabledAttr}>${escapeHtml(primaryLabel)}</button>
+                    <button type="button" class="secondary-btn" data-desktop-action="${desktop.source === 'saved' ? 'advanced' : 'fill'}" data-nearby-key="${escapeHtml(getNearbyDesktopKey(desktop))}" ${disabledAttr}>${escapeHtml(secondaryLabel)}</button>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    list.querySelectorAll('[data-desktop-action]').forEach((button) => {
+        button.addEventListener('click', async () => {
+            const nearbyKey = button.dataset.nearbyKey;
+            const action = button.dataset.desktopAction;
+            const desktop = visibleItems.find((item) => getNearbyDesktopKey(item) === nearbyKey);
+            if (!desktop) return;
+            const matched = resolveNearbyDesktopMatch(desktop, devices);
+            if (action === 'advanced') {
+                $('advanced-connect-panel')?.setAttribute('open', 'open');
+                return;
+            }
+            if (action === 'fill') {
+                fillDesktopIntoSettings(desktop);
+                return;
+            }
+            if (action === 'connect') {
+                if (desktop.source === 'saved' && matched) {
+                    connectDevice(matched.id, matched.ip, matched.port || '9001', matched.pin || '');
+                    showToast(`正在连接 ${matched.name}`);
+                    return;
+                }
+                connectMatchedDesktop(desktop);
+                return;
+            }
+            await startDesktopPairing(desktop);
+        });
+    });
+}
+
+function getNearbyDesktopKey(desktop) {
+    if (desktop.server_id) return `server:${desktop.server_id}`;
+    if (desktop.deviceId) return `device:${desktop.deviceId}`;
+    return `ip:${desktop.ip || ''}:${String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT)}`;
+}
+
+function resolveNearbyDesktopMatch(desktop, devices = getDevices()) {
+    if (desktop.deviceId) {
+        return devices.find((device) => device.id === desktop.deviceId) || null;
+    }
+    return matchSavedDevice(desktop, devices);
+}
+
+function buildVisibleNearbyDesktops(devices = getDevices()) {
+    const discovered = nearbyDesktopState.items.map((desktop) => ({
+        ...desktop,
+        source: 'discovered',
+    }));
+    const seen = new Set(discovered.map((desktop) => getNearbyDesktopKey(desktop)));
+    const saved = devices
+        .filter((device) => device && (device.ip || device.serverId))
+        .map((device) => ({
+            server_id: device.serverId || '',
+            hostname: device.name || '未命名电脑',
+            ip: device.ip || '',
+            port: Number(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+            source: 'saved',
+            deviceId: device.id,
+        }))
+        .filter((desktop) => {
+            const key = getNearbyDesktopKey(desktop);
+            if (seen.has(key)) {
+                return false;
+            }
+            seen.add(key);
+            return true;
+        });
+
+    return [...discovered, ...saved];
+}
+
+function matchSavedDevice(desktop, devices = getDevices()) {
+    return devices.find((device) => (
+        (device.serverId && desktop.server_id && device.serverId === desktop.server_id)
+        || (!device.serverId && device.ip === desktop.ip && String(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT) === String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT))
+    )) || null;
+}
+
+function syncKnownDevicesWithDiscovery(discovered) {
+    const devices = getDevices();
+    if (!devices.length) return;
+
+    let changed = false;
+    discovered.forEach((desktop) => {
+        const matched = matchSavedDevice(desktop, devices);
+        if (!matched) return;
+        if (matched.ip !== desktop.ip || String(matched.port || DESKTOP_DISCOVERY_DEFAULT_PORT) !== String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT) || matched.name !== desktop.hostname) {
+            matched.ip = desktop.ip;
+            matched.port = String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT);
+            matched.name = desktop.hostname;
+            matched.serverId = desktop.server_id || matched.serverId || '';
+            changed = true;
+            if (connections[matched.id]) {
+                connectDevice(matched.id, matched.ip, matched.port, matched.pin || '');
+            }
+        }
+    });
+
+    if (!changed) return;
+
+    saveDevices(devices);
+    renderDeviceCards(devices);
+    renderSendCards(devices);
+    renderHistoryFilters(devices);
+}
+
+function fillDesktopIntoSettings(desktop) {
+    const devices = getDevicesFromUI();
+    const matched = matchSavedDevice(desktop, devices);
+    if (matched) {
+        matched.name = desktop.hostname;
+        matched.ip = desktop.ip;
+        matched.port = String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT);
+        matched.serverId = desktop.server_id || matched.serverId || '';
+    } else {
+        devices.unshift({
+            id: newDeviceId(),
+            name: desktop.hostname,
+            ip: desktop.ip,
+            port: String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+            pin: '',
+            serverId: desktop.server_id || '',
+        });
+    }
+    renderDeviceCards(devices);
+    showToast('已填入桌面端配置');
+}
+
+function connectMatchedDesktop(desktop) {
+    const devices = getDevices();
+    const matched = matchSavedDevice(desktop, devices);
+    if (!matched || !matched.pin) {
+        fillDesktopIntoSettings(desktop);
+        showToast('这个电脑还没完成配对，请先请求配对');
+        return;
+    }
+
+    matched.name = desktop.hostname;
+    matched.ip = desktop.ip;
+    matched.port = String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT);
+    matched.serverId = desktop.server_id || matched.serverId || '';
+    saveDevices(devices);
+    renderDeviceCards(devices);
+    renderSendCards(devices);
+    renderHistoryFilters(devices);
+    connectDevice(matched.id, matched.ip, matched.port, matched.pin || '');
+    showToast(`正在连接 ${matched.name}`);
+}
+
+async function startDesktopPairing(desktop) {
+    if (nearbyDesktopState.pairing) {
+        showToast('已有一个配对请求正在等待确认');
+        return;
+    }
+
+    try {
+        const response = await invokeNative('request_desktop_pairing', {
+            ip: desktop.ip,
+            port: Number(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+            clientId: clientIdentity.id,
+            clientName: clientIdentity.name,
+        });
+        nearbyDesktopState.pairing = {
+            requestId: response.request_id,
+            code: response.code,
+            hostname: response.hostname || desktop.hostname,
+            ip: desktop.ip,
+            port: Number(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+            serverId: desktop.server_id || '',
+            expiresAt: Date.now() + Number(response.expires_in_secs || 120) * 1000,
+        };
+        openDesktopPairingModal();
+        startDesktopPairingPoll();
+    } catch (error) {
+        console.error('发起桌面配对失败:', error);
+        showToast(`发起配对失败：${error?.message || error}`);
+    }
+}
+
+function openDesktopPairingModal() {
+    const pairing = nearbyDesktopState.pairing;
+    if (!pairing) return;
+    $('desktop-pairing-target').textContent = pairing.hostname || pairing.ip;
+    $('desktop-pairing-code').textContent = pairing.code || '------';
+    $('desktop-pairing-status').textContent = '配对请求已发出，请在电脑端确认同样的验证码并点击同意。';
+    $('desktop-pairing-subtitle').textContent = `目标电脑：${pairing.hostname || pairing.ip}。确认两边看到的是同一组 6 位验证码。`;
+    $('desktop-pairing-modal')?.classList.remove('hidden');
+}
+
+function closeDesktopPairingModal() {
+    stopDesktopPairingPoll();
+    nearbyDesktopState.pairing = null;
+    $('desktop-pairing-modal')?.classList.add('hidden');
+    renderNearbyDesktops();
+}
+
+function startDesktopPairingPoll() {
+    stopDesktopPairingPoll();
+    nearbyDesktopState.pollTimer = setInterval(() => {
+        void pollDesktopPairingStatus();
+    }, DESKTOP_PAIRING_POLL_MS);
+    void pollDesktopPairingStatus();
+}
+
+function stopDesktopPairingPoll() {
+    clearInterval(nearbyDesktopState.pollTimer);
+    nearbyDesktopState.pollTimer = null;
+}
+
+async function pollDesktopPairingStatus() {
+    const pairing = nearbyDesktopState.pairing;
+    if (!pairing) return;
+
+    if (Date.now() > pairing.expiresAt) {
+        showToast('配对请求已过期，请重新发起');
+        closeDesktopPairingModal();
+        return;
+    }
+
+    try {
+        const status = await invokeNative('poll_desktop_pairing', {
+            ip: pairing.ip,
+            port: pairing.port,
+            requestId: pairing.requestId,
+        });
+
+        if (status.status === 'pending') {
+            $('desktop-pairing-status').textContent = '配对请求已送达，正在等待电脑端确认。';
+            return;
+        }
+
+        if (status.status === 'approved') {
+            finalizePairedDesktop({
+                serverId: status.server_id || pairing.serverId,
+                hostname: status.hostname || pairing.hostname,
+                ip: status.ip || pairing.ip,
+                port: Number(status.port || pairing.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+                pin: status.pin || '',
+            });
+            showToast(`已配对 ${status.hostname || pairing.hostname}`);
+            closeDesktopPairingModal();
+            focusSendView();
+            return;
+        }
+
+        const errorMessage = status.error || (status.status === 'rejected' ? '桌面端拒绝了配对请求' : '配对请求已失效');
+        showToast(errorMessage);
+        closeDesktopPairingModal();
+    } catch (error) {
+        console.error('查询桌面配对状态失败:', error);
+        $('desktop-pairing-status').textContent = `状态查询失败，正在重试…`;
+    }
+}
+
+function finalizePairedDesktop(pairing) {
+    const devices = getDevices();
+    let matched = devices.find((device) => (
+        (pairing.serverId && device.serverId === pairing.serverId)
+        || (device.ip === pairing.ip && String(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT) === String(pairing.port || DESKTOP_DISCOVERY_DEFAULT_PORT))
+    ));
+
+    if (!matched) {
+        matched = {
+            id: newDeviceId(),
+            name: pairing.hostname,
+            ip: pairing.ip,
+            port: String(pairing.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+            pin: pairing.pin || '',
+            serverId: pairing.serverId || '',
+        };
+        devices.unshift(matched);
+    } else {
+        matched.name = pairing.hostname;
+        matched.ip = pairing.ip;
+        matched.port = String(pairing.port || DESKTOP_DISCOVERY_DEFAULT_PORT);
+        matched.pin = pairing.pin || matched.pin || '';
+        matched.serverId = pairing.serverId || matched.serverId || '';
+    }
+
+    saveDevices(devices);
+    renderDeviceCards(devices);
+    renderSendCards(devices);
+    renderHistoryFilters(devices);
+    connectDevice(matched.id, matched.ip, matched.port, matched.pin || '');
+    void discoverNearbyDesktops({ silent: true });
+}
+
+// ============================================
 // 动态渲染 — 发送页
 // ============================================
 
@@ -314,12 +877,6 @@ function renderSendCards(devices) {
                 await sendSelectedFile(dev.id, file);
             }
         });
-        input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                sendText(dev.id);
-            }
-        });
     });
 }
 
@@ -344,6 +901,7 @@ function renderHistoryFilters(devices) {
     container.querySelectorAll('.filter-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             currentHistoryFilters.device = btn.dataset.filter;
+            clearHistoryHeatmapSelection();
             renderDeviceFilterState();
             renderHistoryDateInputs();
             renderHistory();
@@ -380,6 +938,7 @@ function initSettingsButton() {
         }
         showView('settings-view');
         document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+        void discoverNearbyDesktops({ silent: true, syncKnownDevices: true });
     });
 
     // 返回按钮（不保存）
@@ -481,6 +1040,7 @@ function initHistoryFilterControls() {
                     return;
                 }
                 currentHistoryFilters.quickTime = value;
+                clearHistoryHeatmapSelection();
                 renderTimeFilterState();
                 renderHistory();
             });
@@ -490,6 +1050,7 @@ function initHistoryFilterControls() {
     $('history-filter-close-btn')?.addEventListener('click', closeHistoryFilterSheet);
     $('history-filter-reset-btn')?.addEventListener('click', () => {
         currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS, device: currentHistoryFilters.device };
+        clearHistoryHeatmapSelection();
         syncHistoryFilterForm();
         renderDeviceFilterState();
         renderTimeFilterState();
@@ -598,6 +1159,7 @@ function applyHistoryFilterForm() {
         status,
     };
 
+    clearHistoryHeatmapSelection();
     renderTimeFilterState();
     renderHistory();
     closeHistoryFilterSheet();
@@ -848,6 +1410,469 @@ function formatHistoryDateLabel(value) {
     return `${year}年${month}月${day}日`;
 }
 
+function dateKeyToUtcDate(value) {
+    const [year, month, day] = String(value).split('-').map(Number);
+    if (!year || !month || !day) {
+        return null;
+    }
+    return new Date(Date.UTC(year, month - 1, day));
+}
+
+function shiftDateKey(value, deltaDays) {
+    const date = dateKeyToUtcDate(value);
+    if (!date) {
+        return formatDateKey(new Date());
+    }
+    date.setUTCDate(date.getUTCDate() + deltaDays);
+    return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())}`;
+}
+
+function diffDateKeys(start, end) {
+    const startDate = dateKeyToUtcDate(start);
+    const endDate = dateKeyToUtcDate(end);
+    if (!startDate || !endDate) {
+        return 0;
+    }
+    return Math.round((endDate.getTime() - startDate.getTime()) / 86400000);
+}
+
+function clampDateKey(value, minValue, maxValue) {
+    if (minValue && value < minValue) {
+        return minValue;
+    }
+    if (maxValue && value > maxValue) {
+        return maxValue;
+    }
+    return value;
+}
+
+function formatShortDateLabel(value) {
+    if (!value) return '';
+    const [year, month, day] = String(value).split('-').map(Number);
+    if (!year || !month || !day) return value;
+    return `${month}/${day}`;
+}
+
+function formatHeatmapHourLabel(hour) {
+    return `${pad2(hour)}:00-${pad2(hour)}:59`;
+}
+
+function formatHeatmapSelectionLabel(dateKey, hour) {
+    if (!dateKey || hour == null) return '';
+    return `${formatHistoryDateLabel(dateKey)} ${formatHeatmapHourLabel(hour)}`;
+}
+
+function getHistoryHeatmapRangeToken() {
+    return [
+        currentHistoryFilters.quickTime,
+        currentHistoryFilters.startDate,
+        currentHistoryFilters.endDate,
+    ].join('|');
+}
+
+function getHistoryHeatmapBounds(baseEntries) {
+    const todayKey = formatDateKey(new Date());
+    const quick = currentHistoryFilters.quickTime;
+    const preferredEnd = quick === 'custom' && currentHistoryFilters.endDate
+        ? currentHistoryFilters.endDate
+        : todayKey;
+
+    let minDate = '';
+    let maxDate = preferredEnd;
+
+    if (quick === 'today') {
+        minDate = preferredEnd;
+    } else if (quick === '7d') {
+        minDate = shiftDateKey(preferredEnd, -(HEATMAP_VISIBLE_DAYS - 1));
+    } else if (quick === '30d') {
+        minDate = shiftDateKey(preferredEnd, -29);
+    } else if (quick === 'custom') {
+        minDate = currentHistoryFilters.startDate || '';
+    }
+
+    if (!minDate) {
+        if (baseEntries.length > 0) {
+            minDate = baseEntries.reduce((earliest, entry) => {
+                const entryDate = new Date(entry.timestamp);
+                if (Number.isNaN(entryDate.getTime())) {
+                    return earliest;
+                }
+                const dayKey = formatDateKey(entryDate);
+                return !earliest || dayKey < earliest ? dayKey : earliest;
+            }, '');
+        }
+    }
+
+    if (!minDate) {
+        minDate = shiftDateKey(preferredEnd, -(HEATMAP_VISIBLE_DAYS - 1));
+    }
+
+    if (minDate > maxDate) {
+        minDate = maxDate;
+    }
+
+    const spanDays = diffDateKeys(minDate, maxDate) + 1;
+    const minViewportEndDate = spanDays >= HEATMAP_VISIBLE_DAYS
+        ? shiftDateKey(minDate, HEATMAP_VISIBLE_DAYS - 1)
+        : maxDate;
+
+    return {
+        minDate,
+        maxDate,
+        preferredEnd,
+        minViewportEndDate,
+    };
+}
+
+function getHistoryHeatmapDragOffsetBounds(bounds) {
+    const currentEnd = historyHeatmapState.viewportEndDate || bounds.maxDate;
+    const minDeltaDays = diffDateKeys(currentEnd, bounds.minViewportEndDate);
+    const maxDeltaDays = diffDateKeys(currentEnd, bounds.maxDate);
+
+    return {
+        minOffsetX: -maxDeltaDays * HEATMAP_COLUMN_STEP,
+        maxOffsetX: -minDeltaDays * HEATMAP_COLUMN_STEP,
+    };
+}
+
+function clampHistoryHeatmapOffset(offsetX) {
+    return Math.max(
+        historyHeatmapState.dragMinOffsetX,
+        Math.min(historyHeatmapState.dragMaxOffsetX, offsetX)
+    );
+}
+
+function clearHistoryHeatmapSelection() {
+    historyHeatmapState.selectionDate = '';
+    historyHeatmapState.selectionHour = null;
+}
+
+function applyHistoryHeatmapSelection(entries) {
+    if (!historyHeatmapState.selectionDate || historyHeatmapState.selectionHour == null) {
+        return entries;
+    }
+
+    return entries.filter((entry) => {
+        const entryDate = new Date(entry.timestamp);
+        if (Number.isNaN(entryDate.getTime())) {
+            return false;
+        }
+        return formatDateKey(entryDate) === historyHeatmapState.selectionDate
+            && entryDate.getHours() === historyHeatmapState.selectionHour;
+    });
+}
+
+function buildHistoryHeatmapCountMap(entries) {
+    const counts = new Map();
+
+    entries.forEach((entry) => {
+        const entryDate = new Date(entry.timestamp);
+        if (Number.isNaN(entryDate.getTime())) {
+            return;
+        }
+        const dayKey = formatDateKey(entryDate);
+        const hour = entryDate.getHours();
+        const key = `${dayKey}|${hour}`;
+        counts.set(key, (counts.get(key) || 0) + 1);
+    });
+
+    return counts;
+}
+
+function getHistoryHeatmapCellCount(counts, dateKey, hour) {
+    return counts.get(`${dateKey}|${hour}`) || 0;
+}
+
+function getHistoryHeatmapCellColor(count, maxCount) {
+    if (count <= 0 || maxCount <= 0) {
+        return 'rgba(152, 162, 179, 0.12)';
+    }
+    const ratio = Math.pow(count / maxCount, 0.72);
+    const hue = 138 - (ratio * 6);
+    const saturation = 46 + (ratio * 28);
+    const lightness = 94 - (ratio * 68);
+    const alpha = 0.22 + (ratio * 0.76);
+    return `hsla(${hue}, ${saturation}%, ${lightness}%, ${alpha})`;
+}
+
+function buildHistoryHeatmapStats(entries, visibleStart, visibleEnd) {
+    const visibleEntries = entries.filter((entry) => {
+        const entryDate = new Date(entry.timestamp);
+        if (Number.isNaN(entryDate.getTime())) {
+            return false;
+        }
+        const dayKey = formatDateKey(entryDate);
+        return dayKey >= visibleStart && dayKey <= visibleEnd;
+    });
+
+    const total = visibleEntries.length;
+    const perHour = new Map();
+    const perDay = new Map();
+
+    visibleEntries.forEach((entry) => {
+        const entryDate = new Date(entry.timestamp);
+        const dayKey = formatDateKey(entryDate);
+        const hour = entryDate.getHours();
+
+        perHour.set(hour, (perHour.get(hour) || 0) + 1);
+        perDay.set(dayKey, (perDay.get(dayKey) || 0) + 1);
+    });
+
+    let peakHour = null;
+    let peakHourCount = 0;
+    perHour.forEach((count, hour) => {
+        if (count > peakHourCount) {
+            peakHour = hour;
+            peakHourCount = count;
+        }
+    });
+
+    let peakDay = '';
+    let peakDayCount = 0;
+    perDay.forEach((count, dayKey) => {
+        if (count > peakDayCount) {
+            peakDay = dayKey;
+            peakDayCount = count;
+        }
+    });
+
+    return [
+        {
+            label: '窗口',
+            value: `${formatShortDateLabel(visibleStart)} - ${formatShortDateLabel(visibleEnd)}`,
+        },
+        {
+            label: '发送',
+            value: `${total} 条`,
+        },
+        {
+            label: '高峰时段',
+            value: peakHour == null ? '暂无' : `${pad2(peakHour)}:00 · ${peakHourCount}`,
+        },
+        {
+            label: '最忙日期',
+            value: !peakDay ? '暂无' : `${formatShortDateLabel(peakDay)} · ${peakDayCount}`,
+        },
+    ];
+}
+
+function renderHistoryHeatmap(baseEntries) {
+    const track = $('history-heatmap-track');
+    const stats = $('history-heatmap-stats');
+    const caption = $('history-heatmap-caption');
+    const resetBtn = $('history-heatmap-reset-btn');
+    if (!track || !stats || !caption || !resetBtn) return;
+
+    const rangeToken = getHistoryHeatmapRangeToken();
+    const bounds = getHistoryHeatmapBounds(baseEntries);
+
+    if (!historyHeatmapState.viewportEndDate || historyHeatmapState.rangeToken !== rangeToken) {
+        historyHeatmapState.viewportEndDate = bounds.preferredEnd;
+        historyHeatmapState.rangeToken = rangeToken;
+    }
+
+    historyHeatmapState.viewportEndDate = clampDateKey(
+        historyHeatmapState.viewportEndDate,
+        bounds.minViewportEndDate,
+        bounds.maxDate
+    );
+
+    const visibleEnd = historyHeatmapState.viewportEndDate;
+    const visibleStart = shiftDateKey(visibleEnd, -(HEATMAP_VISIBLE_DAYS - 1));
+    const renderStart = shiftDateKey(visibleStart, -HEATMAP_RENDER_BUFFER_DAYS);
+    const renderEnd = shiftDateKey(visibleEnd, HEATMAP_RENDER_BUFFER_DAYS);
+    const counts = buildHistoryHeatmapCountMap(baseEntries);
+    const maxCount = Array.from(counts.values()).reduce((max, value) => Math.max(max, value), 0);
+    const todayKey = formatDateKey(new Date());
+    const days = [];
+
+    for (let dayKey = renderStart; dayKey <= renderEnd; dayKey = shiftDateKey(dayKey, 1)) {
+        days.push(dayKey);
+    }
+
+    track.innerHTML = days.map((dayKey) => {
+        const dayDate = dateKeyToUtcDate(dayKey);
+        const weekday = dayDate
+            ? dayDate.toLocaleDateString('zh-CN', { weekday: 'short', timeZone: 'UTC' }).replace('周', '周')
+            : '';
+        const isToday = dayKey === todayKey;
+        const headerLabel = isToday ? '今天' : weekday;
+
+        const hoursHtml = Array.from({ length: HEATMAP_HOUR_SLOTS }, (_, hour) => {
+            const count = getHistoryHeatmapCellCount(counts, dayKey, hour);
+            const isSelected = historyHeatmapState.selectionDate === dayKey
+                && historyHeatmapState.selectionHour === hour;
+            const classes = ['history-heatmap-cell'];
+            if (count > 0) classes.push('has-data');
+            if (isSelected) classes.push('selected');
+            const style = `background:${getHistoryHeatmapCellColor(count, maxCount)};`;
+            const label = `${formatHistoryDateLabel(dayKey)} ${formatHeatmapHourLabel(hour)}，${count} 条`;
+
+            return `
+                <button
+                    type="button"
+                    class="${classes.join(' ')}"
+                    style="${style}"
+                    data-date-key="${dayKey}"
+                    data-hour="${hour}"
+                    aria-label="${label}"
+                    title="${label}"
+                ></button>
+            `;
+        }).join('');
+
+        return `
+            <div class="history-heatmap-day ${isToday ? 'is-today' : ''}">
+                <div class="history-heatmap-day-header">
+                    <span class="history-heatmap-day-weekday">${escapeHtml(headerLabel)}</span>
+                    <span class="history-heatmap-day-date">${escapeHtml(formatShortDateLabel(dayKey))}</span>
+                </div>
+                <div class="history-heatmap-hours">
+                    ${hoursHtml}
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    const baseOffset = -(diffDateKeys(renderStart, visibleStart) * HEATMAP_COLUMN_STEP);
+    track.dataset.baseOffset = String(baseOffset);
+    track.style.transition = historyHeatmapState.dragPointerId == null
+        ? 'transform 220ms cubic-bezier(0.22, 1, 0.36, 1)'
+        : 'none';
+    track.style.transform = `translate3d(${baseOffset + historyHeatmapState.dragOffsetX}px, 0, 0)`;
+
+    stats.innerHTML = buildHistoryHeatmapStats(baseEntries, visibleStart, visibleEnd).map((item) => `
+        <div class="history-heatmap-stat">
+            <span class="history-heatmap-stat-label">${escapeHtml(item.label)}</span>
+            <span class="history-heatmap-stat-value">${escapeHtml(item.value)}</span>
+        </div>
+    `).join('');
+
+    caption.textContent = `当前窗口 ${formatHistoryDateLabel(visibleStart)} 至 ${formatHistoryDateLabel(visibleEnd)}。左右拖动查看更多日期，点方块筛选该小时。`;
+    resetBtn.classList.toggle('hidden', visibleEnd === bounds.maxDate);
+
+    track.querySelectorAll('.history-heatmap-cell').forEach((cell) => {
+        cell.addEventListener('click', () => {
+            if (Date.now() < historyHeatmapState.suppressCellClickUntil) {
+                return;
+            }
+
+            const dayKey = cell.dataset.dateKey || '';
+            const hour = Number(cell.dataset.hour);
+
+            if (historyHeatmapState.selectionDate === dayKey && historyHeatmapState.selectionHour === hour) {
+                clearHistoryHeatmapSelection();
+            } else {
+                historyHeatmapState.selectionDate = dayKey;
+                historyHeatmapState.selectionHour = hour;
+            }
+
+            renderHistory();
+        });
+    });
+}
+
+function initHistoryHeatmapInteractions() {
+    const viewport = $('history-heatmap-viewport');
+    const resetBtn = $('history-heatmap-reset-btn');
+    if (!viewport || viewport.dataset.ready === '1') {
+        return;
+    }
+
+    viewport.dataset.ready = '1';
+
+    viewport.addEventListener('pointerdown', (event) => {
+        const bounds = getHistoryHeatmapBounds(filterHistoryEntries(getHistory()));
+        const dragBounds = getHistoryHeatmapDragOffsetBounds(bounds);
+        historyHeatmapState.dragPointerId = event.pointerId;
+        historyHeatmapState.dragStartX = event.clientX;
+        historyHeatmapState.dragOffsetX = 0;
+        historyHeatmapState.dragLastX = event.clientX;
+        historyHeatmapState.dragLastTime = Date.now();
+        historyHeatmapState.dragVelocity = 0;
+        historyHeatmapState.dragMoved = false;
+        historyHeatmapState.dragMinOffsetX = dragBounds.minOffsetX;
+        historyHeatmapState.dragMaxOffsetX = dragBounds.maxOffsetX;
+        viewport.setPointerCapture?.(event.pointerId);
+    });
+
+    viewport.addEventListener('pointermove', (event) => {
+        if (event.pointerId !== historyHeatmapState.dragPointerId) {
+            return;
+        }
+
+        const rawOffsetX = event.clientX - historyHeatmapState.dragStartX;
+        const offsetX = clampHistoryHeatmapOffset(rawOffsetX);
+        const now = Date.now();
+        const deltaTime = Math.max(now - historyHeatmapState.dragLastTime, 1);
+
+        historyHeatmapState.dragVelocity = (event.clientX - historyHeatmapState.dragLastX) / deltaTime;
+        historyHeatmapState.dragLastX = event.clientX;
+        historyHeatmapState.dragLastTime = now;
+
+        if (!historyHeatmapState.dragMoved && Math.abs(offsetX) < HEATMAP_DRAG_THRESHOLD) {
+            return;
+        }
+
+        historyHeatmapState.dragMoved = true;
+        historyHeatmapState.dragOffsetX = offsetX;
+
+        const track = $('history-heatmap-track');
+        if (!track) return;
+
+        const baseOffset = Number(track.dataset.baseOffset || 0);
+        track.style.transition = 'none';
+        track.style.transform = `translate3d(${baseOffset + offsetX}px, 0, 0)`;
+    });
+
+    const finishDrag = (event) => {
+        if (event.pointerId !== historyHeatmapState.dragPointerId) {
+            return;
+        }
+
+        viewport.releasePointerCapture?.(event.pointerId);
+
+        const moved = historyHeatmapState.dragMoved;
+        const predictedOffset = clampHistoryHeatmapOffset(
+            historyHeatmapState.dragOffsetX + (historyHeatmapState.dragVelocity * HEATMAP_INERTIA_MS)
+        );
+
+        historyHeatmapState.dragPointerId = null;
+        historyHeatmapState.dragOffsetX = 0;
+        historyHeatmapState.dragVelocity = 0;
+        historyHeatmapState.dragLastX = 0;
+        historyHeatmapState.dragLastTime = 0;
+        historyHeatmapState.dragMoved = false;
+        historyHeatmapState.dragMinOffsetX = 0;
+        historyHeatmapState.dragMaxOffsetX = 0;
+
+        if (!moved) {
+            return;
+        }
+
+        const bounds = getHistoryHeatmapBounds(filterHistoryEntries(getHistory()));
+        const deltaDays = -Math.round(predictedOffset / HEATMAP_COLUMN_STEP);
+        historyHeatmapState.viewportEndDate = clampDateKey(
+            shiftDateKey(historyHeatmapState.viewportEndDate, deltaDays),
+            bounds.minViewportEndDate,
+            bounds.maxDate
+        );
+        clearHistoryHeatmapSelection();
+        historyHeatmapState.suppressCellClickUntil = Date.now() + 180;
+        renderHistory();
+    };
+
+    viewport.addEventListener('pointerup', finishDrag);
+    viewport.addEventListener('pointercancel', finishDrag);
+
+    resetBtn?.addEventListener('click', () => {
+        const bounds = getHistoryHeatmapBounds(filterHistoryEntries(getHistory()));
+        historyHeatmapState.viewportEndDate = bounds.maxDate;
+        clearHistoryHeatmapSelection();
+        renderHistory();
+    });
+}
+
 // ============================================
 // WebSocket 连接
 // ============================================
@@ -902,7 +1927,13 @@ function connectDevice(deviceId, ip, port, pin) {
 
     ws.onopen = () => {
         console.log(`[${deviceId}] WebSocket 已连接，发送 PIN 认证`);
-        ws.send(JSON.stringify({ action: 'auth', pin: pin }));
+        ws.send(JSON.stringify({
+            action: 'auth',
+            pin: pin,
+            device_id: clientIdentity.id,
+            device_name: clientIdentity.name,
+            can_receive_files: supportsNativeFileReceive(),
+        }));
         updateDeviceUI(deviceId, 'connecting', '认证中...');
     };
 
@@ -923,6 +1954,15 @@ function connectDevice(deviceId, ip, port, pin) {
                     showToast('剪贴板写入失败');
                 });
             }
+            return;
+        }
+
+        if (
+            data.action === 'incoming_file_start'
+            || data.action === 'incoming_file_chunk'
+            || data.action === 'incoming_file_complete'
+        ) {
+            queueIncomingDesktopTransfer(deviceId, data);
             return;
         }
 
@@ -990,6 +2030,154 @@ function clearTimers(conn) {
     conn.reconnectTimer = null;
 }
 
+function queueIncomingDesktopTransfer(deviceId, payload) {
+    const conn = ensureConnection(deviceId);
+    conn.incomingTransferQueue = (conn.incomingTransferQueue || Promise.resolve())
+        .then(() => handleIncomingDesktopTransfer(deviceId, payload))
+        .catch((error) => {
+            console.error('处理桌面文件传输失败:', error);
+        });
+}
+
+async function handleIncomingDesktopTransfer(deviceId, payload) {
+    const transferId = payload.transfer_id;
+    const conn = connections[deviceId];
+    if (!transferId || !conn || !conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
+        return;
+    }
+
+    try {
+        if (payload.action === 'incoming_file_start') {
+            await beginIncomingDesktopFile(payload);
+            const fileName = payload.file_name || '文件';
+            showToast(`正在接收：${fileName}`);
+            return;
+        }
+
+        if (payload.action === 'incoming_file_chunk') {
+            await appendIncomingDesktopFileChunk(payload);
+            return;
+        }
+
+        if (payload.action === 'incoming_file_complete') {
+            const savedPath = await finishIncomingDesktopFile(payload);
+            conn.ws.send(JSON.stringify({
+                action: 'incoming_file_saved',
+                transfer_id: transferId,
+                saved_path: savedPath,
+            }));
+            return;
+        }
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || '接收失败');
+        await cancelIncomingDesktopFile(transferId);
+        if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+            conn.ws.send(JSON.stringify({
+                action: 'incoming_file_error',
+                transfer_id: transferId,
+                error: message,
+            }));
+        }
+        showToast(`接收文件失败：${message}`);
+    }
+}
+
+async function beginIncomingDesktopFile(payload) {
+    const transferId = payload.transfer_id;
+    if (!transferId) {
+        throw new Error('缺少传输标识');
+    }
+
+    incomingDesktopTransfers[transferId] = {
+        fileName: payload.file_name || 'file.bin',
+        mimeType: payload.mime_type || 'application/octet-stream',
+        chunks: [],
+    };
+
+    if (window.__TAURI__) {
+        await window.__TAURI__.core.invoke('begin_incoming_file', {
+            transferId,
+            fileName: payload.file_name || 'file.bin',
+            mimeType: payload.mime_type || 'application/octet-stream',
+            sizeBytes: Number(payload.size_bytes || 0),
+        });
+    }
+}
+
+async function appendIncomingDesktopFileChunk(payload) {
+    const transferId = payload.transfer_id;
+    const transfer = incomingDesktopTransfers[transferId];
+    if (!transfer) {
+        throw new Error('接收状态不存在');
+    }
+
+    if (window.__TAURI__) {
+        await window.__TAURI__.core.invoke('append_incoming_file_chunk', {
+            transferId,
+            chunkBase64: payload.chunk_base64 || '',
+        });
+        return;
+    }
+
+    transfer.chunks.push(base64ToUint8Array(payload.chunk_base64 || ''));
+}
+
+async function finishIncomingDesktopFile(payload) {
+    const transferId = payload.transfer_id;
+    const transfer = incomingDesktopTransfers[transferId];
+    if (!transfer) {
+        throw new Error('接收状态不存在');
+    }
+
+    try {
+        if (window.__TAURI__) {
+            const savedPath = await window.__TAURI__.core.invoke('finish_incoming_file', {
+                transferId,
+            });
+            showToast(`已保存到下载：${transfer.fileName}`);
+            return savedPath;
+        }
+
+        const blob = new Blob(transfer.chunks, { type: transfer.mimeType || 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = transfer.fileName;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1200);
+        showToast(`已下载：${transfer.fileName}`);
+        return transfer.fileName;
+    } finally {
+        delete incomingDesktopTransfers[transferId];
+    }
+}
+
+async function cancelIncomingDesktopFile(transferId) {
+    if (!transferId) {
+        return;
+    }
+
+    delete incomingDesktopTransfers[transferId];
+    if (window.__TAURI__) {
+        try {
+            await window.__TAURI__.core.invoke('cancel_incoming_file', {
+                transferId,
+            });
+        } catch (error) {
+            console.warn('清理接收中的桌面文件失败', error);
+        }
+    }
+}
+
+function base64ToUint8Array(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+}
+
 // ---- UI 更新 ----
 
 function updateDeviceUI(deviceId, status, detail) {
@@ -1049,6 +2237,8 @@ function updateDeviceUI(deviceId, status, detail) {
             if (fileBtn) fileBtn.disabled = true;
             break;
     }
+
+    renderNearbyDesktops();
 }
 
 // ============================================
@@ -1976,6 +3166,7 @@ function updateHistory(entry) {
 function clearHistory() {
     localStorage.removeItem(HISTORY_KEY);
     persistHistory();
+    clearHistoryHeatmapSelection();
     renderHistory();
 }
 
@@ -2053,6 +3244,7 @@ function importHistory(file) {
 
             resultDiv.innerHTML = `已导入 ${added} 条，跳过 ${skipped} 条重复`;
             resultDiv.style.color = '#147d33';
+            renderHistory();
         } catch (err) {
             resultDiv.innerHTML = `解析失败：${err.message}`;
             resultDiv.style.color = '#c73b31';
@@ -2065,18 +3257,24 @@ function renderHistory() {
     const list = $('history-list');
     if (!list) return;
     const history = getHistory();
+    const baseEntries = filterHistoryEntries(history);
 
     if (history.length === 0) {
-        renderHistoryFilterSummary();
+        renderHistoryHeatmap([]);
+        renderHistoryFilterSummary([]);
         list.innerHTML = '<p class="empty-hint">暂无发送记录</p>';
         return;
     }
 
-    const filtered = filterHistoryEntries(history);
-    renderHistoryFilterSummary();
+    renderHistoryHeatmap(baseEntries);
+    renderHistoryFilterSummary(baseEntries);
+    const filtered = applyHistoryHeatmapSelection(baseEntries);
 
     if (filtered.length === 0) {
-        list.innerHTML = '<p class="empty-hint">没有符合筛选条件的记录</p>';
+        const emptyText = historyHeatmapState.selectionDate && historyHeatmapState.selectionHour != null
+            ? '这个时段没有符合条件的记录'
+            : '没有符合筛选条件的记录';
+        list.innerHTML = `<p class="empty-hint">${emptyText}</p>`;
         return;
     }
 
@@ -2280,7 +3478,7 @@ function matchesStatus(entry, filters = currentHistoryFilters) {
     return (entry.status || 'success') === filters.status;
 }
 
-function renderHistoryFilterSummary() {
+function renderHistoryFilterSummary(baseEntries = filterHistoryEntries(getHistory())) {
     const toolbar = $('history-toolbar');
     const summary = $('history-filter-summary');
     if (!summary) return;
@@ -2335,6 +3533,11 @@ function renderHistoryFilterSummary() {
         labels.push(statusLabels[currentHistoryFilters.status]);
     }
 
+    if (historyHeatmapState.selectionDate && historyHeatmapState.selectionHour != null) {
+        const selectedCount = applyHistoryHeatmapSelection(baseEntries).length;
+        labels.push(`${formatHeatmapSelectionLabel(historyHeatmapState.selectionDate, historyHeatmapState.selectionHour)} · ${selectedCount} 条`);
+    }
+
     if (labels.length === 0) {
         toolbar?.classList.add('hidden');
         summary.classList.add('hidden');
@@ -2352,6 +3555,7 @@ function renderHistoryFilterSummary() {
     `;
     $('history-filter-clear-btn')?.addEventListener('click', () => {
         currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS };
+        clearHistoryHeatmapSelection();
         renderDeviceFilterState();
         renderTimeFilterState();
         syncHistoryFilterForm();

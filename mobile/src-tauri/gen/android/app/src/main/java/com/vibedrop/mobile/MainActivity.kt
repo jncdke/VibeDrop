@@ -151,6 +151,8 @@ class MainActivity : TauriActivity() {
     appWebView = webView
     webView.addJavascriptInterface(ClipboardBridge(this), "NativeClipboard")
     webView.addJavascriptInterface(ShareBridge(), "NativeShare")
+    webView.addJavascriptInterface(DeviceBridge(), "NativeDevice")
+    webView.addJavascriptInterface(BackgroundClipboardBridge(this), "NativeBackgroundClipboard")
     Log.d(TAG, "JS Bridge NativeClipboard 已注入")
     emitPendingShareIfAvailable()
   }
@@ -259,6 +261,58 @@ class MainActivity : TauriActivity() {
     }
   }
 
+  inner class DeviceBridge {
+    @JavascriptInterface
+    fun getDeviceInfo(): String {
+      val marketName = readSystemProperty("ro.vendor.oplus.market.name")
+        ?: readSystemProperty("ro.product.marketname")
+        ?: readSystemProperty("ro.vendor.oplus.market.enname")
+      val manufacturer = Build.MANUFACTURER?.trim().orEmpty()
+      val model = Build.MODEL?.trim().orEmpty()
+      val friendlyName = when {
+        marketName?.isNotBlank() == true -> marketName
+        manufacturer.isNotBlank() && model.isNotBlank() -> "$manufacturer $model"
+        model.isNotBlank() -> model
+        manufacturer.isNotBlank() -> manufacturer
+        else -> "Android 手机"
+      }
+
+      return JSONObject().apply {
+        put("friendlyName", friendlyName)
+        put("manufacturer", manufacturer)
+        put("model", model)
+        put("marketName", marketName ?: "")
+        put("brand", Build.BRAND?.trim().orEmpty())
+        put("device", Build.DEVICE?.trim().orEmpty())
+      }.toString()
+    }
+  }
+
+  inner class BackgroundClipboardBridge(private val context: Context) {
+    @JavascriptInterface
+    fun syncConfig(configJson: String) {
+      try {
+        BackgroundClipboardConfigStore.save(context, configJson)
+        requestBackgroundClipboardRefresh(context)
+        Log.d(TAG, "后台剪贴板配置已同步")
+      } catch (e: Exception) {
+        Log.e(TAG, "同步后台剪贴板配置失败", e)
+      }
+    }
+  }
+
+  private fun readSystemProperty(key: String): String? {
+    return try {
+      val clazz = Class.forName("android.os.SystemProperties")
+      val method = clazz.getMethod("get", String::class.java)
+      val value = method.invoke(null, key) as? String
+      value?.takeIf { it.isNotBlank() }
+    } catch (e: Exception) {
+      Log.w(TAG, "读取系统属性失败: $key", e)
+      null
+    }
+  }
+
   private var hasCheckedPermissions = false
 
   private fun checkPermissionsOnce() {
@@ -334,6 +388,17 @@ class MainActivity : TauriActivity() {
       try {
         startActivity(Intent(Settings.ACTION_SETTINGS))
       } catch (_: Exception) {}
+    }
+  }
+
+  private fun requestBackgroundClipboardRefresh(context: Context) {
+    val serviceIntent = Intent(context, KeepAliveService::class.java).apply {
+      action = KeepAliveService.ACTION_REFRESH_BACKGROUND_CLIPBOARD
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      context.startForegroundService(serviceIntent)
+    } else {
+      context.startService(serviceIntent)
     }
   }
 

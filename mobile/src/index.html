@@ -28,18 +28,40 @@
                 <button id="settings-back-btn" class="icon-btn back-btn" title="返回">返回</button>
                 <div class="settings-title-group">
                     <h2>连接设置</h2>
-                    <p class="hint">添加你的 Mac 设备，填写局域网 IP、端口和 PIN。</p>
+                    <p class="hint">默认使用“附近电脑 + 验证码配对”。手动 IP、端口和 PIN 已收进高级连接里，平时不需要碰。</p>
                 </div>
             </div>
 
-            <!-- 动态设备卡片容器 -->
-            <div id="device-cards"></div>
+            <section class="settings-card nearby-desktops-card">
+                <div class="nearby-desktops-header">
+                    <div>
+                        <h3>附近电脑</h3>
+                        <p id="nearby-desktops-caption" class="hint">自动扫描当前局域网中的 VibeDrop 桌面端，发起配对后即可保存并自动连接。</p>
+                    </div>
+                    <button id="scan-nearby-desktops-btn" class="secondary-btn nearby-scan-btn">扫描</button>
+                </div>
+                <div id="nearby-desktops-list" class="nearby-desktops-list"></div>
+                <div id="nearby-desktops-empty" class="empty-hint nearby-desktops-empty">
+                    正在等待扫描结果。确保桌面端和手机在同一局域网，且桌面端已打开。
+                </div>
+            </section>
 
-            <button id="add-device-btn" class="secondary-btn stack-action">添加设备</button>
-
-            <button id="test-connection-btn" class="secondary-btn">测试连接</button>
-            <div id="test-result" class="test-result" style="display:none"></div>
-            <button id="save-settings-btn" class="primary-btn">保存并连接</button>
+            <details id="advanced-connect-panel" class="settings-card advanced-connect-panel">
+                <summary class="advanced-connect-summary">
+                    <div class="advanced-connect-copy">
+                        <h3>高级连接</h3>
+                        <p class="hint">只有在局域网自动发现失败、需要排障，或者想手动改连接参数时，才需要展开这里。</p>
+                    </div>
+                    <span class="advanced-connect-toggle">IP / 端口 / PIN</span>
+                </summary>
+                <div class="advanced-connect-body">
+                    <div id="device-cards"></div>
+                    <button id="add-device-btn" class="secondary-btn stack-action">添加设备</button>
+                    <button id="test-connection-btn" class="secondary-btn">测试连接</button>
+                    <div id="test-result" class="test-result" style="display:none"></div>
+                    <button id="save-settings-btn" class="primary-btn">保存并连接</button>
+                </div>
+            </details>
 
             <div class="settings-card data-card">
                 <h3>数据管理</h3>
@@ -85,6 +107,35 @@
                     <div id="history-filter-summary" class="history-filter-summary hidden"></div>
                 </div>
             </div>
+            <section id="history-heatmap-card" class="history-heatmap-card" aria-label="发送活跃热力图">
+                <div class="history-heatmap-header">
+                    <div>
+                        <h3>活跃热力图</h3>
+                        <p id="history-heatmap-caption" class="hint">每个方块代表某天某小时发送了多少条记录。左右拖动查看更多日期，点方块筛选该小时。</p>
+                    </div>
+                    <button id="history-heatmap-reset-btn" class="secondary-btn history-heatmap-reset hidden">回到最近</button>
+                </div>
+                <div id="history-heatmap-stats" class="history-heatmap-stats"></div>
+                <div class="history-heatmap-body">
+                    <div class="history-heatmap-axis" aria-hidden="true">
+                        <div class="history-heatmap-axis-grid">
+                            <span class="history-heatmap-axis-label is-top" style="--offset: 0%;">00:00</span>
+                            <span class="history-heatmap-axis-label" style="--offset: 25%;">06:00</span>
+                            <span class="history-heatmap-axis-label" style="--offset: 50%;">12:00</span>
+                            <span class="history-heatmap-axis-label" style="--offset: 75%;">18:00</span>
+                            <span class="history-heatmap-axis-label is-bottom" style="--offset: 100%;">24:00</span>
+                        </div>
+                    </div>
+                    <div id="history-heatmap-viewport" class="history-heatmap-viewport">
+                        <div id="history-heatmap-track" class="history-heatmap-track"></div>
+                    </div>
+                </div>
+                <div class="history-heatmap-legend" aria-hidden="true">
+                    <span>少</span>
+                    <div class="history-heatmap-legend-scale"></div>
+                    <span>多</span>
+                </div>
+            </section>
             <div id="history-list" class="history-list">
                 <p class="empty-hint">暂无发送记录</p>
             </div>
@@ -202,6 +253,27 @@
                 <div class="sheet-actions">
                     <button id="history-date-picker-clear-btn" class="secondary-btn">清除日期</button>
                     <button id="history-date-picker-done-btn" class="primary-btn">完成</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="desktop-pairing-modal" class="sheet-backdrop hidden" role="dialog" aria-modal="true">
+            <div class="sheet-card desktop-pairing-card">
+                <div class="sheet-handle"></div>
+                <div class="sheet-header">
+                    <div>
+                        <h3>等待电脑确认配对</h3>
+                        <p id="desktop-pairing-subtitle" class="hint">请在电脑端确认相同验证码后点击同意。</p>
+                    </div>
+                    <button id="desktop-pairing-close-btn" class="icon-btn share-clear-btn" title="关闭">关闭</button>
+                </div>
+                <div class="desktop-pairing-code-wrap">
+                    <div id="desktop-pairing-target" class="desktop-pairing-target">正在连接电脑…</div>
+                    <div id="desktop-pairing-code" class="desktop-pairing-code">------</div>
+                    <p id="desktop-pairing-status" class="desktop-pairing-status">配对请求已发出，正在等待桌面端确认。</p>
+                </div>
+                <div class="sheet-actions">
+                    <button id="desktop-pairing-cancel-btn" class="secondary-btn">先关闭</button>
                 </div>
             </div>
         </div>
