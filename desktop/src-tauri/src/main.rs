@@ -89,6 +89,10 @@ struct HistoryEntry {
     text: String,
     client_ip: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file_name: Option<String>,
@@ -740,11 +744,18 @@ const PAIR_REQUEST_TTL_SECS: i64 = 120;
 const DISCOVERY_PROTOCOL_VERSION: u16 = 1;
 
 impl HistoryEntry {
-    fn text_entry(text: &str, client_ip: &str) -> Self {
+    fn text_entry(
+        text: &str,
+        client_ip: &str,
+        client_id: Option<String>,
+        client_name: Option<String>,
+    ) -> Self {
         Self {
             timestamp: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
             text: text.to_string(),
             client_ip: client_ip.to_string(),
+            client_id,
+            client_name,
             kind: None,
             file_name: None,
             image_path: None,
@@ -1106,6 +1117,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     let mut authenticated = false;
     let session_id = state.session_counter.fetch_add(1, Ordering::Relaxed);
     let mut authenticated_client: Option<(String, u64)> = None;
+    let mut current_client_id = String::new();
+    let mut current_client_name = String::new();
     let mut current_receives_clipboard = false;
 
     // 拆分 WebSocket 为 sender/receiver，以便同时接收客户端消息和广播剪贴板
@@ -1174,6 +1187,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                                 },
                                             );
                                         }
+                                        current_client_id = client_id.clone();
+                                        current_client_name = client_name.clone();
                                         authenticated_client = Some((client_id, session_id));
                                         broadcast_connected_clients(&state);
 
@@ -1259,7 +1274,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                     } else {
                                         info!("收到文字: {}", text_content);
                                     }
-                                    let history_entry = HistoryEntry::text_entry(text_content, "ws-client");
+                                    let history_entry = HistoryEntry::text_entry(
+                                        text_content,
+                                        "ws-client",
+                                        if current_client_id.is_empty() {
+                                            None
+                                        } else {
+                                            Some(current_client_id.clone())
+                                        },
+                                        if current_client_name.is_empty() {
+                                            None
+                                        } else {
+                                            Some(current_client_name.clone())
+                                        },
+                                    );
                                     append_history_entry(&history_entry);
 
                                     let (reply_tx, reply_rx) = oneshot::channel();
@@ -1349,6 +1377,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                             ),
                                             text: format!("[图片] {}", saved_image.file_name),
                                             client_ip: "ws-client".to_string(),
+                                            client_id: if current_client_id.is_empty() {
+                                                None
+                                            } else {
+                                                Some(current_client_id.clone())
+                                            },
+                                            client_name: if current_client_name.is_empty() {
+                                                None
+                                            } else {
+                                                Some(current_client_name.clone())
+                                            },
                                             kind: Some("image".to_string()),
                                             file_name: Some(saved_image.file_name.clone()),
                                             image_path: Some(saved_image.image_path.clone()),
@@ -1434,6 +1472,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                             ),
                                             text: format!("[文件] {}", saved_file_name),
                                             client_ip: "ws-client".to_string(),
+                                            client_id: if current_client_id.is_empty() {
+                                                None
+                                            } else {
+                                                Some(current_client_id.clone())
+                                            },
+                                            client_name: if current_client_name.is_empty() {
+                                                None
+                                            } else {
+                                                Some(current_client_name.clone())
+                                            },
                                             kind: Some("file".to_string()),
                                             file_name: Some(saved_file_name),
                                             image_path: None,

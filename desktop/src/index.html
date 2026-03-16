@@ -143,13 +143,78 @@
                             <div id="drop-transfer-list" class="drop-transfer-list hidden"></div>
                         </section>
 
+                    </section>
+
+                    <section class="desktop-page hidden" id="desktop-page-history" data-page="history">
+                        <div class="history-panel-header">
+                            <div>
+                                <h2>接收历史</h2>
+                                <p class="history-panel-caption">桌面端收到的文字、图片和文件都会收进这里。热力图、快速时间筛选和精确筛选都集中放在历史页顶部。</p>
+                            </div>
+                            <button id="btn-export-log" class="btn-small" title="导出备份">导出</button>
+                        </div>
+
+                        <div class="desktop-history-filter-row" id="desktop-history-device-filter"></div>
+                        <div class="desktop-history-filter-row" id="desktop-history-time-filter">
+                            <button type="button" class="desktop-history-filter-btn" data-time-filter="all">全部时间</button>
+                            <button type="button" class="desktop-history-filter-btn" data-time-filter="today">今天</button>
+                            <button type="button" class="desktop-history-filter-btn" data-time-filter="7d">近7天</button>
+                            <button type="button" class="desktop-history-filter-btn" data-time-filter="30d">近30天</button>
+                            <button type="button" class="desktop-history-filter-btn" data-time-filter="custom">自定义</button>
+                        </div>
+
+                        <section id="desktop-history-advanced-panel" class="desktop-history-advanced-panel hidden" aria-label="精确筛选">
+                            <div class="desktop-history-advanced-grid">
+                                <label class="desktop-history-field">
+                                    <span>开始日期</span>
+                                    <input id="desktop-history-start-date" type="date">
+                                </label>
+                                <label class="desktop-history-field">
+                                    <span>结束日期</span>
+                                    <input id="desktop-history-end-date" type="date">
+                                </label>
+                                <label class="desktop-history-field">
+                                    <span>时间范围</span>
+                                    <select id="desktop-history-time-range">
+                                        <option value="all">全天</option>
+                                        <option value="morning">上午 06:00 - 11:59</option>
+                                        <option value="afternoon">下午 12:00 - 17:59</option>
+                                        <option value="evening">晚上 18:00 - 23:59</option>
+                                        <option value="night">凌晨 00:00 - 05:59</option>
+                                        <option value="custom">自定义时段</option>
+                                    </select>
+                                </label>
+                                <label class="desktop-history-field">
+                                    <span>开始时间</span>
+                                    <input id="desktop-history-start-time" type="time" disabled>
+                                </label>
+                                <label class="desktop-history-field">
+                                    <span>结束时间</span>
+                                    <input id="desktop-history-end-time" type="time" disabled>
+                                </label>
+                                <label class="desktop-history-field">
+                                    <span>记录类型</span>
+                                    <select id="desktop-history-kind-filter">
+                                        <option value="all">全部类型</option>
+                                        <option value="text">文字</option>
+                                        <option value="image">图片</option>
+                                        <option value="file">文件</option>
+                                    </select>
+                                </label>
+                            </div>
+                            <div class="desktop-history-advanced-actions">
+                                <button id="desktop-history-advanced-reset" class="btn-small" type="button">重置</button>
+                                <button id="desktop-history-advanced-apply" class="btn-small" type="button">应用筛选</button>
+                            </div>
+                        </section>
+
                         <section class="heatmap-card" aria-label="接收热力图">
                             <div class="heatmap-header">
                                 <div>
                                     <h3>接收热力图</h3>
-                                    <p id="log-heatmap-caption" class="heatmap-caption">最近 7 天每小时收到的记录数量。点击方块查看历史页筛选结果。</p>
+                                    <p id="log-heatmap-caption" class="heatmap-caption">当前窗口内每个方块代表某天某小时收到多少条记录。拖动查看更多日期，点方块筛选该小时。</p>
                                 </div>
-                                <button id="btn-clear-heatmap-filter" class="btn-small hidden" title="清除热力图筛选">清除筛选</button>
+                                <button id="btn-log-heatmap-reset" class="btn-small hidden" title="回到最近">回到最近</button>
                             </div>
                             <div id="log-heatmap-stats" class="heatmap-stats"></div>
                             <div class="heatmap-board">
@@ -162,19 +227,16 @@
                                         <span class="heatmap-axis-label is-bottom" style="--offset: 100%;">24:00</span>
                                     </div>
                                 </div>
-                                <div id="log-heatmap-grid" class="heatmap-grid"></div>
+                                <div id="log-heatmap-viewport" class="heatmap-viewport">
+                                    <div id="log-heatmap-track" class="heatmap-track"></div>
+                                </div>
+                            </div>
+                            <div class="heatmap-legend" aria-hidden="true">
+                                <span>少</span>
+                                <div class="heatmap-legend-scale"></div>
+                                <span>多</span>
                             </div>
                         </section>
-                    </section>
-
-                    <section class="desktop-page hidden" id="desktop-page-history" data-page="history">
-                        <div class="history-panel-header">
-                            <div>
-                                <h2>最近收到</h2>
-                                <p class="history-panel-caption">完整查看桌面端接收到的文字、图片和文件记录，导出也集中放在这里。</p>
-                            </div>
-                            <button id="btn-export-log" class="btn-small" title="导出备份">导出</button>
-                        </div>
 
                         <section id="history-filter-banner" class="history-filter-banner hidden">
                             <div class="history-filter-banner-copy">
