@@ -151,7 +151,9 @@ function getDevices() {
                 name: '设备 1',
                 ip: settings.mac1Ip,
                 port: settings.mac1Port || '9001',
-                pin: settings.mac1Pin || ''
+                pin: settings.mac1Pin || '',
+                serverId: '',
+                legacyIds: [],
             });
         }
         if (settings.mac2Ip) {
@@ -160,7 +162,9 @@ function getDevices() {
                 name: '设备 2',
                 ip: settings.mac2Ip,
                 port: settings.mac2Port || '9001',
-                pin: settings.mac2Pin || ''
+                pin: settings.mac2Pin || '',
+                serverId: '',
+                legacyIds: [],
             });
         }
         if (devices.length > 0) {
@@ -169,12 +173,104 @@ function getDevices() {
         return devices;
     }
 
-    return settings.devices;
+    const normalized = normalizeDevices(settings.devices);
+    if (JSON.stringify(normalized) !== JSON.stringify(settings.devices)) {
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify({ devices: normalized }));
+    }
+    return normalized;
 }
 
 function saveDevices(devices) {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ devices }));
+    const normalized = normalizeDevices(devices);
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ devices: normalized }));
     syncNativeBackgroundClipboardConfig();
+}
+
+function normalizeDeviceRecord(device) {
+    return {
+        id: String(device?.id || newDeviceId()),
+        name: String(device?.name || '未命名设备').trim() || '未命名设备',
+        ip: String(device?.ip || '').trim(),
+        port: String(device?.port || DESKTOP_DISCOVERY_DEFAULT_PORT).trim() || String(DESKTOP_DISCOVERY_DEFAULT_PORT),
+        pin: String(device?.pin || '').trim(),
+        serverId: String(device?.serverId || '').trim(),
+        legacyIds: Array.from(new Set((Array.isArray(device?.legacyIds) ? device.legacyIds : [])
+            .map((item) => String(item || '').trim())
+            .filter(Boolean))),
+    };
+}
+
+function getDeviceIdentityKey(device) {
+    if (device.serverId) {
+        return `server:${device.serverId}`;
+    }
+    if (device.ip) {
+        return `endpoint:${device.ip}:${String(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT)}`;
+    }
+    return `device:${device.id}`;
+}
+
+function mergeDeviceRecords(primary, secondary) {
+    const merged = { ...primary };
+    const primaryNameIsPlaceholder = /^设备\s+\d+$/.test(merged.name) || merged.name === '未命名设备';
+    const secondaryNameIsUsable = secondary.name && !/^设备\s+\d+$/.test(secondary.name) && secondary.name !== '未命名设备';
+
+    if ((!merged.name || primaryNameIsPlaceholder) && secondaryNameIsUsable) {
+        merged.name = secondary.name;
+    }
+    if (!merged.ip && secondary.ip) {
+        merged.ip = secondary.ip;
+    }
+    if ((!merged.port || merged.port === String(DESKTOP_DISCOVERY_DEFAULT_PORT)) && secondary.port) {
+        merged.port = secondary.port;
+    }
+    if (!merged.pin && secondary.pin) {
+        merged.pin = secondary.pin;
+    }
+    if (!merged.serverId && secondary.serverId) {
+        merged.serverId = secondary.serverId;
+    }
+
+    const legacyIds = new Set([
+        ...merged.legacyIds,
+        merged.id,
+        ...secondary.legacyIds,
+        secondary.id,
+    ].filter(Boolean));
+    legacyIds.delete(merged.id);
+    merged.legacyIds = Array.from(legacyIds);
+
+    return merged;
+}
+
+function normalizeDevices(devices = []) {
+    const merged = new Map();
+    const order = [];
+
+    devices
+        .map(normalizeDeviceRecord)
+        .forEach((device) => {
+            const key = getDeviceIdentityKey(device);
+            if (!merged.has(key)) {
+                merged.set(key, device);
+                order.push(key);
+                return;
+            }
+            merged.set(key, mergeDeviceRecords(merged.get(key), device));
+        });
+
+    return order.map((key) => merged.get(key));
+}
+
+function findDeviceByAnyId(deviceId, devices = getDevices()) {
+    if (!deviceId) {
+        return null;
+    }
+
+    return devices.find((device) => (
+        device.id === deviceId
+        || (Array.isArray(device.legacyIds) && device.legacyIds.includes(deviceId))
+    )) || null;
 }
 
 function newDeviceId() {
@@ -312,6 +408,8 @@ function saveSettingsFromUI() {
     cards.forEach(card => {
         devices.push({
             id: card.dataset.deviceId,
+            serverId: card.dataset.serverId || '',
+            legacyIds: parseDeviceLegacyIds(card.dataset.legacyIds),
             name: card.querySelector('.device-name-input').value.trim() || '未命名设备',
             ip: card.querySelector('.device-ip-input').value.trim(),
             port: card.querySelector('.device-port-input').value.trim() || '9001',
@@ -328,6 +426,8 @@ function getDevicesFromUI() {
     cards.forEach(card => {
         devices.push({
             id: card.dataset.deviceId,
+            serverId: card.dataset.serverId || '',
+            legacyIds: parseDeviceLegacyIds(card.dataset.legacyIds),
             name: card.querySelector('.device-name-input').value.trim() || '未命名设备',
             ip: card.querySelector('.device-ip-input').value.trim(),
             port: card.querySelector('.device-port-input').value.trim() || '9001',
@@ -349,6 +449,8 @@ function renderDeviceCards(devices) {
         const card = document.createElement('div');
         card.className = 'settings-card';
         card.dataset.deviceId = dev.id;
+        card.dataset.serverId = dev.serverId || '';
+        card.dataset.legacyIds = JSON.stringify(Array.isArray(dev.legacyIds) ? dev.legacyIds : []);
         card.innerHTML = `
             <div class="device-card-header">
                 <input type="text" class="device-name-input" value="${escapeHtml(dev.name)}" placeholder="设备名称">
@@ -381,6 +483,19 @@ function renderDeviceCards(devices) {
             }
         });
     });
+}
+
+function parseDeviceLegacyIds(rawValue) {
+    if (!rawValue) {
+        return [];
+    }
+    try {
+        const parsed = JSON.parse(rawValue);
+        return Array.isArray(parsed) ? parsed.map((item) => String(item || '').trim()).filter(Boolean) : [];
+    } catch (error) {
+        console.warn('解析 legacyIds 失败', error);
+        return [];
+    }
 }
 
 // ============================================
@@ -489,8 +604,9 @@ function renderNearbyDesktops() {
         const badgeText = isConnected ? '已连接' : matched ? '已配对' : '附近电脑';
         const primaryLabel = isConnected ? '已连接' : matched ? '连接' : '请求配对';
         const primaryClass = matched ? 'secondary-btn' : 'primary-btn';
-        const secondaryLabel = desktop.source === 'saved' ? '查看参数' : '填入配置';
+        const secondaryLabel = matched ? '查看参数' : '填入配置';
         const disabledAttr = nearbyDesktopState.pairing ? 'disabled' : '';
+        const nearbyKey = getNearbyDesktopKey(desktop, devices);
 
         return `
             <div class="nearby-desktop-item">
@@ -502,8 +618,8 @@ function renderNearbyDesktops() {
                     <span class="nearby-desktop-badge${matched ? ' is-paired' : ''}">${escapeHtml(badgeText)}</span>
                 </div>
                 <div class="nearby-desktop-actions">
-                    <button type="button" class="${primaryClass}" data-desktop-action="${matched ? 'connect' : 'pair'}" data-nearby-key="${escapeHtml(getNearbyDesktopKey(desktop))}" ${disabledAttr}>${escapeHtml(primaryLabel)}</button>
-                    <button type="button" class="secondary-btn" data-desktop-action="${desktop.source === 'saved' ? 'advanced' : 'fill'}" data-nearby-key="${escapeHtml(getNearbyDesktopKey(desktop))}" ${disabledAttr}>${escapeHtml(secondaryLabel)}</button>
+                    <button type="button" class="${primaryClass}" data-desktop-action="${matched ? 'connect' : 'pair'}" data-nearby-key="${escapeHtml(nearbyKey)}" ${disabledAttr}>${escapeHtml(primaryLabel)}</button>
+                    <button type="button" class="secondary-btn" data-desktop-action="${matched ? 'advanced' : 'fill'}" data-nearby-key="${escapeHtml(nearbyKey)}" ${disabledAttr}>${escapeHtml(secondaryLabel)}</button>
                 </div>
             </div>
         `;
@@ -513,7 +629,7 @@ function renderNearbyDesktops() {
         button.addEventListener('click', async () => {
             const nearbyKey = button.dataset.nearbyKey;
             const action = button.dataset.desktopAction;
-            const desktop = visibleItems.find((item) => getNearbyDesktopKey(item) === nearbyKey);
+            const desktop = visibleItems.find((item) => getNearbyDesktopKey(item, devices) === nearbyKey);
             if (!desktop) return;
             const matched = resolveNearbyDesktopMatch(desktop, devices);
             if (action === 'advanced') {
@@ -538,52 +654,100 @@ function renderNearbyDesktops() {
     });
 }
 
-function getNearbyDesktopKey(desktop) {
-    if (desktop.server_id) return `server:${desktop.server_id}`;
-    if (desktop.deviceId) return `device:${desktop.deviceId}`;
-    return `ip:${desktop.ip || ''}:${String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT)}`;
+function getDesktopIdentityKey(desktop, matchedDevice = null) {
+    const serverId = desktop.server_id || matchedDevice?.serverId || '';
+    if (serverId) {
+        return `server:${serverId}`;
+    }
+
+    const ip = desktop.ip || matchedDevice?.ip || '';
+    const port = String(desktop.port || matchedDevice?.port || DESKTOP_DISCOVERY_DEFAULT_PORT);
+    if (ip) {
+        return `endpoint:${ip}:${port}`;
+    }
+
+    const deviceId = desktop.deviceId || matchedDevice?.id || '';
+    if (deviceId) {
+        return `device:${deviceId}`;
+    }
+
+    return `host:${desktop.hostname || matchedDevice?.name || 'unknown'}`;
+}
+
+function getNearbyDesktopKey(desktop, devices = getDevices()) {
+    return getDesktopIdentityKey(desktop, resolveNearbyDesktopMatch(desktop, devices));
 }
 
 function resolveNearbyDesktopMatch(desktop, devices = getDevices()) {
     if (desktop.deviceId) {
-        return devices.find((device) => device.id === desktop.deviceId) || null;
+        return findDeviceByAnyId(desktop.deviceId, devices);
     }
     return matchSavedDevice(desktop, devices);
 }
 
 function buildVisibleNearbyDesktops(devices = getDevices()) {
-    const discovered = nearbyDesktopState.items.map((desktop) => ({
-        ...desktop,
-        source: 'discovered',
-    }));
-    const seen = new Set(discovered.map((desktop) => getNearbyDesktopKey(desktop)));
-    const saved = devices
+    const visible = [];
+    const seen = new Set();
+
+    nearbyDesktopState.items.forEach((desktop) => {
+        const matched = matchSavedDevice(desktop, devices);
+        const item = {
+            ...desktop,
+            source: 'discovered',
+            deviceId: matched?.id || desktop.deviceId || '',
+        };
+        const key = getDesktopIdentityKey(item, matched);
+        if (seen.has(key)) {
+            return;
+        }
+        seen.add(key);
+        visible.push(item);
+    });
+
+    devices
         .filter((device) => device && (device.ip || device.serverId))
-        .map((device) => ({
-            server_id: device.serverId || '',
-            hostname: device.name || '未命名电脑',
-            ip: device.ip || '',
-            port: Number(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
-            source: 'saved',
-            deviceId: device.id,
-        }))
-        .filter((desktop) => {
-            const key = getNearbyDesktopKey(desktop);
+        .forEach((device) => {
+            const item = {
+                server_id: device.serverId || '',
+                hostname: device.name || '未命名电脑',
+                ip: device.ip || '',
+                port: Number(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+                source: 'saved',
+                deviceId: device.id,
+            };
+            const key = getDesktopIdentityKey(item, device);
             if (seen.has(key)) {
-                return false;
+                return;
             }
             seen.add(key);
-            return true;
+            visible.push(item);
         });
 
-    return [...discovered, ...saved];
+    return visible;
 }
 
 function matchSavedDevice(desktop, devices = getDevices()) {
-    return devices.find((device) => (
-        (device.serverId && desktop.server_id && device.serverId === desktop.server_id)
-        || (!device.serverId && device.ip === desktop.ip && String(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT) === String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT))
-    )) || null;
+    return devices.find((device) => deviceMatchesDesktop(device, desktop)) || null;
+}
+
+function deviceMatchesDesktop(device, desktop) {
+    if (!device || !desktop) {
+        return false;
+    }
+
+    if (device.serverId && desktop.server_id && device.serverId === desktop.server_id) {
+        return true;
+    }
+
+    if (device.ip && desktop.ip && device.ip === desktop.ip && String(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT) === String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT)) {
+        return true;
+    }
+
+    if (!device.serverId && device.name && desktop.hostname && device.name === desktop.hostname) {
+        return true;
+    }
+
+    return false;
 }
 
 function syncKnownDevicesWithDiscovery(discovered) {
@@ -886,14 +1050,20 @@ function renderSendCards(devices) {
 
 function renderHistoryFilters(devices) {
     const container = $('history-filter-btns');
+    if (!container) return;
     container.innerHTML = '<button class="filter-btn" data-filter="all">全部</button>';
 
-    devices.forEach(dev => {
-        if (!dev.ip) return;
+    const options = getHistoryDeviceOptions(getHistory(), devices || getDevices());
+    const validFilters = new Set(['all', ...options.map((option) => option.value)]);
+    if (!validFilters.has(currentHistoryFilters.device)) {
+        currentHistoryFilters.device = 'all';
+    }
+
+    options.forEach((option) => {
         const btn = document.createElement('button');
         btn.className = 'filter-btn';
-        btn.dataset.filter = dev.id;
-        btn.textContent = dev.name;
+        btn.dataset.filter = option.value;
+        btn.textContent = option.label;
         container.appendChild(btn);
     });
 
@@ -910,6 +1080,34 @@ function renderHistoryFilters(devices) {
 
     renderDeviceFilterState();
     renderHistoryDateInputs();
+}
+
+function getHistoryDeviceOptions(history = getHistory(), devices = getDevices()) {
+    const options = new Map();
+
+    devices
+        .filter((device) => device && (device.ip || device.serverId))
+        .forEach((device) => {
+            options.set(device.id, {
+                value: device.id,
+                label: device.name || device.ip || '未命名电脑',
+            });
+        });
+
+    history.forEach((entry) => {
+        const hydrated = hydrateHistoryEntry(entry);
+        const value = hydrated.target;
+        if (!value || options.has(value)) {
+            return;
+        }
+
+        options.set(value, {
+            value,
+            label: getHistoryPrimaryTargetLabel(hydrated),
+        });
+    });
+
+    return Array.from(options.values());
 }
 
 // ============================================
@@ -1229,11 +1427,12 @@ function getHistoryDateAvailability() {
     let maxDate = '';
 
     history.forEach((entry) => {
-        if (filters.device !== 'all' && entry.target !== filters.device) {
+        const hydratedEntry = hydrateHistoryEntry(entry);
+        if (filters.device !== 'all' && hydratedEntry.target !== filters.device) {
             return;
         }
 
-        const entryDate = new Date(entry.timestamp);
+        const entryDate = new Date(hydratedEntry.timestamp);
         if (Number.isNaN(entryDate.getTime())) {
             return;
         }
@@ -2420,7 +2619,7 @@ function readFileAsDataUrl(file) {
 function getTargetName(deviceId) {
     const conn = connections[deviceId];
     const devices = getDevices();
-    const dev = devices.find(d => d.id === deviceId);
+    const dev = findDeviceByAnyId(deviceId, devices);
     return (dev ? dev.name : '') || conn?.hostname || deviceId;
 }
 
@@ -2430,6 +2629,7 @@ function getTargetDeviceName(deviceId) {
 }
 
 function buildHistoryTargetMeta(deviceId) {
+    const device = findDeviceByAnyId(deviceId);
     const targetAlias = getTargetName(deviceId);
     const targetDeviceName = getTargetDeviceName(deviceId);
     return {
@@ -2437,6 +2637,7 @@ function buildHistoryTargetMeta(deviceId) {
         targetName: targetAlias || targetDeviceName || deviceId,
         targetAlias,
         targetDeviceName,
+        targetServerId: device?.serverId || '',
     };
 }
 
@@ -2888,6 +3089,41 @@ function looksLikeTargetHost(value) {
         || value.includes(':');
 }
 
+function normalizeHistoryDeviceToken(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+function resolveHistoryDevice(targetId, targetAlias, targetDeviceName, targetServerId = '', devices = getDevices()) {
+    const directMatch = findDeviceByAnyId(targetId, devices);
+    if (directMatch) {
+        return directMatch;
+    }
+
+    if (targetServerId) {
+        const serverMatch = devices.find((device) => device.serverId && device.serverId === targetServerId);
+        if (serverMatch) {
+            return serverMatch;
+        }
+    }
+
+    const tokens = new Set([
+        normalizeHistoryDeviceToken(targetAlias),
+        normalizeHistoryDeviceToken(targetDeviceName),
+    ].filter(Boolean));
+    if (!tokens.size) {
+        return null;
+    }
+
+    return devices.find((device) => {
+        const candidates = new Set([
+            normalizeHistoryDeviceToken(device.name),
+            normalizeHistoryDeviceToken(device.ip),
+            normalizeHistoryDeviceToken(getTargetDeviceName(device.id)),
+        ].filter(Boolean));
+        return Array.from(tokens).some((token) => candidates.has(token));
+    }) || null;
+}
+
 function hydrateHistoryEntry(entry) {
     const storedTarget = typeof entry.target === 'string' ? entry.target : '';
     const storedTargetName = typeof entry.targetName === 'string' ? entry.targetName : '';
@@ -2895,16 +3131,24 @@ function hydrateHistoryEntry(entry) {
     const storedTargetHost = typeof entry.targetDeviceName === 'string'
         ? entry.targetDeviceName
         : (typeof entry.targetHost === 'string' ? entry.targetHost : '');
+    const storedTargetServerId = typeof entry.targetServerId === 'string' ? entry.targetServerId : '';
     const targetId = entry.targetId
         || entry.deviceId
         || (looksLikeInternalDeviceId(storedTarget) ? storedTarget : '');
 
     const devices = getDevices();
-    const device = targetId ? devices.find((item) => item.id === targetId) : null;
+    const device = resolveHistoryDevice(
+        targetId,
+        storedTargetAlias || (!looksLikeTargetHost(storedTargetName) ? storedTargetName : ''),
+        storedTargetHost || (looksLikeTargetHost(storedTargetName) ? storedTargetName : ''),
+        storedTargetServerId,
+        devices
+    );
+    const resolvedTargetId = device?.id || targetId;
 
     const targetAlias = [
-        storedTargetAlias,
         device?.name || '',
+        storedTargetAlias,
         !looksLikeInternalDeviceId(storedTarget) && !looksLikeTargetHost(storedTarget) ? storedTarget : '',
         !looksLikeInternalDeviceId(storedTargetName) && !looksLikeTargetHost(storedTargetName) ? storedTargetName : '',
     ].find(Boolean) || '';
@@ -2913,17 +3157,18 @@ function hydrateHistoryEntry(entry) {
         storedTargetHost,
         looksLikeTargetHost(storedTargetName) ? storedTargetName : '',
         looksLikeTargetHost(storedTarget) ? storedTarget : '',
-        targetId ? getTargetDeviceName(targetId) : '',
+        resolvedTargetId ? getTargetDeviceName(resolvedTargetId) : '',
     ].find(Boolean) || '';
 
-    const displayTarget = targetAlias || targetDeviceName || targetId || storedTarget || storedTargetName || '未知设备';
+    const displayTarget = targetAlias || targetDeviceName || resolvedTargetId || storedTarget || storedTargetName || '未知设备';
 
     return {
         ...entry,
-        target: targetId || storedTarget || displayTarget,
+        target: resolvedTargetId || storedTarget || displayTarget,
         targetName: displayTarget,
         targetAlias,
         targetDeviceName,
+        targetServerId: storedTargetServerId || device?.serverId || '',
     };
 }
 
@@ -2958,10 +3203,11 @@ function normalizeImportedHistoryEntry(entry) {
     const normalizedTimestamp = getLocalTimestamp(timestampSource);
     const targetAlias = entry.targetAlias || entry.targetName || entry.target || '';
     const targetDeviceName = entry.targetDeviceName || entry.targetHost || entry.hostname || '';
+    const targetServerId = entry.targetServerId || entry.serverId || '';
     const targetId = entry.targetId
         || entry.deviceId
         || (typeof entry.target === 'string' && /^dev[_-]/.test(entry.target) ? entry.target : '')
-        || resolveHistoryImportTargetId(targetAlias, targetDeviceName)
+        || resolveHistoryImportTargetId(targetAlias, targetDeviceName, targetServerId)
         || targetAlias
         || targetDeviceName
         || '';
@@ -2973,11 +3219,18 @@ function normalizeImportedHistoryEntry(entry) {
         targetName: targetAlias || targetDeviceName || targetId || '未知设备',
         targetAlias,
         targetDeviceName,
+        targetServerId,
     };
 }
 
-function resolveHistoryImportTargetId(targetAlias, targetDeviceName) {
+function resolveHistoryImportTargetId(targetAlias, targetDeviceName, targetServerId = '') {
     const devices = getDevices();
+    if (targetServerId) {
+        const serverMatch = devices.find((device) => device.serverId && device.serverId === targetServerId);
+        if (serverMatch) {
+            return serverMatch.id;
+        }
+    }
     const aliasMatch = devices.find((device) => device.name === targetAlias);
     if (aliasMatch) {
         return aliasMatch.id;
@@ -3359,11 +3612,12 @@ function formatTime(isoString) {
 
 function filterHistoryEntries(history, filters = currentHistoryFilters) {
     return history.filter((entry) => {
-        if (filters.device !== 'all' && entry.target !== filters.device) {
+        const hydratedEntry = hydrateHistoryEntry(entry);
+        if (filters.device !== 'all' && hydratedEntry.target !== filters.device) {
             return false;
         }
 
-        const entryDate = new Date(entry.timestamp);
+        const entryDate = new Date(hydratedEntry.timestamp);
         if (Number.isNaN(entryDate.getTime())) {
             return false;
         }
@@ -3380,11 +3634,11 @@ function filterHistoryEntries(history, filters = currentHistoryFilters) {
             return false;
         }
 
-        if (!matchesKind(entry, filters)) {
+        if (!matchesKind(hydratedEntry, filters)) {
             return false;
         }
 
-        if (!matchesStatus(entry, filters)) {
+        if (!matchesStatus(hydratedEntry, filters)) {
             return false;
         }
 
@@ -3567,8 +3821,8 @@ function getHistoryDeviceLabel(deviceId) {
     if (deviceId === 'all') {
         return '';
     }
-    const devices = getDevices();
-    return devices.find(device => device.id === deviceId)?.name || deviceId;
+    const options = getHistoryDeviceOptions();
+    return options.find((option) => option.value === deviceId)?.label || deviceId;
 }
 
 function getHistoryPrimaryTargetLabel(entry) {
