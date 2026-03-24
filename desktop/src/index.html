@@ -130,7 +130,7 @@
                             <div class="drop-send-header">
                                 <div>
                                     <h2>发送到手机</h2>
-                                    <p id="drop-send-caption" class="drop-send-caption">把 Finder 里的文件或文件夹拖进这个窗口，直接发到手机默认下载目录。</p>
+                                    <p id="drop-send-caption" class="drop-send-caption">把 Finder 里的文件或文件夹拖进这个窗口，图片/视频会进相册，其它内容进下载目录。</p>
                                 </div>
                             </div>
                             <div id="drop-client-row" class="drop-client-row"></div>
@@ -138,7 +138,7 @@
                             <div id="drop-zone" class="drop-zone">
                                 <div class="drop-zone-icon" aria-hidden="true">⇪</div>
                                 <div class="drop-zone-title">拖入文件或文件夹</div>
-                                <p class="drop-zone-desc">单文件原样发送；文件夹和多文件会自动打包成 ZIP，再落到手机下载目录。</p>
+                                <p class="drop-zone-desc">单个图片/视频直接进手机相册；其它单文件进下载，多文件和文件夹会按规则自动发送或打包。</p>
                             </div>
                             <div id="drop-transfer-list" class="drop-transfer-list hidden"></div>
                         </section>
@@ -148,8 +148,8 @@
                     <section class="desktop-page hidden" id="desktop-page-history" data-page="history">
                         <div class="history-panel-header">
                             <div>
-                                <h2>接收历史</h2>
-                                <p class="history-panel-caption">桌面端收到的文字、图片和文件都会收进这里。热力图、快速时间筛选和精确筛选都集中放在历史页顶部。</p>
+                                <h2>传输历史</h2>
+                                <p class="history-panel-caption">桌面端收到的内容，以及发送到手机的图片、视频和文件，都会收进这里。热力图、快速时间筛选和精确筛选都集中放在历史页顶部。</p>
                             </div>
                             <button id="btn-export-log" class="btn-small" title="导出备份">导出</button>
                         </div>
@@ -198,6 +198,8 @@
                                         <option value="all">全部类型</option>
                                         <option value="text">文字</option>
                                         <option value="image">图片</option>
+                                        <option value="video">视频</option>
+                                        <option value="media">媒体</option>
                                         <option value="file">文件</option>
                                     </select>
                                 </label>
@@ -212,7 +214,7 @@
                             <div class="heatmap-header">
                                 <div>
                                     <h3>接收热力图</h3>
-                                    <p id="log-heatmap-caption" class="heatmap-caption">当前窗口内每个方块代表某天某小时收到多少条记录。拖动查看更多日期，点方块筛选该小时。</p>
+                                    <p id="log-heatmap-caption" class="heatmap-caption">当前窗口内每个方块代表某天某小时的传输记录数量。拖动查看更多日期，点方块筛选该小时。</p>
                                 </div>
                                 <button id="btn-log-heatmap-reset" class="btn-small hidden" title="回到最近">回到最近</button>
                             </div>
@@ -260,7 +262,24 @@
     <div id="window-drop-overlay" class="window-drop-overlay hidden" aria-hidden="true">
         <div class="window-drop-overlay-card">
             <div class="window-drop-overlay-title">松手发送到手机</div>
-            <p id="window-drop-overlay-text" class="window-drop-overlay-text">单文件原样发送，文件夹会自动打包 ZIP。</p>
+            <p id="window-drop-overlay-text" class="window-drop-overlay-text">纯图片/视频会逐个保存到相册，其它内容会进下载或打包 ZIP。</p>
+        </div>
+    </div>
+
+    <div id="history-media-preview-modal" class="history-media-preview-modal hidden" aria-hidden="true">
+        <div id="history-media-preview-backdrop" class="history-media-preview-backdrop"></div>
+        <div class="history-media-preview-card" role="dialog" aria-modal="true" aria-labelledby="history-media-preview-title">
+            <div class="history-media-preview-header">
+                <div class="history-media-preview-copy">
+                    <h3 id="history-media-preview-title">媒体预览</h3>
+                    <p id="history-media-preview-subtitle" class="history-media-preview-subtitle">查看这次传输里的媒体内容。</p>
+                </div>
+                <button id="history-media-preview-close" type="button" class="btn-small">关闭</button>
+            </div>
+            <div id="history-media-preview-body" class="history-media-preview-body"></div>
+            <div class="history-media-preview-actions">
+                <button id="history-media-preview-open-all" type="button" class="btn-small hidden">打开全部原文件</button>
+            </div>
         </div>
     </div>
 

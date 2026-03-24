@@ -24,6 +24,8 @@ let textReceiveListenerBound = false;
 let desktopPairingInitialized = false;
 let desktopHistoryControlsInitialized = false;
 let desktopHistoryAdvancedPanelVisible = false;
+let historyMediaPreviewInitialized = false;
+let desktopLogCache = [];
 let lastNonCustomLogQuickTime = DEFAULT_LOG_HISTORY_FILTERS.quickTime;
 const desktopTransferItems = new Map();
 let currentDesktopTab = 'overview';
@@ -61,6 +63,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 });
 
+window.addEventListener('focus', () => {
+    if (document.getElementById('main-view')?.style.display === 'flex') {
+        void restoreLog();
+    }
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && document.getElementById('main-view')?.style.display === 'flex') {
+        void restoreLog();
+    }
+});
+
 async function checkPermission() {
     try {
         const hasPermission = await invoke('check_accessibility');
@@ -86,6 +100,7 @@ async function showMainView() {
     document.getElementById('main-view').style.display = 'flex';
     initDesktopTabs();
     initDesktopHistoryControls();
+    initHistoryMediaPreview();
 
     // 加载服务信息
     try {
@@ -148,10 +163,10 @@ function initDesktopTabs() {
     }
 
     document.querySelectorAll('.desktop-tab').forEach((tab) => {
-        tab.addEventListener('click', () => {
+        tab.addEventListener('click', async () => {
             const nextTab = tab.dataset.tab;
             if (nextTab) {
-                showDesktopTab(nextTab, { resetScroll: true });
+                await showDesktopTab(nextTab, { resetScroll: true });
             }
         });
     });
@@ -160,7 +175,7 @@ function initDesktopTabs() {
     renderDesktopTabState();
 }
 
-function showDesktopTab(tab, { resetScroll = false } = {}) {
+async function showDesktopTab(tab, { resetScroll = false } = {}) {
     currentDesktopTab = tab === 'history' ? 'history' : 'overview';
     renderDesktopTabState();
 
@@ -169,6 +184,10 @@ function showDesktopTab(tab, { resetScroll = false } = {}) {
         if (scroller) {
             scroller.scrollTop = 0;
         }
+    }
+
+    if (currentDesktopTab === 'history') {
+        await restoreLog();
     }
 }
 
@@ -201,10 +220,8 @@ async function initDesktopDropExperience() {
 
         eventApi.listen('tauri://drag-enter', (event) => {
             const paths = event.payload?.paths || [];
-            if (paths.length) {
-                toggleWindowDropOverlay(true, paths.length);
-                document.getElementById('drop-zone')?.classList.add('is-active');
-            }
+            toggleWindowDropOverlay(true, paths.length || 1);
+            document.getElementById('drop-zone')?.classList.add('is-active');
         });
 
         eventApi.listen('tauri://drag-leave', () => {
@@ -408,7 +425,7 @@ function renderConnectedDropClients() {
         void syncPreferredShareClient('');
         caption.textContent = connectedDropClients.length
             ? '已有设备连上这台 Mac，但当前没有支持接收文件的客户端。'
-            : '把 Finder 里的文件或文件夹拖进这个窗口，直接发到手机默认下载目录。';
+            : '把 Finder 里的文件或文件夹拖进这个窗口，图片/视频会进相册，其它内容进下载。';
         empty.textContent = connectedDropClients.length
             ? '已有设备在线，但它当前不支持接收文件。请使用最新版手机 App 连接这台 Mac。'
             : '当前没有已连接的手机 App，先在手机端连上这台 Mac。';
@@ -437,8 +454,8 @@ function renderConnectedDropClients() {
     }
     void syncPreferredShareClient(selectedDropClientId);
     caption.textContent = selected
-        ? `把 Finder 里的文件或文件夹拖进这个窗口，直接发到 ${selected.name} 的默认下载目录。`
-        : '把 Finder 里的文件或文件夹拖进这个窗口，直接发到手机默认下载目录。';
+        ? `把 Finder 里的文件或文件夹拖进这个窗口，图片/视频会进 ${selected.name} 的相册，其它内容进下载目录。`
+        : '把 Finder 里的文件或文件夹拖进这个窗口，图片/视频会进相册，其它内容进下载目录。';
 }
 
 async function syncPreferredShareClient(clientId) {
@@ -464,12 +481,12 @@ function toggleWindowDropOverlay(visible, itemCount = 0) {
     const selected = connectedDropClients.find((client) => client.id === selectedDropClientId);
     const targetText = selected ? `发送到 ${selected.name}` : '先选择一个已连接的手机';
     const itemText = itemCount > 1 ? `${itemCount} 个项目` : '当前项目';
-    text.textContent = `${itemText}将${targetText}。文件夹和多文件会自动打包成 ZIP。`;
+    text.textContent = `${itemText}将${targetText}。纯图片/视频会逐个发到相册，其它多文件/文件夹会打包 ZIP。`;
     overlay.classList.remove('hidden');
 }
 
 async function handleDroppedPaths(paths) {
-    if (!Array.isArray(paths) || !paths.length) {
+    if (!Array.isArray(paths)) {
         return;
     }
 
@@ -482,11 +499,6 @@ async function handleDroppedPaths(paths) {
         .map((path) => String(path || '').trim())
         .filter(Boolean);
 
-    if (!normalizedPaths.length) {
-        showToast('没有可发送的文件');
-        return;
-    }
-
     try {
         const launch = await invoke('send_dropped_paths', {
             clientId: selectedDropClientId,
@@ -497,7 +509,9 @@ async function handleDroppedPaths(paths) {
                 transfer_id: launch.transfer_id,
                 client_id: launch.client_id,
                 client_name: launch.client_name,
-                file_name: normalizedPaths.length > 1 ? `${normalizedPaths.length} 个项目` : pathBaseName(normalizedPaths[0]),
+                file_name: normalizedPaths.length > 1
+                    ? `${normalizedPaths.length} 个项目`
+                    : (normalizedPaths[0] ? pathBaseName(normalizedPaths[0]) : '拖拽内容'),
                 status: 'preparing',
                 progress: 0,
                 sent_bytes: 0,
@@ -595,27 +609,24 @@ function formatBytes(value) {
 const LOG_KEY = 'voicedrop_received_log';
 
 function getLog() {
-    const data = localStorage.getItem(LOG_KEY);
-    return data ? JSON.parse(data) : [];
+    return desktopLogCache;
 }
 
 function saveLog(log) {
-    localStorage.setItem(LOG_KEY, JSON.stringify(log));
+    desktopLogCache = Array.isArray(log) ? log : [];
+    localStorage.setItem(LOG_KEY, JSON.stringify(desktopLogCache));
 }
 
 async function restoreLog() {
-    let log = [];
-
     try {
-        log = await invoke('load_history_entries');
-        if (Array.isArray(log) && log.length > 0) {
+        const log = await invoke('load_history_entries');
+        if (Array.isArray(log)) {
             saveLog(log);
         } else {
-            log = getLog();
+            throw new Error('桌面端返回的历史格式无效');
         }
     } catch (e) {
         console.error('读取桌面历史失败:', e);
-        log = getLog();
     }
 
     renderLog();
@@ -630,6 +641,12 @@ function normalizeLogEntry(entryOrText, timestamp) {
             client_id: '',
             client_name: '',
             client_ip: '',
+            direction: '',
+            status: 'success',
+            session_id: '',
+            item_count: 0,
+            save_target: '',
+            items: [],
         };
     }
 
@@ -640,7 +657,35 @@ function normalizeLogEntry(entryOrText, timestamp) {
         client_id: entryOrText.client_id || entryOrText.clientId || '',
         client_name: entryOrText.client_name || entryOrText.clientName || '',
         client_ip: entryOrText.client_ip || entryOrText.clientIp || '',
+        direction: entryOrText.direction || '',
+        status: entryOrText.status || 'success',
+        session_id: entryOrText.session_id || entryOrText.sessionId || '',
+        item_count: entryOrText.item_count || entryOrText.itemCount || 0,
+        save_target: entryOrText.save_target || entryOrText.saveTarget || '',
+        items: Array.isArray(entryOrText.items)
+            ? entryOrText.items.map((item) => normalizeLogItem(item))
+            : [],
     };
+}
+
+function normalizeLogItem(item = {}) {
+    return {
+        kind: item.kind || normalizeLogKind(item.mime_type || item.mimeType || ''),
+        file_name: item.file_name || item.fileName || '文件',
+        mime_type: item.mime_type || item.mimeType || 'application/octet-stream',
+        thumbnail_data_url: item.thumbnail_data_url || item.thumbnailDataUrl || '',
+        file_path: item.file_path || item.filePath || '',
+        saved_path: item.saved_path || item.savedPath || '',
+        status: item.status || 'pending',
+        error: item.error || '',
+    };
+}
+
+function normalizeLogKind(mimeType = '') {
+    const normalized = String(mimeType || '').toLowerCase();
+    if (normalized.startsWith('image/')) return 'image';
+    if (normalized.startsWith('video/')) return 'video';
+    return 'file';
 }
 
 function addLogItem(entryOrText, timestamp) {
@@ -947,6 +992,8 @@ function renderHistoryFilterBanner(baseEntries, totalCount = 0) {
     const kindLabels = {
         text: '文字',
         image: '图片',
+        video: '视频',
+        media: '媒体',
         file: '文件',
     };
     if (currentLogHistoryFilters.kind !== 'all') {
@@ -1477,19 +1524,27 @@ function initDesktopLogHeatmapInteractions() {
 function createLogElement(entryOrText, timestamp) {
     const entry = normalizeLogEntry(entryOrText, timestamp);
     const timeLabel = formatLogTime(entry.timestamp);
-    const isImage = entry.kind === 'image';
+    const isMedia = ['image', 'video', 'media'].includes(entry.kind);
     const isFile = entry.kind === 'file';
-    const thumbnail = entry.thumbnail_data_url || entry.thumbnailDataUrl;
+    const mediaItems = getLogEntryItems(entry);
     const imagePath = entry.image_path || entry.imagePath;
     const filePath = entry.file_path || entry.filePath;
     const sourceName = getLogEntryDeviceName(entry);
     const sourceDetail = getLogEntryDeviceDetail(entry);
-    const kindLabel = isImage ? '图片' : isFile ? '文件' : '文字';
+    const kindLabel = entry.kind === 'image'
+        ? '图片'
+        : entry.kind === 'video'
+            ? '视频'
+            : entry.kind === 'media'
+                ? '媒体'
+                : isFile
+                    ? '文件'
+                    : '文字';
 
     const item = document.createElement('div');
     item.className = 'log-item';
-    item.title = isImage ? '点击打开原图' : isFile ? '点击打开文件' : '点击复制';
-    item.style.cursor = 'pointer';
+    item.title = getLogEntryTitle(entry);
+    item.style.cursor = isMedia && mediaItems.length > 1 ? 'default' : 'pointer';
 
     const headerHtml = `
         <div class="log-item-top">
@@ -1502,28 +1557,53 @@ function createLogElement(entryOrText, timestamp) {
         </div>
     `;
 
-    if (isImage && thumbnail) {
+    if (isMedia) {
         item.classList.add('log-item-image');
         item.innerHTML = `
             ${headerHtml}
-            <div class="log-image-row">
-                <img class="log-image-thumb" src="${thumbnail}" alt="${escapeHtml(entry.file_name || entry.text || '图片')}">
-                <div class="log-image-meta">
-                    <div class="log-text">${escapeHtml(entry.text || '图片')}</div>
-                    <div class="log-image-hint">点击打开原图</div>
-                </div>
-            </div>
+            ${renderLogMediaContent(entry, mediaItems)}
         `;
-        item.addEventListener('click', async () => {
-            if (!imagePath) {
-                showToast('原图文件不可用');
+        item.addEventListener('click', async (event) => {
+            const mediaCell = event.target.closest('[data-media-index]');
+            if (mediaCell) {
+                const itemIndex = Number(mediaCell.dataset.mediaIndex);
+                const selectedItem = mediaItems[itemIndex];
+                if (selectedItem) {
+                    const selectedPath = getLogMediaOpenPath(selectedItem);
+                    if (selectedPath) {
+                        try {
+                            await invoke('open_history_path', { path: selectedPath });
+                        } catch (error) {
+                            showToast(`打开失败：${error}`);
+                        }
+                        return;
+                    }
+                    showHistoryMediaPreview(entry, mediaItems, { initialIndex: itemIndex });
+                    return;
+                }
+            }
+
+            if (mediaItems.length > 1) {
+                showHistoryMediaPreview(entry, mediaItems);
                 return;
             }
-            try {
-                await invoke('open_history_path', { path: imagePath });
-            } catch (error) {
-                showToast(`打开失败：${error}`);
+
+            const openablePaths = mediaItems
+                .map((mediaItem) => getLogMediaOpenPath(mediaItem))
+                .filter(Boolean);
+            const openablePath = mediaItems.length === 1
+                ? (openablePaths[0] || imagePath || filePath || '')
+                : '';
+            if (openablePath) {
+                try {
+                    await invoke('open_history_path', { path: openablePath });
+                } catch (error) {
+                    showToast(`打开失败：${error}`);
+                }
+                return;
             }
+
+            showHistoryMediaPreview(entry, mediaItems);
         });
         return item;
     }
@@ -1536,7 +1616,7 @@ function createLogElement(entryOrText, timestamp) {
                 <div class="log-file-badge">文件</div>
                 <div class="log-image-meta">
                     <div class="log-text">${escapeHtml(entry.text || '文件')}</div>
-                    <div class="log-image-hint">点击打开下载的文件</div>
+                    <div class="log-image-hint">${escapeHtml(getLogEntryHint(entry))}</div>
                 </div>
             </div>
         `;
@@ -1563,6 +1643,272 @@ function createLogElement(entryOrText, timestamp) {
         showToast('已复制');
     });
     return item;
+}
+
+function getLogMediaOpenPath(item) {
+    return item?.file_path || '';
+}
+
+function getLogEntryItems(entry) {
+    const items = Array.isArray(entry.items) ? entry.items.map((item) => normalizeLogItem(item)) : [];
+    if (items.length) {
+        return items;
+    }
+
+    if (entry.kind === 'image' || entry.kind === 'video') {
+        return [normalizeLogItem({
+            kind: entry.kind,
+            file_name: entry.file_name || entry.fileName || entry.text || '媒体',
+            mime_type: entry.mime_type || entry.mimeType || '',
+            thumbnail_data_url: entry.thumbnail_data_url || entry.thumbnailDataUrl || '',
+            file_path: entry.file_path || entry.filePath || entry.image_path || entry.imagePath || '',
+        })];
+    }
+
+    return [];
+}
+
+function getLogEntryTitle(entry) {
+    if (['image', 'video', 'media'].includes(entry.kind)) {
+        const itemCount = Array.isArray(entry.items) ? entry.items.length : 0;
+        return itemCount > 1
+            ? '点缩略图打开单个原文件，点卡片空白查看全部'
+            : '点击打开原文件';
+    }
+    if (entry.kind === 'file') {
+        return '点击打开文件';
+    }
+    return '点击复制';
+}
+
+function getLogEntryHint(entry) {
+    if (entry.direction === 'desktop_to_mobile') {
+        return entry.save_target === 'gallery' ? '已保存到手机相册' : '已保存到手机下载';
+    }
+    if (entry.kind === 'image') {
+        return '点击打开原图';
+    }
+    if (entry.kind === 'video' || entry.kind === 'media') {
+        return '点击打开原始媒体';
+    }
+    if (entry.kind === 'file') {
+        return '点击打开文件';
+    }
+    return '';
+}
+
+function getLogEntryStatusLabel(entry) {
+    if (entry.direction === 'desktop_to_mobile') {
+        if (entry.status === 'success') return '已保存';
+        if (entry.status === 'partial') return '部分成功';
+        if (entry.status === 'failed') return '失败';
+        return '发送中';
+    }
+    if (entry.status === 'success') return '已送达';
+    if (entry.status === 'partial') return '部分成功';
+    if (entry.status === 'failed') return '失败';
+    return '处理中';
+}
+
+function renderLogMediaContent(entry, items) {
+    if (items.length > 1) {
+        const visibleItems = items.slice(0, 4);
+        const remaining = items.length - visibleItems.length;
+        const cells = visibleItems.map((item, index) => {
+            const overlay = item.kind === 'video'
+                ? '<span class="log-media-play">▶</span>'
+                : '';
+            const countBadge = remaining > 0 && index === visibleItems.length - 1
+                ? `<span class="log-media-count">+${remaining}</span>`
+                : '';
+            if (item.thumbnail_data_url) {
+                return `
+                    <div class="log-media-cell" data-media-index="${index}">
+                        <img class="log-media-thumb" src="${item.thumbnail_data_url}" alt="${escapeHtml(item.file_name)}">
+                        ${overlay}
+                        ${countBadge}
+                    </div>
+                `;
+            }
+            return `
+                <div class="log-media-cell log-media-cell-placeholder" data-media-index="${index}">
+                    <span class="log-media-placeholder">${item.kind === 'video' ? '视频' : item.kind === 'image' ? '图片' : '文件'}</span>
+                    ${countBadge}
+                </div>
+            `;
+        }).join('');
+
+        return `
+            <div class="log-media-stack">
+                <div class="log-media-grid">${cells}</div>
+                <div class="log-image-meta">
+                    <div class="log-text">${escapeHtml(entry.text || '媒体')}</div>
+                    <div class="log-image-hint">${escapeHtml(getLogEntryHint(entry))}</div>
+                </div>
+            </div>
+        `;
+    }
+
+    const firstItem = items[0];
+    const thumbContent = firstItem?.thumbnail_data_url
+        ? `
+            <div class="log-thumb-wrap">
+                <img class="log-image-thumb" src="${firstItem.thumbnail_data_url}" alt="${escapeHtml(firstItem.file_name || entry.text || '媒体')}">
+                ${firstItem.kind === 'video' ? '<span class="log-media-play log-media-play-single">▶</span>' : ''}
+            </div>
+        `
+        : `<div class="log-file-badge">${firstItem?.kind === 'video' ? '视频' : '图片'}</div>`;
+
+    return `
+        <div class="log-image-row">
+            ${thumbContent}
+            <div class="log-image-meta">
+                <div class="log-text">${escapeHtml(entry.text || '媒体')}</div>
+                <div class="log-image-hint">${escapeHtml(getLogEntryHint(entry))}</div>
+            </div>
+        </div>
+    `;
+}
+
+function initHistoryMediaPreview() {
+    if (historyMediaPreviewInitialized) {
+        return;
+    }
+
+    const modal = document.getElementById('history-media-preview-modal');
+    const backdrop = document.getElementById('history-media-preview-backdrop');
+    const closeBtn = document.getElementById('history-media-preview-close');
+
+    if (!modal || !backdrop || !closeBtn) {
+        return;
+    }
+
+    const close = () => closeHistoryMediaPreview();
+    backdrop.addEventListener('click', close);
+    closeBtn.addEventListener('click', close);
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            closeHistoryMediaPreview();
+        }
+    });
+
+    historyMediaPreviewInitialized = true;
+}
+
+function showHistoryMediaPreview(entry, items, { initialIndex = 0 } = {}) {
+    const modal = document.getElementById('history-media-preview-modal');
+    const title = document.getElementById('history-media-preview-title');
+    const subtitle = document.getElementById('history-media-preview-subtitle');
+    const body = document.getElementById('history-media-preview-body');
+    const openAllBtn = document.getElementById('history-media-preview-open-all');
+
+    if (!modal || !title || !subtitle || !body || !openAllBtn) {
+        return;
+    }
+
+    const normalizedItems = (Array.isArray(items) ? items : [])
+        .map((item) => normalizeLogItem(item));
+    if (!normalizedItems.length) {
+        showToast('没有可预览的媒体内容');
+        return;
+    }
+
+    const orderedItems = normalizedItems.slice();
+    if (initialIndex > 0 && initialIndex < orderedItems.length) {
+        const [selected] = orderedItems.splice(initialIndex, 1);
+        orderedItems.unshift(selected);
+    }
+
+    title.textContent = entry.text || '媒体预览';
+    subtitle.textContent = getLogEntryHint(entry) || '查看这次传输里的媒体内容。';
+    body.innerHTML = `
+        <div class="history-media-preview-grid">
+            ${orderedItems.map((item) => renderHistoryMediaPreviewItem(item)).join('')}
+        </div>
+    `;
+
+    openAllBtn.classList.add('hidden');
+    openAllBtn.onclick = null;
+
+    body.querySelectorAll('[data-preview-open-path]').forEach((node) => {
+        node.addEventListener('click', async () => {
+            const path = node.dataset.previewOpenPath || '';
+            if (!path) {
+                return;
+            }
+            try {
+                await invoke('open_history_path', { path });
+            } catch (error) {
+                showToast(`打开失败：${error}`);
+            }
+        });
+    });
+
+    modal.classList.remove('hidden');
+    modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeHistoryMediaPreview() {
+    const modal = document.getElementById('history-media-preview-modal');
+    const body = document.getElementById('history-media-preview-body');
+    const openAllBtn = document.getElementById('history-media-preview-open-all');
+    if (!modal || !body || !openAllBtn) {
+        return;
+    }
+    modal.classList.add('hidden');
+    modal.setAttribute('aria-hidden', 'true');
+    body.innerHTML = '';
+    openAllBtn.onclick = null;
+}
+
+function renderHistoryMediaPreviewItem(item) {
+    const displayName = truncateFilenamePreserveExtension(item.file_name || '媒体');
+    const thumb = item.thumbnail_data_url
+        ? `<img class="history-media-preview-thumb" src="${item.thumbnail_data_url}" alt="${escapeHtml(item.file_name || '媒体')}">`
+        : `<div class="history-media-preview-thumb-placeholder">${item.kind === 'video' ? '视频' : item.kind === 'image' ? '图片' : '文件'}</div>`;
+    const playBadge = item.kind === 'video'
+        ? '<span class="log-media-play log-media-play-single">▶</span>'
+        : '';
+    const openPath = getLogMediaOpenPath(item);
+    const openableClass = openPath ? ' is-openable' : '';
+    const dataAttr = openPath ? ` data-preview-open-path="${escapeHtml(openPath)}"` : '';
+
+    return `
+        <div class="history-media-preview-item${openableClass}"${dataAttr}>
+            <div class="history-media-preview-thumb-wrap">
+                ${thumb}
+                ${playBadge}
+            </div>
+            <div class="history-media-preview-meta">
+                <div class="history-media-preview-name" title="${escapeHtml(item.file_name || '媒体')}">${escapeHtml(displayName)}</div>
+            </div>
+        </div>
+    `;
+}
+
+function truncateFilenamePreserveExtension(filename, maxBaseLength = 18, maxTotalLength = 32) {
+    const value = String(filename || '媒体').trim() || '媒体';
+    if (value.length <= maxTotalLength) {
+        return value;
+    }
+
+    const lastDot = value.lastIndexOf('.');
+    if (lastDot <= 0 || lastDot === value.length - 1) {
+        return `${value.slice(0, Math.max(8, maxTotalLength - 1))}…`;
+    }
+
+    const ext = value.slice(lastDot);
+    if (ext.length > 12) {
+        return `${value.slice(0, Math.max(8, maxTotalLength - 1))}…`;
+    }
+
+    const base = value.slice(0, lastDot);
+    const allowedBaseLength = Math.max(8, Math.min(maxBaseLength, maxTotalLength - ext.length - 1));
+    if (base.length <= allowedBaseLength) {
+        return value;
+    }
+
+    return `${base.slice(0, allowedBaseLength)}…${ext}`;
 }
 
 function getLogEntryDeviceId(entry) {

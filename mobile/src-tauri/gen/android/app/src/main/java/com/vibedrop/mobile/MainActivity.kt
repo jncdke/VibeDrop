@@ -6,7 +6,9 @@ import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ResolveInfo
 import android.database.Cursor
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -16,6 +18,9 @@ import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebViewClient
 import android.webkit.WebView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
@@ -23,14 +28,31 @@ import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.webkit.WebViewAssetLoader
+import androidx.webkit.WebViewClientCompat
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
+import java.net.URLConnection
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class MainActivity : TauriActivity() {
 
   companion object {
     private const val TAG = "VibeDrop"
+    private const val PREVIEW_ASSET_PREFIX = "/vibedrop-preview/"
+    private const val PREVIEW_ASSET_HOST = "https://appassets.androidplatform.net"
   }
+
+  private data class PreviewMediaAsset(
+    val sourcePath: String,
+    val mimeType: String,
+    val displayName: String
+  )
 
   private data class PendingSharedContent(
     val cachePath: String,
@@ -52,6 +74,8 @@ class MainActivity : TauriActivity() {
   private var pendingExportFilename: String? = null
   private var pendingExportData: String? = null
   private var pendingSharedContent: PendingSharedContent? = null
+  private val previewMediaAssets = ConcurrentHashMap<String, PreviewMediaAsset>()
+  private var previewAssetLoaderInstalled = false
 
   private val exportDocumentLauncher = registerForActivityResult(
     ActivityResultContracts.CreateDocument("application/json")
@@ -149,12 +173,95 @@ class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     appWebView = webView
+    webView.settings.allowContentAccess = true
+    webView.settings.allowFileAccess = true
     webView.addJavascriptInterface(ClipboardBridge(this), "NativeClipboard")
     webView.addJavascriptInterface(ShareBridge(), "NativeShare")
     webView.addJavascriptInterface(DeviceBridge(), "NativeDevice")
     webView.addJavascriptInterface(BackgroundClipboardBridge(this), "NativeBackgroundClipboard")
+    webView.addJavascriptInterface(MediaLibraryBridge(this), "NativeMediaLibrary")
     Log.d(TAG, "JS Bridge NativeClipboard 已注入")
+    webView.post { installPreviewAssetLoaderIfNeeded(webView) }
     emitPendingShareIfAvailable()
+  }
+
+  private fun installPreviewAssetLoaderIfNeeded(webView: WebView) {
+    if (previewAssetLoaderInstalled) {
+      return
+    }
+
+    val previousClient = webView.webViewClient
+    val assetLoader = WebViewAssetLoader.Builder()
+      .addPathHandler(PREVIEW_ASSET_PREFIX, PreviewMediaPathHandler())
+      .build()
+
+    webView.webViewClient = object : WebViewClientCompat() {
+      override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+        assetLoader.shouldInterceptRequest(request.url)?.let { return it }
+        return previousClient?.shouldInterceptRequest(view, request)
+          ?: super.shouldInterceptRequest(view, request)
+      }
+
+      @Deprecated("Deprecated in Java")
+      override fun shouldInterceptRequest(view: WebView, url: String): WebResourceResponse? {
+        assetLoader.shouldInterceptRequest(Uri.parse(url))?.let { return it }
+        return previousClient?.shouldInterceptRequest(view, url)
+          ?: super.shouldInterceptRequest(view, url)
+      }
+
+      override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+        return previousClient?.shouldOverrideUrlLoading(view, request)
+          ?: super.shouldOverrideUrlLoading(view, request)
+      }
+
+      @Deprecated("Deprecated in Java")
+      override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean {
+        return previousClient?.shouldOverrideUrlLoading(view, url)
+          ?: super.shouldOverrideUrlLoading(view, url)
+      }
+
+      override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+        previousClient?.onPageStarted(view, url, favicon)
+        super.onPageStarted(view, url, favicon)
+      }
+
+      override fun onPageFinished(view: WebView, url: String?) {
+        previousClient?.onPageFinished(view, url)
+        super.onPageFinished(view, url)
+      }
+    }
+
+    previewAssetLoaderInstalled = true
+    Log.d(TAG, "媒体预览资源拦截已安装: ${previousClient?.javaClass?.name ?: "none"}")
+  }
+
+  private inner class PreviewMediaPathHandler : WebViewAssetLoader.PathHandler {
+    override fun handle(path: String): WebResourceResponse? {
+      val token = path.substringBefore('/').takeIf { it.isNotBlank() } ?: return null
+      val asset = previewMediaAssets[token] ?: return null
+      return try {
+        val inputStream = if (asset.sourcePath.startsWith("content://")) {
+          contentResolver.openInputStream(Uri.parse(asset.sourcePath))
+        } else {
+          val file = File(asset.sourcePath)
+          if (!file.exists()) {
+            null
+          } else {
+            FileInputStream(file)
+          }
+        } ?: return null
+
+        WebResourceResponse(asset.mimeType, null, inputStream).apply {
+          responseHeaders = mapOf(
+            "Cache-Control" to "no-store",
+            "Access-Control-Allow-Origin" to "*"
+          )
+        }
+      } catch (e: Exception) {
+        Log.e(TAG, "读取预览媒体失败: ${asset.displayName}", e)
+        null
+      }
+    }
   }
 
   /**
@@ -166,6 +273,279 @@ class MainActivity : TauriActivity() {
       Log.d(TAG, "JS 调用 NativeClipboard.writeText, 长度: ${text.length}")
       ClipboardFloatingActivity.launchWrite(context, text)
     }
+  }
+
+  inner class MediaLibraryBridge(private val context: Context) {
+    @JavascriptInterface
+    fun getPreviewUri(path: String, mimeType: String?): String {
+      if (path.isBlank()) {
+        return ""
+      }
+
+      return try {
+        if (!path.startsWith("content://")) {
+          val file = File(path)
+          if (!file.exists()) {
+            return ""
+          }
+        }
+
+        val resolvedMimeType = mimeType?.takeIf { it.isNotBlank() }
+          ?: resolveMimeTypeForPath(path)
+          ?: "*/*"
+        val displayName = deriveDisplayName(path)
+        val token = UUID.randomUUID().toString()
+        previewMediaAssets[token] = PreviewMediaAsset(
+          sourcePath = path,
+          mimeType = resolvedMimeType,
+          displayName = displayName
+        )
+        "$PREVIEW_ASSET_HOST$PREVIEW_ASSET_PREFIX$token/${sanitizePreviewName(displayName)}"
+      } catch (e: Exception) {
+        Log.e(TAG, "生成预览 URI 失败", e)
+        ""
+      }
+    }
+
+    @JavascriptInterface
+    fun scanPath(path: String, mimeType: String?) {
+      if (path.isBlank()) {
+        return
+      }
+
+      MediaScannerConnection.scanFile(
+        context,
+        arrayOf(path),
+        arrayOf(mimeType?.takeIf { it.isNotBlank() }),
+        null
+      )
+    }
+
+    @JavascriptInterface
+    fun openPath(path: String, mimeType: String?): String {
+      if (path.isBlank()) {
+        return "原文件路径为空"
+      }
+
+      val latch = CountDownLatch(1)
+      var errorMessage = ""
+      runOnUiThread {
+        try {
+          val uri = if (path.startsWith("content://")) {
+            Uri.parse(path)
+          } else {
+            val file = File(path)
+            if (!file.exists()) {
+              throw IllegalStateException("原文件不存在")
+            }
+            FileProvider.getUriForFile(
+              this@MainActivity,
+              "$packageName.fileprovider",
+              file
+            )
+          }
+
+          val resolvedMimeType = mimeType?.takeIf { it.isNotBlank() }
+            ?: contentResolver.getType(uri)
+            ?: "*/*"
+
+          val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, resolvedMimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          }
+
+          startActivity(Intent.createChooser(intent, "打开媒体"))
+        } catch (e: ActivityNotFoundException) {
+          Log.e(TAG, "没有可用的应用打开媒体", e)
+          errorMessage = "没有可用的应用可以打开这个媒体文件"
+        } catch (e: Exception) {
+          Log.e(TAG, "打开媒体文件失败", e)
+          errorMessage = e.message ?: "打开失败"
+        } finally {
+          latch.countDown()
+        }
+      }
+
+      if (!latch.await(5, TimeUnit.SECONDS)) {
+        return "打开媒体超时"
+      }
+      return errorMessage
+    }
+
+    @JavascriptInterface
+    fun listOpeners(path: String?, mimeType: String?): String {
+      return try {
+        val resolvedMimeType = mimeType?.takeIf { it.isNotBlank() } ?: "*/*"
+        val intent = buildMediaViewIntent(path, resolvedMimeType, null)
+        val apps = JSONArray()
+        val seenPackages = linkedSetOf<String>()
+        queryIntentActivitiesCompat(intent)
+          .sortedBy { resolveAppLabel(it).lowercase() }
+          .forEach { resolveInfo ->
+            val packageName = resolveInfo.activityInfo?.packageName ?: return@forEach
+            if (!seenPackages.add(packageName)) {
+              return@forEach
+            }
+            apps.put(JSONObject().apply {
+              put("packageName", packageName)
+              put("label", resolveAppLabel(resolveInfo))
+            })
+          }
+        apps.toString()
+      } catch (e: Exception) {
+        Log.e(TAG, "读取可用打开应用失败", e)
+        "[]"
+      }
+    }
+
+    @JavascriptInterface
+    fun openPathWithPackage(path: String, mimeType: String?, packageName: String?): String {
+      if (path.isBlank()) {
+        return JSONObject().apply {
+          put("ok", false)
+          put("code", "missing_path")
+          put("message", "原文件路径为空")
+        }.toString()
+      }
+
+      val normalizedPackage = packageName?.trim().orEmpty()
+      if (normalizedPackage.isBlank()) {
+        return JSONObject().apply {
+          put("ok", false)
+          put("code", "missing_package")
+          put("message", "未指定打开应用")
+        }.toString()
+      }
+
+      val latch = CountDownLatch(1)
+      var result = JSONObject().apply { put("ok", true) }
+
+      runOnUiThread {
+        try {
+          val intent = buildMediaViewIntent(path, mimeType, normalizedPackage)
+          startActivity(intent)
+        } catch (e: ActivityNotFoundException) {
+          Log.e(TAG, "指定应用无法打开媒体", e)
+          result = JSONObject().apply {
+            put("ok", false)
+            put("code", "package_unavailable")
+            put("message", "这个应用当前无法打开该媒体，可能已卸载或不再支持")
+          }
+        } catch (e: Exception) {
+          Log.e(TAG, "指定应用打开媒体失败", e)
+          result = JSONObject().apply {
+            put("ok", false)
+            put("code", "open_failed")
+            put("message", e.message ?: "打开失败")
+          }
+        } finally {
+          latch.countDown()
+        }
+      }
+
+      if (!latch.await(5, TimeUnit.SECONDS)) {
+        return JSONObject().apply {
+          put("ok", false)
+          put("code", "timeout")
+          put("message", "打开媒体超时")
+        }.toString()
+      }
+
+      return result.toString()
+    }
+  }
+
+  private fun buildMediaViewIntent(path: String?, mimeType: String?, packageName: String?): Intent {
+    val resolvedMimeType = mimeType?.takeIf { it.isNotBlank() } ?: "*/*"
+    return Intent(Intent.ACTION_VIEW).apply {
+      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+      if (!path.isNullOrBlank()) {
+        val uri = buildMediaOpenUri(path)
+        setDataAndType(uri, resolvedMimeType)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        clipData = ClipData.newUri(contentResolver, deriveDisplayName(path), uri)
+      } else {
+        type = resolvedMimeType
+      }
+
+      if (!packageName.isNullOrBlank()) {
+        setPackage(packageName)
+      }
+    }
+  }
+
+  private fun buildMediaOpenUri(path: String): Uri {
+    return if (path.startsWith("content://")) {
+      Uri.parse(path)
+    } else {
+      val file = File(path)
+      if (!file.exists()) {
+        throw IllegalStateException("原文件不存在")
+      }
+      FileProvider.getUriForFile(
+        this@MainActivity,
+        "$packageName.fileprovider",
+        file
+      )
+    }
+  }
+
+  @Suppress("DEPRECATION")
+  private fun queryIntentActivitiesCompat(intent: Intent): List<ResolveInfo> {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      packageManager.queryIntentActivities(
+        intent,
+        PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY.toLong())
+      )
+    } else {
+      packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+    }
+  }
+
+  private fun resolveAppLabel(resolveInfo: ResolveInfo): String {
+    return resolveInfo.loadLabel(packageManager)?.toString()?.trim().takeIf { !it.isNullOrBlank() }
+      ?: resolveInfo.activityInfo?.packageName
+      ?: "未知应用"
+  }
+
+  private fun resolveMimeTypeForPath(path: String): String? {
+    return try {
+      if (path.startsWith("content://")) {
+        contentResolver.getType(Uri.parse(path))
+      } else {
+        URLConnection.guessContentTypeFromName(path)
+      }
+    } catch (e: Exception) {
+      Log.w(TAG, "推断媒体 MIME 失败: $path", e)
+      null
+    }
+  }
+
+  private fun deriveDisplayName(path: String): String {
+    if (path.startsWith("content://")) {
+      return runCatching {
+        contentResolver.query(Uri.parse(path), arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+          if (cursor.moveToFirst()) {
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (index >= 0) {
+              cursor.getString(index)
+            } else {
+              null
+            }
+          } else {
+            null
+          }
+        }
+      }.getOrNull()?.takeIf { it.isNotBlank() } ?: "media"
+    }
+
+    return File(path).name.takeIf { it.isNotBlank() } ?: "media"
+  }
+
+  private fun sanitizePreviewName(name: String): String {
+    return name.replace(Regex("""[^A-Za-z0-9._-]"""), "_")
   }
 
   inner class ShareBridge {

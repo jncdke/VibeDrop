@@ -19,6 +19,7 @@ APP_BUNDLE_NAME="${APP_BUNDLE_NAME:-VibeDrop}"
 INSTALL_DIR="${INSTALL_DIR:-/Applications}"
 APP_IDENTIFIER="${APP_IDENTIFIER:-com.vibedrop.desktop}"
 LEGACY_APP_IDENTIFIER="${LEGACY_APP_IDENTIFIER:-com.voicedrop.desktop}"
+LEGACY_LAUNCH_AGENT_PATH="${LEGACY_LAUNCH_AGENT_PATH:-$HOME/Library/LaunchAgents/$LEGACY_APP_IDENTIFIER.plist}"
 KEYCHAIN_PATH="${KEYCHAIN_PATH:-$HOME/.vibedrop/signing/vibedrop-codesign.keychain-db}"
 KEYCHAIN_PASSWORD_FILE="${KEYCHAIN_PASSWORD_FILE:-$HOME/.vibedrop/signing/.keychain-password}"
 CERT_NAME_PATTERN="${CERT_NAME_PATTERN:-VibeTech Local Code Signing}"
@@ -264,6 +265,15 @@ stop_running_app() {
   fi
 }
 
+cleanup_legacy_launch_agent() {
+  [[ -f "$LEGACY_LAUNCH_AGENT_PATH" ]] || return 0
+
+  log "Removing legacy LaunchAgent $LEGACY_LAUNCH_AGENT_PATH to avoid duplicate autostart"
+  launchctl bootout "gui/$(id -u)" "$LEGACY_LAUNCH_AGENT_PATH" >/dev/null 2>&1 || true
+  launchctl remove "$LEGACY_APP_IDENTIFIER" >/dev/null 2>&1 || true
+  rm -f "$LEGACY_LAUNCH_AGENT_PATH"
+}
+
 open_app() {
   log "Launching $DEST_APP_PATH"
   open -n "$DEST_APP_PATH"
@@ -333,6 +343,7 @@ sign_app "$BUILT_APP_PATH" "$SIGNING_IDENTITY"
 verify_app "$BUILT_APP_PATH"
 
 stop_running_app
+cleanup_legacy_launch_agent
 install_app
 validate_app_identifier "$DEST_APP_PATH"
 embed_share_extension "$DEST_APP_PATH"

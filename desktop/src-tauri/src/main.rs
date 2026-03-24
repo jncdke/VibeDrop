@@ -2,9 +2,8 @@
 
 use axum::{
     extract::{
-        ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path as AxumPath, State as AxumState,
+        ConnectInfo, Path as AxumPath, State as AxumState,
     },
     http::StatusCode,
     response::IntoResponse,
@@ -36,6 +35,20 @@ use tower_http::services::ServeDir;
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 use zip::write::FileOptions;
+
+#[cfg(target_os = "macos")]
+enum MacosResolvedDrop {
+    None,
+    PromisedFiles {
+        expected: usize,
+        staged_dir: PathBuf,
+    },
+    PhotosSelection {
+        staged_dir: PathBuf,
+        hinted_names: Vec<String>,
+        hinted_content_types: Vec<String>,
+    },
+}
 
 // ---- 数据结构 ----
 
@@ -84,6 +97,21 @@ struct ServerMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct HistoryTransferItem {
+    kind: String,
+    file_name: String,
+    mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thumbnail_data_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saved_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct HistoryEntry {
     timestamp: String,
     text: String,
@@ -102,6 +130,18 @@ struct HistoryEntry {
     thumbnail_data_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    item_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    save_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    items: Option<Vec<HistoryTransferItem>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -165,6 +205,39 @@ struct DesktopTransferEvent {
     is_archive: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+}
+
+#[derive(Debug)]
+struct ResolvedDropPaths {
+    paths: Vec<PathBuf>,
+    cleanup_dir: Option<PathBuf>,
+}
+
+fn desktop_debug_log_path() -> PathBuf {
+    dirs_log_dir().join("debug.log")
+}
+
+fn append_debug_log(scope: &str, event: &str, detail: serde_json::Value) {
+    let log_path = desktop_debug_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let record = serde_json::json!({
+        "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
+        "scope": scope,
+        "event": event,
+        "detail": detail,
+    });
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(file, "{}", record);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn log_macos_drag_event(event: &str, detail: serde_json::Value) {
+    append_debug_log("macos-drag", event, detail);
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -253,6 +326,31 @@ struct PreparedDesktopTransfer {
     cleanup_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+struct OutboundHistorySession {
+    session_id: String,
+    timestamp: String,
+    kind: String,
+    text: String,
+    item_count: usize,
+    save_target: String,
+    items: Vec<HistoryTransferItem>,
+}
+
+#[derive(Debug, Clone)]
+struct OutboundTransferItemContext {
+    session_id: String,
+    item_index: usize,
+    item_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct OutboundTransferResult {
+    item_index: usize,
+    status: String,
+    saved_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairRequestStatus {
     Pending,
@@ -298,6 +396,33 @@ fn open_history_path(path: String) -> Result<(), String> {
 
     std::process::Command::new("open")
         .arg(&path)
+        .spawn()
+        .map_err(|e| format!("无法打开文件: {}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn open_history_paths(paths: Vec<String>) -> Result<(), String> {
+    let mut existing_paths = Vec::new();
+
+    for raw in paths {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(trimmed);
+        if path.exists() && !existing_paths.iter().any(|item: &PathBuf| item == &path) {
+            existing_paths.push(path);
+        }
+    }
+
+    if existing_paths.is_empty() {
+        return Err("没有可打开的原文件".to_string());
+    }
+
+    std::process::Command::new("open")
+        .args(&existing_paths)
         .spawn()
         .map_err(|e| format!("无法打开文件: {}", e))?;
 
@@ -352,20 +477,14 @@ async fn send_dropped_paths(
     ws_state: tauri::State<'_, Arc<WsState>>,
     app: AppHandle,
 ) -> Result<DesktopTransferLaunch, String> {
-    if paths.is_empty() {
-        return Err("没有可发送的文件".to_string());
-    }
-
-    let path_bufs: Vec<PathBuf> = paths
-        .into_iter()
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-        .collect();
-
-    if path_bufs.is_empty() {
-        return Err("拖入的路径不存在或不可访问".to_string());
-    }
-
+    append_debug_log(
+        "desktop-transfer",
+        "send_dropped_paths:start",
+        serde_json::json!({
+            "client_id": client_id,
+            "raw_paths": paths,
+        }),
+    );
     let client = {
         let clients = ws_state
             .clients
@@ -387,6 +506,7 @@ async fn send_dropped_paths(
         chrono::Local::now().format("%Y%m%d%H%M%S"),
         transfer_seq
     );
+    let resolved_drop = resolve_desktop_drop_paths(&app, &transfer_id, paths)?;
     let client_name = client.name.clone();
 
     let ws_state_clone = ws_state.inner().clone();
@@ -398,7 +518,7 @@ async fn send_dropped_paths(
             app_handle,
             client,
             transfer_id_for_task,
-            path_bufs,
+            resolved_drop,
         )
         .await;
     });
@@ -408,6 +528,558 @@ async fn send_dropped_paths(
         client_id: client_id.clone(),
         client_name,
     })
+}
+
+fn resolve_desktop_drop_paths(
+    app: &AppHandle,
+    transfer_id: &str,
+    raw_paths: Vec<String>,
+) -> Result<ResolvedDropPaths, String> {
+    let raw_paths_for_log = raw_paths.clone();
+    let fallback_paths: Vec<PathBuf> = raw_paths
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect();
+
+    #[cfg(target_os = "macos")]
+    if let Some(resolved) = resolve_macos_drag_promised_files(app, transfer_id)? {
+        if !resolved.paths.is_empty() {
+            log_macos_drag_event(
+                "resolve-drop:using-promised-files",
+                serde_json::json!({
+                    "transfer_id": transfer_id,
+                    "resolved_paths": resolved.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                    "cleanup_dir": resolved.cleanup_dir.as_ref().map(|path| path.display().to_string()),
+                }),
+            );
+            return Ok(resolved);
+        }
+    }
+
+    if fallback_paths.is_empty() {
+        append_debug_log(
+            "desktop-transfer",
+            "resolve-drop:no-usable-paths",
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "raw_paths": raw_paths_for_log,
+            }),
+        );
+        return Err("拖入的路径不存在或不可访问".to_string());
+    }
+
+    append_debug_log(
+        "desktop-transfer",
+        "resolve-drop:using-fallback-paths",
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "paths": fallback_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        }),
+    );
+
+    Ok(ResolvedDropPaths {
+        paths: fallback_paths,
+        cleanup_dir: None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_drag_promised_files(
+    app: &AppHandle,
+    transfer_id: &str,
+) -> Result<Option<ResolvedDropPaths>, String> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(None);
+    };
+
+    let transfer_id = transfer_id.to_string();
+    let transfer_id_for_webview = transfer_id.clone();
+    let (control_tx, control_rx) = std::sync::mpsc::sync_channel(1);
+    let (file_tx, file_rx) = std::sync::mpsc::channel::<Result<PathBuf, String>>();
+    window
+        .with_webview(move |_| {
+            let result = unsafe {
+                resolve_macos_drag_promised_files_inner(&transfer_id_for_webview, file_tx.clone())
+            };
+            let _ = control_tx.send(result);
+        })
+        .map_err(|error| format!("无法访问 macOS 拖拽内容: {}", error))?;
+
+    let resolution = control_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .map_err(|_| "读取 macOS 拖拽内容超时，请重新拖一次".to_string())??;
+
+    match resolution {
+        MacosResolvedDrop::None => {
+            log_macos_drag_event(
+                "resolve-promised:none",
+                serde_json::json!({
+                    "transfer_id": transfer_id,
+                }),
+            );
+            Ok(None)
+        }
+        MacosResolvedDrop::PromisedFiles {
+            expected,
+            staged_dir,
+        } => {
+            log_macos_drag_event(
+                "resolve-promised:scheduled",
+                serde_json::json!({
+                    "transfer_id": transfer_id,
+                    "expected_items": expected,
+                    "staged_dir": staged_dir.display().to_string(),
+                }),
+            );
+
+            let mut staged_paths = Vec::with_capacity(expected);
+            for _ in 0..expected {
+                match file_rx.recv_timeout(std::time::Duration::from_secs(20)) {
+                    Ok(Ok(path)) => {
+                        log_macos_drag_event(
+                            "resolve-promised:file-ready",
+                            serde_json::json!({
+                                "transfer_id": transfer_id,
+                                "path": path.display().to_string(),
+                            }),
+                        );
+                        staged_paths.push(path);
+                    }
+                    Ok(Err(error)) => {
+                        let _ = fs::remove_dir_all(&staged_dir);
+                        log_macos_drag_event(
+                            "resolve-promised:error",
+                            serde_json::json!({
+                                "transfer_id": transfer_id,
+                                "error": error,
+                            }),
+                        );
+                        return Err(format!("无法读取 Photos 拖拽内容: {}", error));
+                    }
+                    Err(_) => {
+                        let _ = fs::remove_dir_all(&staged_dir);
+                        log_macos_drag_event(
+                            "resolve-promised:timeout",
+                            serde_json::json!({
+                                "transfer_id": transfer_id,
+                                "staged_dir": staged_dir.display().to_string(),
+                            }),
+                        );
+                        return Err("等待 Photos 拖拽内容超时，请重新拖一次".to_string());
+                    }
+                }
+            }
+
+            staged_paths.retain(|path| path.exists());
+            if staged_paths.is_empty() {
+                let _ = fs::remove_dir_all(&staged_dir);
+                log_macos_drag_event(
+                    "resolve-promised:empty",
+                    serde_json::json!({
+                        "transfer_id": transfer_id,
+                        "staged_dir": staged_dir.display().to_string(),
+                    }),
+                );
+                return Err("Photos 拖拽没有生成可发送文件".to_string());
+            }
+
+            info!(
+                "resolved {} macOS promised drop item(s) into {}",
+                staged_paths.len(),
+                staged_dir.display()
+            );
+
+            Ok(Some(ResolvedDropPaths {
+                paths: staged_paths,
+                cleanup_dir: Some(staged_dir),
+            }))
+        }
+        MacosResolvedDrop::PhotosSelection {
+            staged_dir,
+            hinted_names,
+            hinted_content_types,
+        } => {
+            let staged_paths =
+                export_photos_selection_to_stage_dir(&transfer_id, &staged_dir, &hinted_names, &hinted_content_types)?;
+            Ok(Some(ResolvedDropPaths {
+                paths: staged_paths,
+                cleanup_dir: Some(staged_dir),
+            }))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn resolve_macos_drag_promised_files_inner(
+    transfer_id: &str,
+    file_tx: std::sync::mpsc::Sender<Result<PathBuf, String>>,
+) -> Result<MacosResolvedDrop, String> {
+    use block2::RcBlock;
+    use objc2::ClassType;
+    use objc2_app_kit::{
+        NSFilePromiseReceiver, NSPasteboard, NSPasteboardItem, NSPasteboardNameDrag,
+    };
+    use objc2_foundation::{NSArray, NSDictionary, NSError, NSOperationQueue, NSString, NSURL};
+    use std::sync::mpsc::Sender;
+
+    unsafe fn collect_item_strings(
+        item: &NSPasteboardItem,
+        type_name: &str,
+    ) -> Option<String> {
+        let data_type = NSString::from_str(type_name);
+        item.stringForType(&data_type).map(|value| value.to_string())
+    }
+
+    unsafe fn collect_photos_drag_hints(
+        pasteboard: &NSPasteboard,
+    ) -> (bool, Vec<String>, Vec<String>, serde_json::Value) {
+        let types = pasteboard
+            .types()
+            .map(|types| types.iter().map(|item| item.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let mut contains_photos_asset_reference = false;
+        let mut hinted_names = Vec::new();
+        let mut hinted_content_types = Vec::new();
+
+        let items = pasteboard
+            .pasteboardItems()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let item_types = item
+                            .types()
+                            .iter()
+                            .map(|item_type| item_type.to_string())
+                            .collect::<Vec<_>>();
+                        if item_types
+                            .iter()
+                            .any(|item_type| item_type == "com.apple.photos.object-reference.asset")
+                        {
+                            contains_photos_asset_reference = true;
+                        }
+                        if let Some(value) = collect_item_strings(
+                            &item,
+                            "com.apple.pasteboard.promised-suggested-file-name",
+                        ) {
+                            hinted_names.push(value);
+                        } else if let Some(value) =
+                            collect_item_strings(&item, "com.apple.pasteboard.promised-file-name")
+                        {
+                            hinted_names.push(value);
+                        }
+                        if let Some(value) = collect_item_strings(
+                            &item,
+                            "com.apple.pasteboard.promised-file-content-type",
+                        ) {
+                            hinted_content_types.push(value);
+                        }
+
+                        serde_json::json!({
+                            "types": item_types,
+                            "values": {
+                                "promised_file_name": collect_item_strings(&item, "com.apple.pasteboard.promised-file-name"),
+                                "promised_suggested_file_name": collect_item_strings(&item, "com.apple.pasteboard.promised-suggested-file-name"),
+                                "promised_file_content_type": collect_item_strings(&item, "com.apple.pasteboard.promised-file-content-type"),
+                                "promised_file_url": collect_item_strings(&item, "com.apple.pasteboard.promised-file-url"),
+                                "public_file_url": collect_item_strings(&item, "public.file-url"),
+                                "photos_asset_reference": collect_item_strings(&item, "com.apple.photos.object-reference.asset"),
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        (
+            contains_photos_asset_reference,
+            hinted_names,
+            hinted_content_types,
+            serde_json::json!({
+            "pasteboard_types": types,
+            "item_types": items,
+            }),
+        )
+    }
+
+    unsafe fn schedule_promised_receivers(
+        transfer_id: &str,
+        file_tx: Sender<Result<PathBuf, String>>,
+    ) -> Result<MacosResolvedDrop, String> {
+        let pasteboard = NSPasteboard::pasteboardWithName(NSPasteboardNameDrag);
+        let (contains_photos_asset_reference, hinted_names, hinted_content_types, snapshot) =
+            collect_photos_drag_hints(&pasteboard);
+        log_macos_drag_event(
+            "pasteboard:snapshot",
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "snapshot": snapshot,
+            }),
+        );
+
+        if contains_photos_asset_reference {
+            let staged_dir =
+                outbound_transfer_temp_dir().join(format!("photos-export-{transfer_id}"));
+            fs::create_dir_all(&staged_dir)
+                .map_err(|error| format!("无法创建 Photos 导出暂存目录: {}", error))?;
+            log_macos_drag_event(
+                "photos-selection:detected",
+                serde_json::json!({
+                    "transfer_id": transfer_id,
+                    "staged_dir": staged_dir.display().to_string(),
+                    "hinted_names": hinted_names,
+                    "hinted_content_types": hinted_content_types,
+                }),
+            );
+            return Ok(MacosResolvedDrop::PhotosSelection {
+                staged_dir,
+                hinted_names,
+                hinted_content_types,
+            });
+        }
+
+        let classes = NSArray::from_slice(&[NSFilePromiseReceiver::class()]);
+        log_macos_drag_event(
+            "pasteboard:before-read-file-promises",
+            serde_json::json!({
+                "transfer_id": transfer_id,
+            }),
+        );
+        let Some(objects) = pasteboard.readObjectsForClasses_options(&classes, None) else {
+            log_macos_drag_event(
+                "pasteboard:no-file-promises",
+                serde_json::json!({
+                    "transfer_id": transfer_id,
+                }),
+            );
+            return Ok(MacosResolvedDrop::None);
+        };
+        log_macos_drag_event(
+            "pasteboard:after-read-file-promises",
+            serde_json::json!({
+                "transfer_id": transfer_id,
+            }),
+        );
+        let receivers: &NSArray<NSFilePromiseReceiver> = objects.cast_unchecked();
+        let expected = receivers.count() as usize;
+        if expected == 0 {
+            log_macos_drag_event(
+                "pasteboard:zero-receivers",
+                serde_json::json!({
+                    "transfer_id": transfer_id,
+                }),
+            );
+            return Ok(MacosResolvedDrop::None);
+        }
+
+        let staged_dir = outbound_transfer_temp_dir().join(format!("promised-drop-{transfer_id}"));
+        fs::create_dir_all(&staged_dir)
+            .map_err(|error| format!("无法创建拖拽暂存目录: {}", error))?;
+        let staged_dir_str = staged_dir.to_string_lossy().to_string();
+        let destination_url = NSURL::fileURLWithPath(&NSString::from_str(&staged_dir_str));
+        let options = NSDictionary::new();
+        let queue = NSOperationQueue::new();
+        log_macos_drag_event(
+            "pasteboard:receivers-found",
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "receiver_count": expected,
+                "staged_dir": staged_dir.display().to_string(),
+                "receivers": receivers.iter().map(|receiver| {
+                    serde_json::json!({
+                        "file_names": receiver.fileNames().iter().map(|item| item.to_string()).collect::<Vec<_>>(),
+                        "file_types": receiver.fileTypes().iter().map(|item| item.to_string()).collect::<Vec<_>>(),
+                    })
+                }).collect::<Vec<_>>(),
+            }),
+        );
+
+        for index in 0..expected {
+            let receiver = receivers.objectAtIndex(index);
+            let tx = file_tx.clone();
+            let reader = RcBlock::new(
+                move |url_ptr: core::ptr::NonNull<NSURL>, error_ptr: *mut NSError| {
+                    if !error_ptr.is_null() {
+                        let error = unsafe { &*error_ptr };
+                        let _ = tx.send(Err(format!(
+                            "{} (domain={}, code={})",
+                            error.localizedDescription(),
+                            error.domain(),
+                            error.code()
+                        )));
+                        return;
+                    }
+
+                    let url = unsafe { url_ptr.as_ref() };
+                    let Some(path) = url.path() else {
+                        let _ = tx.send(Err("拖拽内容已生成，但没有可读路径".to_string()));
+                        return;
+                    };
+
+                    let _ = tx.send(Ok(PathBuf::from(path.to_string())));
+                },
+            );
+
+            receiver.receivePromisedFilesAtDestination_options_operationQueue_reader(
+                &destination_url,
+                &options,
+                &queue,
+                &reader,
+            );
+        }
+
+        Ok(MacosResolvedDrop::PromisedFiles {
+            expected,
+            staged_dir,
+        })
+    }
+    schedule_promised_receivers(transfer_id, file_tx)
+}
+
+#[cfg(target_os = "macos")]
+fn export_photos_selection_to_stage_dir(
+    transfer_id: &str,
+    staged_dir: &Path,
+    hinted_names: &[String],
+    hinted_content_types: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    let staged_dir_str = staged_dir
+        .to_str()
+        .ok_or_else(|| "Photos 导出目录路径不可读".to_string())?;
+    let staged_dir_escaped = staged_dir_str.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        r#"
+tell application "Photos"
+    set selectedItems to selection
+    if (count of selectedItems) is 0 then error "Photos 当前没有选中任何项目"
+    export selectedItems to POSIX file "{}" with using originals
+end tell
+"#,
+        staged_dir_escaped
+    );
+
+    log_macos_drag_event(
+        "photos-selection:export-start",
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "staged_dir": staged_dir.display().to_string(),
+            "hinted_names": hinted_names,
+            "hinted_content_types": hinted_content_types,
+        }),
+    );
+
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| format!("无法启动 Photos 导出: {}", error))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        log_macos_drag_event(
+            "photos-selection:export-error",
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "status": output.status.code(),
+                "stderr": stderr,
+                "stdout": stdout,
+            }),
+        );
+        if stderr.contains("Not authorized to send Apple events") {
+            return Err(
+                "VibeDrop 还没有获得控制 Photos 的权限，请在“系统设置 -> 隐私与安全性 -> 自动化”里允许后再试一次"
+                    .to_string(),
+            );
+        }
+        return Err(if stderr.is_empty() {
+            "无法从 Photos 导出当前拖拽项目".to_string()
+        } else {
+            format!("无法从 Photos 导出当前拖拽项目: {}", stderr)
+        });
+    }
+
+    let mut exported_paths = WalkDir::new(staged_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+
+    exported_paths.sort();
+    if !hinted_names.is_empty() {
+        let hinted_names_lower = hinted_names
+            .iter()
+            .map(|item| item.to_lowercase())
+            .collect::<Vec<_>>();
+        let matching = exported_paths
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| hinted_names_lower.contains(&name.to_lowercase()))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !matching.is_empty() {
+            exported_paths = matching;
+        }
+    }
+
+    if exported_paths.is_empty() {
+        log_macos_drag_event(
+            "photos-selection:export-empty",
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "staged_dir": staged_dir.display().to_string(),
+            }),
+        );
+        return Err("Photos 没有导出任何可发送文件".to_string());
+    }
+
+    log_macos_drag_event(
+        "photos-selection:export-finished",
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "paths": exported_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        }),
+    );
+
+    Ok(exported_paths)
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_native_drag_support(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let window_label = window.label().to_string();
+    window
+        .with_webview(move |webview| unsafe {
+            use objc2_app_kit::{
+                NSFilePromiseReceiver, NSPasteboardTypeFileURL, NSView, NSWindow,
+            };
+            use objc2_foundation::NSMutableCopying;
+
+            let ns_window: &NSWindow = &*webview.ns_window().cast();
+            let ns_view: &NSView = &*webview.inner().cast();
+
+            let drag_types = NSFilePromiseReceiver::readableDraggedTypes();
+            let mutable_types = drag_types.mutableCopy();
+            mutable_types.addObject(NSPasteboardTypeFileURL);
+
+            ns_window.registerForDraggedTypes(&mutable_types);
+            ns_view.registerForDraggedTypes(&mutable_types);
+
+            log_macos_drag_event(
+                "setup:register-drag-types",
+                serde_json::json!({
+                    "window_label": window_label,
+                    "types": mutable_types.iter().map(|item| item.to_string()).collect::<Vec<_>>(),
+                }),
+            );
+        })
+        .map_err(|error| format!("无法配置 macOS 原生拖拽支持: {}", error))
 }
 
 #[tauri::command]
@@ -707,6 +1379,7 @@ async fn local_share_extension_handler(
         client.clone(),
         transfer_id.clone(),
         prepared,
+        None,
     ));
     focus_main_window(&state.ws);
 
@@ -737,9 +1410,9 @@ struct ServerState {
 
 const MIN_WINDOW_WIDTH: f64 = 320.0;
 const MIN_WINDOW_HEIGHT: f64 = 420.0;
-const DESKTOP_TO_MOBILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DESKTOP_TO_MOBILE_CHUNK_BYTES: usize = 192 * 1024;
 const DESKTOP_TO_MOBILE_ACK_TIMEOUT_SECS: u64 = 90;
+const HISTORY_MEDIA_PREVIEW_LIMIT: usize = 6;
 const PAIR_REQUEST_TTL_SECS: i64 = 120;
 const DISCOVERY_PROTOCOL_VERSION: u16 = 1;
 
@@ -761,6 +1434,12 @@ impl HistoryEntry {
             image_path: None,
             thumbnail_data_url: None,
             file_path: None,
+            direction: None,
+            status: None,
+            session_id: None,
+            item_count: None,
+            save_target: None,
+            items: None,
         }
     }
 }
@@ -905,6 +1584,7 @@ fn main() {
     });
 
     let ws_state = Arc::new(WsState {
+        server_id: server_id.clone(),
         pin: ws_pin,
         hostname: ws_hostname,
         input_tx: ws_input_tx,
@@ -940,7 +1620,10 @@ fn main() {
                 .route("/discover", get(discover_handler))
                 .route("/pair/request", post(request_pairing_handler))
                 .route("/pair/status/{request_id}", get(pair_status_handler))
-                .route("/share-extension/paths", post(local_share_extension_handler))
+                .route(
+                    "/share-extension/paths",
+                    post(local_share_extension_handler),
+                )
                 .fallback_service(ServeDir::new(ws_static_dir))
                 .with_state(server_state);
 
@@ -949,14 +1632,24 @@ fn main() {
             let listener = tokio::net::TcpListener::bind(&http_addr)
                 .await
                 .unwrap_or_else(|_| panic!("无法绑定端口 {}", ws_port));
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
     });
 
     // 启动 Tauri APP
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .manage(state)
         .manage(ws_state)
@@ -1000,6 +1693,7 @@ fn main() {
             open_accessibility_settings,
             load_history_entries,
             open_history_path,
+            open_history_paths,
             list_connected_clients,
             list_pair_requests,
             approve_pair_request,
@@ -1017,7 +1711,18 @@ fn main() {
                     window_config.center = false;
                 }
 
-                WebviewWindowBuilder::from_config(app, &window_config)?.build()?;
+                let window = WebviewWindowBuilder::from_config(app, &window_config)?.build()?;
+                #[cfg(target_os = "macos")]
+                if let Err(error) = configure_macos_native_drag_support(&window) {
+                    warn!("配置 macOS 原生拖拽支持失败: {}", error);
+                    log_macos_drag_event(
+                        "setup:register-drag-types:error",
+                        serde_json::json!({
+                            "window_label": window.label(),
+                            "error": error,
+                        }),
+                    );
+                }
             }
 
             // 把 app_handle 传给 WebSocket 线程
@@ -1083,6 +1788,7 @@ fn main() {
 // ---- WebSocket 相关 ----
 
 struct WsState {
+    server_id: String,
     pin: String,
     hostname: String,
     input_tx: mpsc::Sender<InputRequest>,
@@ -1193,12 +1899,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                         broadcast_connected_clients(&state);
 
                                         info!("客户端认证成功: {} ({})", client_name, device_role);
-                                        let reply = ServerMessage {
-                                            status: "ok".to_string(),
-                                            hostname: Some(state.hostname.clone()),
-                                            error: None,
-                                        };
-                                        let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                        let reply = serde_json::json!({
+                                            "status": "ok",
+                                            "hostname": state.hostname.clone(),
+                                            "server_id": state.server_id.clone(),
+                                        });
+                                        let _ = ws_sender.send(Message::Text(reply.to_string().into())).await;
                                     } else {
                                         warn!("PIN 错误");
                                         let reply = ServerMessage {
@@ -1392,6 +2098,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                             image_path: Some(saved_image.image_path.clone()),
                                             thumbnail_data_url: Some(saved_image.thumbnail_data_url.clone()),
                                             file_path: None,
+                                            direction: None,
+                                            status: None,
+                                            session_id: None,
+                                            item_count: None,
+                                            save_target: None,
+                                            items: None,
                                         };
 
                                         if let Err(e) = set_clipboard_image(saved_image.clipboard_image) {
@@ -1487,6 +2199,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                             image_path: None,
                                             thumbnail_data_url: None,
                                             file_path: Some(saved_file_path),
+                                            direction: None,
+                                            status: None,
+                                            session_id: None,
+                                            item_count: None,
+                                            save_target: None,
+                                            items: None,
                                         };
 
                                         append_history_entry(&history_entry);
@@ -1631,13 +2349,14 @@ fn connected_clients_snapshot(state: &Arc<WsState>) -> Vec<ConnectedClientInfo> 
         .map(|clients| {
             let mut grouped = std::collections::HashMap::<String, ConnectedClientInfo>::new();
             for client in clients.values() {
-                let entry = grouped
-                    .entry(client.base_id.clone())
-                    .or_insert_with(|| ConnectedClientInfo {
-                        id: client.base_id.clone(),
-                        name: client.name.clone(),
-                        can_receive_files: client.can_receive_files,
-                    });
+                let entry =
+                    grouped
+                        .entry(client.base_id.clone())
+                        .or_insert_with(|| ConnectedClientInfo {
+                            id: client.base_id.clone(),
+                            name: client.name.clone(),
+                            can_receive_files: client.can_receive_files,
+                        });
                 if entry.name.trim().is_empty() {
                     entry.name = client.name.clone();
                 }
@@ -1790,11 +2509,7 @@ fn process_pending_finder_share_requests(state: &Arc<WsState>) {
             }
         };
 
-        let share_paths = request
-            .paths
-            .iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
+        let share_paths = request.paths.iter().map(PathBuf::from).collect::<Vec<_>>();
         if share_paths.is_empty() {
             let _ = fs::remove_file(&request_path);
             continue;
@@ -1836,7 +2551,10 @@ fn process_pending_finder_share_requests(state: &Arc<WsState>) {
             app_handle.clone(),
             client.clone(),
             transfer_id,
-            share_paths,
+            ResolvedDropPaths {
+                paths: share_paths,
+                cleanup_dir: None,
+            },
         ));
         focus_main_window(state);
         break;
@@ -1880,13 +2598,170 @@ fn emit_desktop_transfer_event(app: &AppHandle, event: &DesktopTransferEvent) {
     let _ = app.emit("desktop-transfer-progress", event);
 }
 
+fn emit_desktop_history_entry(app: &AppHandle, entry: &HistoryEntry) {
+    let _ = app.emit("text-received", entry);
+}
+
+fn emit_incoming_history_session_start(
+    client: &ConnectedClient,
+    session: &OutboundHistorySession,
+) -> Result<(), String> {
+    let message = serde_json::json!({
+        "action": "incoming_history_session_start",
+        "session_id": &session.session_id,
+        "timestamp": &session.timestamp,
+        "kind": &session.kind,
+        "text": &session.text,
+        "item_count": session.item_count,
+        "save_target": &session.save_target,
+        "items": &session.items,
+    });
+
+    client
+        .sender
+        .send(message.to_string())
+        .map_err(|_| "手机连接已断开".to_string())
+}
+
 async fn run_desktop_outbound_transfer(
     state: Arc<WsState>,
     app: AppHandle,
     client: ConnectedClient,
     transfer_id: String,
-    paths: Vec<PathBuf>,
+    resolved_drop: ResolvedDropPaths,
 ) {
+    let _cleanup = resolved_drop
+        .cleanup_dir
+        .as_ref()
+        .map(|path| ScopedPathCleanup::new(path.clone()));
+    let paths = resolved_drop.paths;
+    let history_session = match build_outbound_history_session(
+        &paths,
+        &transfer_id,
+        resolved_drop.cleanup_dir.as_deref(),
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            emit_desktop_transfer_event(
+                &app,
+                &DesktopTransferEvent {
+                    transfer_id,
+                    client_id: client.id,
+                    client_name: client.name,
+                    file_name: summarize_paths_for_ui(&paths),
+                    status: "error".to_string(),
+                    progress: 0.0,
+                    sent_bytes: 0,
+                    total_bytes: 0,
+                    is_archive: false,
+                    detail: Some(error),
+                },
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = emit_incoming_history_session_start(&client, &history_session) {
+        emit_desktop_transfer_event(
+            &app,
+            &DesktopTransferEvent {
+                transfer_id,
+                client_id: client.id,
+                client_name: client.name,
+                file_name: summarize_paths_for_ui(&paths),
+                status: "error".to_string(),
+                progress: 0.0,
+                sent_bytes: 0,
+                total_bytes: 0,
+                is_archive: false,
+                detail: Some(error),
+            },
+        );
+        return;
+    }
+
+    let mut results = Vec::new();
+
+    if should_split_gallery_media_paths(&paths) {
+        for (index, path) in paths.into_iter().enumerate() {
+            let next_transfer_id = if index == 0 {
+                transfer_id.clone()
+            } else {
+                format!("{}-{}", transfer_id, index + 1)
+            };
+            let result = run_single_desktop_outbound_transfer(
+                Arc::clone(&state),
+                app.clone(),
+                client.clone(),
+                next_transfer_id,
+                vec![path],
+                Some(OutboundTransferItemContext {
+                    session_id: history_session.session_id.clone(),
+                    item_index: index,
+                    item_count: history_session.item_count,
+                }),
+            )
+            .await;
+            results.push(result);
+        }
+    } else {
+        let result = run_single_desktop_outbound_transfer(
+            state,
+            app.clone(),
+            client.clone(),
+            transfer_id,
+            paths,
+            Some(OutboundTransferItemContext {
+                session_id: history_session.session_id.clone(),
+                item_index: 0,
+                item_count: history_session.item_count,
+            }),
+        )
+        .await;
+        results.push(result);
+    }
+
+    let history_entry = build_outbound_history_entry(&history_session, &client, &results);
+    append_history_entry(&history_entry);
+    emit_desktop_history_entry(&app, &history_entry);
+}
+
+struct ScopedPathCleanup {
+    path: PathBuf,
+}
+
+impl ScopedPathCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for ScopedPathCleanup {
+    fn drop(&mut self) {
+        let result = if self.path.is_dir() {
+            fs::remove_dir_all(&self.path)
+        } else {
+            fs::remove_file(&self.path)
+        };
+
+        if let Err(error) = result {
+            warn!("cleanup for {} failed: {}", self.path.display(), error);
+        }
+    }
+}
+
+async fn run_single_desktop_outbound_transfer(
+    state: Arc<WsState>,
+    app: AppHandle,
+    client: ConnectedClient,
+    transfer_id: String,
+    paths: Vec<PathBuf>,
+    history_context: Option<OutboundTransferItemContext>,
+) -> OutboundTransferResult {
+    let item_index = history_context
+        .as_ref()
+        .map(|context| context.item_index)
+        .unwrap_or(0);
     emit_desktop_transfer_event(
         &app,
         &DesktopTransferEvent {
@@ -1923,12 +2798,17 @@ async fn run_desktop_outbound_transfer(
                     sent_bytes: 0,
                     total_bytes: 0,
                     is_archive: false,
-                    detail: Some(error),
+                    detail: Some(error.clone()),
                 },
             );
-            return;
+            return OutboundTransferResult {
+                item_index,
+                status: "error".to_string(),
+                saved_path: None,
+            };
         }
         Err(join_error) => {
+            let message = format!("准备文件失败: {}", join_error);
             emit_desktop_transfer_event(
                 &app,
                 &DesktopTransferEvent {
@@ -1941,14 +2821,255 @@ async fn run_desktop_outbound_transfer(
                     sent_bytes: 0,
                     total_bytes: 0,
                     is_archive: false,
-                    detail: Some(format!("准备文件失败: {}", join_error)),
+                    detail: Some(message.clone()),
                 },
             );
-            return;
+            return OutboundTransferResult {
+                item_index,
+                status: "error".to_string(),
+                saved_path: None,
+            };
         }
     };
 
-    run_prepared_desktop_outbound_transfer(state, app, client, transfer_id, prepared).await;
+    run_prepared_desktop_outbound_transfer(
+        state,
+        app,
+        client,
+        transfer_id,
+        prepared,
+        history_context,
+    )
+    .await
+}
+
+fn should_split_gallery_media_paths(paths: &[PathBuf]) -> bool {
+    if paths.len() <= 1 {
+        return false;
+    }
+
+    paths.iter().all(|path| {
+        path.is_file()
+            && is_gallery_media_mime(
+                mime_guess::from_path(path)
+                    .first_or_octet_stream()
+                    .essence_str(),
+            )
+    })
+}
+
+fn is_gallery_media_mime(mime_type: &str) -> bool {
+    mime_type.starts_with("image/") || mime_type.starts_with("video/")
+}
+
+fn normalize_history_kind_from_mime(mime_type: &str) -> String {
+    if mime_type.starts_with("image/") {
+        return "image".to_string();
+    }
+    if mime_type.starts_with("video/") {
+        return "video".to_string();
+    }
+    "file".to_string()
+}
+
+fn build_outbound_history_session(
+    paths: &[PathBuf],
+    session_id: &str,
+    cleanup_dir: Option<&Path>,
+) -> Result<OutboundHistorySession, String> {
+    let timestamp = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
+    let mut items = Vec::new();
+
+    for (index, path) in paths.iter().enumerate() {
+        let mime_type = mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string();
+        let kind = normalize_history_kind_from_mime(&mime_type);
+        let allow_preview = index < HISTORY_MEDIA_PREVIEW_LIMIT;
+        let thumbnail_data_url = if allow_preview {
+            build_path_thumbnail_data_url(path, &mime_type).ok()
+        } else {
+            None
+        };
+        let file_path = if cleanup_dir.is_some_and(|root| path.starts_with(root)) {
+            cache_outbound_history_media(path, session_id, index).map_err(|error| {
+                warn!("缓存桌面发送历史媒体失败: {}", error);
+                error
+            }).ok()
+        } else {
+            Some(path.to_string_lossy().to_string())
+        };
+
+        items.push(HistoryTransferItem {
+            kind,
+            file_name: sanitize_file_name(path.file_name().and_then(|name| name.to_str()), "文件"),
+            mime_type,
+            thumbnail_data_url,
+            file_path,
+            saved_path: None,
+            status: Some("pending".to_string()),
+        });
+    }
+
+    let item_count = items.len().max(1);
+    let media_count = items
+        .iter()
+        .filter(|item| item.kind == "image" || item.kind == "video")
+        .count();
+    let image_count = items.iter().filter(|item| item.kind == "image").count();
+    let video_count = items.iter().filter(|item| item.kind == "video").count();
+    let save_target = if media_count == item_count && item_count > 0 {
+        "gallery".to_string()
+    } else {
+        "download".to_string()
+    };
+
+    let (kind, text) = if item_count == 1 {
+        let item = items
+            .first()
+            .ok_or_else(|| "发送内容为空".to_string())?;
+        let prefix = match item.kind.as_str() {
+            "image" => "图片",
+            "video" => "视频",
+            _ => "文件",
+        };
+        (item.kind.clone(), format!("[{}] {}", prefix, item.file_name))
+    } else if image_count == item_count {
+        ("image".to_string(), format!("[图片] {} 张", item_count))
+    } else if video_count == item_count {
+        ("video".to_string(), format!("[视频] {} 个", item_count))
+    } else if media_count == item_count {
+        ("media".to_string(), format!("[媒体] {} 项", item_count))
+    } else {
+        ("file".to_string(), format!("[文件] {} 项", item_count))
+    };
+
+    Ok(OutboundHistorySession {
+        session_id: session_id.to_string(),
+        timestamp,
+        kind,
+        text,
+        item_count,
+        save_target,
+        items,
+    })
+}
+
+fn build_outbound_history_entry(
+    session: &OutboundHistorySession,
+    client: &ConnectedClient,
+    results: &[OutboundTransferResult],
+) -> HistoryEntry {
+    let mut items = session.items.clone();
+    for result in results {
+        if let Some(item) = items.get_mut(result.item_index) {
+            item.status = Some(if result.status == "success" {
+                "success".to_string()
+            } else {
+                "failed".to_string()
+            });
+            if let Some(saved_path) = &result.saved_path {
+                item.saved_path = Some(saved_path.clone());
+            }
+        }
+    }
+
+    let success_count = items
+        .iter()
+        .filter(|item| item.status.as_deref() == Some("success"))
+        .count();
+    let failed_count = items
+        .iter()
+        .filter(|item| item.status.as_deref() == Some("failed"))
+        .count();
+    let status = if failed_count == 0 {
+        "success".to_string()
+    } else if success_count == 0 {
+        "failed".to_string()
+    } else {
+        "partial".to_string()
+    };
+
+    let first_item = items.first().cloned();
+    HistoryEntry {
+        timestamp: session.timestamp.clone(),
+        text: session.text.clone(),
+        client_ip: "desktop-outbound".to_string(),
+        client_id: Some(client.id.clone()),
+        client_name: Some(client.name.clone()),
+        kind: Some(session.kind.clone()),
+        file_name: first_item.as_ref().map(|item| item.file_name.clone()),
+        image_path: None,
+        thumbnail_data_url: first_item
+            .as_ref()
+            .and_then(|item| item.thumbnail_data_url.clone()),
+        file_path: first_item.as_ref().and_then(|item| item.file_path.clone()),
+        direction: Some("desktop_to_mobile".to_string()),
+        status: Some(status),
+        session_id: Some(session.session_id.clone()),
+        item_count: Some(session.item_count),
+        save_target: Some(session.save_target.clone()),
+        items: Some(items),
+    }
+}
+
+fn build_path_thumbnail_data_url(path: &Path, mime_type: &str) -> Result<String, String> {
+    if mime_type.starts_with("image/") {
+        let image = image::open(path).map_err(|e| format!("无法生成图片预览: {}", e))?;
+        return build_thumbnail_data_url(&image);
+    }
+
+    if mime_type.starts_with("video/") {
+        return build_video_thumbnail_data_url(path);
+    }
+
+    Err("当前文件类型不支持缩略图".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn build_video_thumbnail_data_url(path: &Path) -> Result<String, String> {
+    let preview_dir = outbound_transfer_temp_dir().join(format!(
+        "history-preview-{}",
+        chrono::Local::now().timestamp_millis()
+    ));
+    fs::create_dir_all(&preview_dir).map_err(|e| format!("无法创建视频预览目录: {}", e))?;
+
+    let output = std::process::Command::new("/usr/bin/qlmanage")
+        .args(["-t", "-s", "256", "-o"])
+        .arg(&preview_dir)
+        .arg(path)
+        .output()
+        .map_err(|e| format!("无法调用系统视频预览: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = fs::remove_dir_all(&preview_dir);
+        return Err(if stderr.is_empty() {
+            "系统视频预览生成失败".to_string()
+        } else {
+            format!("系统视频预览生成失败: {}", stderr)
+        });
+    }
+
+    let preview_path = WalkDir::new(&preview_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().is_file() && entry.path().extension().and_then(|ext| ext.to_str()) == Some("png"))
+        .map(|entry| entry.path().to_path_buf())
+        .ok_or_else(|| "系统未返回视频预览图".to_string())?;
+
+    let bytes = fs::read(&preview_path).map_err(|e| format!("无法读取视频预览图: {}", e))?;
+    let _ = fs::remove_dir_all(&preview_dir);
+    Ok(format!(
+        "data:image/png;base64,{}",
+        BASE64_STANDARD.encode(bytes)
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_video_thumbnail_data_url(_path: &Path) -> Result<String, String> {
+    Err("当前系统不支持视频预览".to_string())
 }
 
 async fn run_prepared_desktop_outbound_transfer(
@@ -1957,8 +3078,12 @@ async fn run_prepared_desktop_outbound_transfer(
     client: ConnectedClient,
     transfer_id: String,
     prepared: PreparedDesktopTransfer,
-) {
-
+    history_context: Option<OutboundTransferItemContext>,
+) -> OutboundTransferResult {
+    let item_index = history_context
+        .as_ref()
+        .map(|context| context.item_index)
+        .unwrap_or(0);
     emit_desktop_transfer_event(
         &app,
         &DesktopTransferEvent {
@@ -1999,7 +3124,11 @@ async fn run_prepared_desktop_outbound_transfer(
                 detail: Some("发送状态初始化失败".to_string()),
             },
         );
-        return;
+        return OutboundTransferResult {
+            item_index,
+            status: "error".to_string(),
+            saved_path: None,
+        };
     }
 
     let start_message = serde_json::json!({
@@ -2009,6 +3138,9 @@ async fn run_prepared_desktop_outbound_transfer(
         "mime_type": prepared.mime_type.clone(),
         "size_bytes": prepared.total_bytes,
         "is_archive": prepared.is_archive,
+        "history_session_id": history_context.as_ref().map(|context| context.session_id.clone()),
+        "history_item_index": history_context.as_ref().map(|context| context.item_index),
+        "history_item_count": history_context.as_ref().map(|context| context.item_count),
     });
 
     if client.sender.send(start_message.to_string()).is_err() {
@@ -2032,7 +3164,11 @@ async fn run_prepared_desktop_outbound_transfer(
                 detail: Some("手机连接已断开".to_string()),
             },
         );
-        return;
+        return OutboundTransferResult {
+            item_index,
+            status: "error".to_string(),
+            saved_path: None,
+        };
     }
 
     let mut file = match fs::File::open(&prepared.source_path) {
@@ -2055,11 +3191,15 @@ async fn run_prepared_desktop_outbound_transfer(
                     sent_bytes: 0,
                     total_bytes: prepared.total_bytes,
                     is_archive: prepared.is_archive,
-                    detail: Some(format!("无法读取待发送文件: {}", error)),
-                },
-            );
-            return;
-        }
+                detail: Some(format!("无法读取待发送文件: {}", error)),
+            },
+        );
+        return OutboundTransferResult {
+            item_index,
+            status: "error".to_string(),
+            saved_path: None,
+        };
+    }
     };
 
     let mut sent_bytes = 0u64;
@@ -2089,7 +3229,11 @@ async fn run_prepared_desktop_outbound_transfer(
                         detail: Some(format!("发送过程中读取文件失败: {}", error)),
                     },
                 );
-                return;
+                return OutboundTransferResult {
+                    item_index,
+                    status: "error".to_string(),
+                    saved_path: None,
+                };
             }
         };
 
@@ -2124,7 +3268,11 @@ async fn run_prepared_desktop_outbound_transfer(
                     detail: Some("手机连接在发送过程中断开".to_string()),
                 },
             );
-            return;
+            return OutboundTransferResult {
+                item_index,
+                status: "error".to_string(),
+                saved_path: None,
+            };
         }
 
         sent_bytes += read as u64;
@@ -2171,7 +3319,11 @@ async fn run_prepared_desktop_outbound_transfer(
                 detail: Some("文件已传出，但手机未确认接收完成".to_string()),
             },
         );
-        return;
+        return OutboundTransferResult {
+            item_index,
+            status: "error".to_string(),
+            saved_path: None,
+        };
     }
 
     let final_result = timeout(
@@ -2202,6 +3354,11 @@ async fn run_prepared_desktop_outbound_transfer(
                     detail: Some(format!("已保存到手机：{}", saved_path)),
                 },
             );
+            OutboundTransferResult {
+                item_index,
+                status: "success".to_string(),
+                saved_path: Some(saved_path),
+            }
         }
         Ok(Ok(Err(error))) => {
             emit_desktop_transfer_event(
@@ -2216,11 +3373,17 @@ async fn run_prepared_desktop_outbound_transfer(
                     sent_bytes: prepared.total_bytes,
                     total_bytes: prepared.total_bytes,
                     is_archive: prepared.is_archive,
-                    detail: Some(error),
+                    detail: Some(error.clone()),
                 },
             );
+            OutboundTransferResult {
+                item_index,
+                status: "error".to_string(),
+                saved_path: None,
+            }
         }
         Ok(Err(_)) => {
+            let message = "手机端确认回执异常".to_string();
             emit_desktop_transfer_event(
                 &app,
                 &DesktopTransferEvent {
@@ -2233,11 +3396,17 @@ async fn run_prepared_desktop_outbound_transfer(
                     sent_bytes: prepared.total_bytes,
                     total_bytes: prepared.total_bytes,
                     is_archive: prepared.is_archive,
-                    detail: Some("手机端确认回执异常".to_string()),
+                    detail: Some(message.clone()),
                 },
             );
+            OutboundTransferResult {
+                item_index,
+                status: "error".to_string(),
+                saved_path: None,
+            }
         }
         Err(_) => {
+            let message = "等待手机保存结果超时".to_string();
             emit_desktop_transfer_event(
                 &app,
                 &DesktopTransferEvent {
@@ -2250,9 +3419,14 @@ async fn run_prepared_desktop_outbound_transfer(
                     sent_bytes: prepared.total_bytes,
                     total_bytes: prepared.total_bytes,
                     is_archive: prepared.is_archive,
-                    detail: Some("等待手机保存结果超时".to_string()),
+                    detail: Some(message.clone()),
                 },
             );
+            OutboundTransferResult {
+                item_index,
+                status: "error".to_string(),
+                saved_path: None,
+            }
         }
     }
 }
@@ -2271,16 +3445,13 @@ fn prepare_share_extension_transfer(
     }
 
     let source_path = existing_paths[0].clone();
-    let metadata = fs::metadata(&source_path).map_err(|e| format!("无法读取共享文件信息: {}", e))?;
-    if metadata.len() > DESKTOP_TO_MOBILE_MAX_BYTES {
-        return Err(format!(
-            "文件过大，请控制在 {}MB 以内",
-            DESKTOP_TO_MOBILE_MAX_BYTES / (1024 * 1024)
-        ));
-    }
+    let metadata =
+        fs::metadata(&source_path).map_err(|e| format!("无法读取共享文件信息: {}", e))?;
 
-    let file_name =
-        sanitize_file_name(source_path.file_name().and_then(|name| name.to_str()), "file.bin");
+    let file_name = sanitize_file_name(
+        source_path.file_name().and_then(|name| name.to_str()),
+        "file.bin",
+    );
     let temp_dir = outbound_transfer_temp_dir();
     fs::create_dir_all(&temp_dir).map_err(|e| format!("无法创建共享暂存目录: {}", e))?;
 
@@ -2319,12 +3490,6 @@ fn prepare_desktop_transfer(
     if existing_paths.len() == 1 && existing_paths[0].is_file() {
         let path = existing_paths[0].clone();
         let metadata = fs::metadata(&path).map_err(|e| format!("无法读取文件信息: {}", e))?;
-        if metadata.len() > DESKTOP_TO_MOBILE_MAX_BYTES {
-            return Err(format!(
-                "文件过大，请控制在 {}MB 以内",
-                DESKTOP_TO_MOBILE_MAX_BYTES / (1024 * 1024)
-            ));
-        }
 
         let file_name =
             sanitize_file_name(path.file_name().and_then(|name| name.to_str()), "file.bin");
@@ -2368,14 +3533,6 @@ fn prepare_desktop_transfer(
         .map_err(|e| format!("无法读取打包结果: {}", e))?
         .len();
 
-    if archive_size > DESKTOP_TO_MOBILE_MAX_BYTES {
-        let _ = fs::remove_file(&archive_path);
-        return Err(format!(
-            "打包后的 ZIP 过大，请控制在 {}MB 以内",
-            DESKTOP_TO_MOBILE_MAX_BYTES / (1024 * 1024)
-        ));
-    }
-
     Ok(PreparedDesktopTransfer {
         source_path: archive_path.clone(),
         file_name: archive_file_name,
@@ -2388,6 +3545,30 @@ fn prepare_desktop_transfer(
 
 fn outbound_transfer_temp_dir() -> PathBuf {
     dirs_log_dir().join("outbound-transfer-temp")
+}
+
+fn outbound_history_media_dir() -> PathBuf {
+    dirs_log_dir().join("history-media-cache")
+}
+
+fn cache_outbound_history_media(
+    source_path: &Path,
+    session_id: &str,
+    item_index: usize,
+) -> Result<String, String> {
+    let cache_dir = outbound_history_media_dir().join(session_id);
+    fs::create_dir_all(&cache_dir).map_err(|e| format!("无法创建历史媒体缓存目录: {}", e))?;
+
+    let preferred_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| sanitize_file_name(Some(name), &format!("media-{}", item_index + 1)))
+        .unwrap_or_else(|| format!("media-{}", item_index + 1));
+    let cache_path = unique_path(&cache_dir, &preferred_name);
+    fs::copy(source_path, &cache_path)
+        .map_err(|e| format!("无法缓存历史媒体文件: {}", e))?;
+
+    Ok(cache_path.to_string_lossy().to_string())
 }
 
 fn create_zip_archive(source_paths: &[PathBuf], archive_path: &Path) -> Result<(), String> {

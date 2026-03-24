@@ -55,6 +55,13 @@ struct IncomingTransferMeta {
     size_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncomingSaveTarget {
+    Download,
+    GalleryImage,
+    GalleryVideo,
+}
+
 #[tauri::command]
 fn save_history(app: tauri::AppHandle, data: String) -> Result<(), String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -137,7 +144,11 @@ fn append_incoming_file_chunk(
 }
 
 #[tauri::command]
-fn finish_incoming_file(app: tauri::AppHandle, transfer_id: String) -> Result<String, String> {
+fn finish_incoming_file(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    save_target: Option<String>,
+) -> Result<String, String> {
     let meta_path = incoming_transfer_meta_path(&app, &transfer_id)?;
     let part_path = incoming_transfer_part_path(&app, &transfer_id)?;
     if !meta_path.exists() || !part_path.exists() {
@@ -149,13 +160,24 @@ fn finish_incoming_file(app: tauri::AppHandle, transfer_id: String) -> Result<St
     let meta: IncomingTransferMeta =
         serde_json::from_str(&meta_raw).map_err(|e| format!("临时元数据无效: {}", e))?;
 
-    let download = download_dir(&app)?;
-    std::fs::create_dir_all(&download).map_err(|e| format!("无法创建下载目录: {}", e))?;
+    let target = incoming_save_target(save_target.as_deref(), &meta.mime_type);
+    let destination_dir = incoming_save_dir(&app, target)?;
+    std::fs::create_dir_all(&destination_dir).map_err(|e| {
+        let label = match target {
+            IncomingSaveTarget::Download => "下载目录",
+            IncomingSaveTarget::GalleryImage | IncomingSaveTarget::GalleryVideo => "相册目录",
+        };
+        format!("无法创建{}: {}", label, e)
+    })?;
 
-    let destination = unique_path(&download, &meta.file_name);
+    let destination = unique_path(&destination_dir, &meta.file_name);
     if let Err(rename_error) = std::fs::rename(&part_path, &destination) {
         std::fs::copy(&part_path, &destination).map_err(|copy_error| {
-            format!("无法保存到下载目录: {}; {}", rename_error, copy_error)
+            let label = match target {
+                IncomingSaveTarget::Download => "下载目录",
+                IncomingSaveTarget::GalleryImage | IncomingSaveTarget::GalleryVideo => "相册目录",
+            };
+            format!("无法保存到{}: {}; {}", label, rename_error, copy_error)
         })?;
         let _ = std::fs::remove_file(&part_path);
     }
@@ -304,6 +326,37 @@ fn download_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     } else {
         app.path().app_data_dir().map_err(|e| e.to_string())
     }
+}
+
+fn incoming_save_target(requested: Option<&str>, mime_type: &str) -> IncomingSaveTarget {
+    match requested.unwrap_or_default() {
+        "gallery-image" => IncomingSaveTarget::GalleryImage,
+        "gallery-video" => IncomingSaveTarget::GalleryVideo,
+        "download" => IncomingSaveTarget::Download,
+        _ => {
+            if mime_type.starts_with("image/") {
+                IncomingSaveTarget::GalleryImage
+            } else if mime_type.starts_with("video/") {
+                IncomingSaveTarget::GalleryVideo
+            } else {
+                IncomingSaveTarget::Download
+            }
+        }
+    }
+}
+
+fn incoming_save_dir(app: &tauri::AppHandle, target: IncomingSaveTarget) -> Result<PathBuf, String> {
+    let public_dir = match target {
+        IncomingSaveTarget::Download => PathBuf::from("/storage/emulated/0/Download"),
+        IncomingSaveTarget::GalleryImage => PathBuf::from("/storage/emulated/0/Pictures/VibeDrop"),
+        IncomingSaveTarget::GalleryVideo => PathBuf::from("/storage/emulated/0/Movies/VibeDrop"),
+    };
+
+    if public_dir.exists() || public_dir.parent().is_some() {
+        return Ok(public_dir);
+    }
+
+    app.path().app_data_dir().map_err(|e| e.to_string())
 }
 
 fn incoming_transfer_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {

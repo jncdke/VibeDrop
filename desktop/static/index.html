@@ -10,6 +10,8 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <link rel="apple-touch-icon" href="/icon.png">
+    <link rel="stylesheet" href="/vendor/photoswipe/photoswipe.css">
+    <link rel="stylesheet" href="/vendor/plyr/plyr.css">
     <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -63,6 +65,33 @@
                 </div>
             </details>
 
+            <section id="media-opener-settings-card" class="settings-card data-card hidden">
+                <h3>默认打开应用</h3>
+                <p class="hint">只影响 VibeDrop 内部的媒体打开方式，不会修改手机系统全局默认。</p>
+                <div class="media-opener-settings-list">
+                    <div class="media-opener-settings-row">
+                        <div class="media-opener-settings-copy">
+                            <div class="media-opener-settings-label">图片</div>
+                            <div id="media-opener-image-value" class="media-opener-settings-value">每次询问</div>
+                        </div>
+                        <div class="media-opener-settings-actions">
+                            <button id="media-opener-image-select-btn" class="secondary-btn" type="button">选择</button>
+                            <button id="media-opener-image-clear-btn" class="secondary-btn hidden" type="button">清除</button>
+                        </div>
+                    </div>
+                    <div class="media-opener-settings-row">
+                        <div class="media-opener-settings-copy">
+                            <div class="media-opener-settings-label">视频</div>
+                            <div id="media-opener-video-value" class="media-opener-settings-value">每次询问</div>
+                        </div>
+                        <div class="media-opener-settings-actions">
+                            <button id="media-opener-video-select-btn" class="secondary-btn" type="button">选择</button>
+                            <button id="media-opener-video-clear-btn" class="secondary-btn hidden" type="button">清除</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
             <div class="settings-card data-card">
                 <h3>数据管理</h3>
                 <div class="history-actions">
@@ -92,7 +121,7 @@
         <!-- 历史页面 -->
         <section id="history-view" class="view hidden">
             <div class="history-header">
-                <h2>发送历史</h2>
+                <h2>传输历史</h2>
                 <div class="history-filter" id="history-filter-btns">
                     <button class="filter-btn active" data-filter="all">全部</button>
                 </div>
@@ -111,7 +140,7 @@
                 <div class="history-heatmap-header">
                     <div>
                         <h3>活跃热力图</h3>
-                        <p id="history-heatmap-caption" class="hint">每个方块代表某天某小时发送了多少条记录。左右拖动查看更多日期，点方块筛选该小时。</p>
+                        <p id="history-heatmap-caption" class="hint">每个方块代表某天某小时的传输记录数量。左右拖动查看更多日期，点方块筛选该小时。</p>
                     </div>
                     <button id="history-heatmap-reset-btn" class="secondary-btn history-heatmap-reset hidden">回到最近</button>
                 </div>
@@ -200,6 +229,8 @@
                         <option value="all">全部类型</option>
                         <option value="text">文字</option>
                         <option value="image">图片</option>
+                        <option value="video">视频</option>
+                        <option value="media">媒体</option>
                         <option value="file">文件</option>
                     </select>
                 </div>
@@ -209,6 +240,7 @@
                     <select id="history-status-filter">
                         <option value="all">全部状态</option>
                         <option value="success">成功</option>
+                        <option value="partial">部分成功</option>
                         <option value="failed">失败</option>
                         <option value="pending">发送中</option>
                     </select>
@@ -278,6 +310,54 @@
             </div>
         </div>
 
+        <div id="history-media-preview-modal" class="history-media-preview-modal hidden" aria-hidden="true">
+            <div id="history-media-preview-backdrop" class="history-media-preview-backdrop"></div>
+            <div class="history-media-preview-card" role="dialog" aria-modal="true" aria-labelledby="history-media-preview-title">
+                <div class="history-media-preview-header">
+                    <div class="history-media-preview-copy">
+                        <h3 id="history-media-preview-title">媒体预览</h3>
+                        <p id="history-media-preview-subtitle" class="history-media-preview-subtitle">查看这次传输里的全部媒体。</p>
+                    </div>
+                    <button id="history-media-preview-close" class="icon-btn share-clear-btn" title="关闭">关闭</button>
+                </div>
+                <div id="history-media-preview-body" class="history-media-preview-body"></div>
+            </div>
+        </div>
+
+        <div id="history-media-viewer-modal" class="history-media-viewer-modal hidden" aria-hidden="true">
+            <div id="history-media-viewer-backdrop" class="history-media-viewer-backdrop"></div>
+            <div class="history-media-viewer-card" role="dialog" aria-modal="true" aria-labelledby="history-media-viewer-title">
+                <div class="history-media-viewer-header">
+                    <div class="history-media-viewer-copy">
+                        <h3 id="history-media-viewer-title">媒体预览</h3>
+                        <p id="history-media-viewer-subtitle" class="history-media-viewer-subtitle">正在加载媒体内容…</p>
+                    </div>
+                    <button id="history-media-viewer-close" class="icon-btn share-clear-btn" title="关闭">关闭</button>
+                </div>
+                <div id="history-media-viewer-stage" class="history-media-viewer-stage"></div>
+            </div>
+        </div>
+
+        <div id="media-opener-picker-modal" class="sheet-backdrop hidden" role="dialog" aria-modal="true">
+            <div class="sheet-card media-opener-picker-card">
+                <div class="sheet-handle"></div>
+                <div class="sheet-header">
+                    <div>
+                        <h3 id="media-opener-picker-title">选择打开应用</h3>
+                        <p id="media-opener-picker-subtitle" class="hint">只影响 VibeDrop 内部，不会修改系统默认。</p>
+                    </div>
+                    <button id="media-opener-picker-close-btn" class="icon-btn share-clear-btn" title="关闭">关闭</button>
+                </div>
+                <label id="media-opener-picker-remember" class="media-opener-picker-remember">
+                    <input id="media-opener-picker-remember-toggle" type="checkbox">
+                    <span id="media-opener-picker-remember-label">记住这次选择</span>
+                </label>
+                <div id="media-opener-picker-list" class="media-opener-picker-list"></div>
+                <div id="media-opener-picker-empty" class="empty-hint hidden">没有找到可用的打开应用。</div>
+            </div>
+            <div id="media-opener-picker-backdrop" class="media-opener-picker-backdrop"></div>
+        </div>
+
         <!-- 底部导航栏 -->
         <nav id="bottom-nav">
             <button class="nav-btn active" data-view="send-view" id="nav-send-btn">
@@ -289,6 +369,12 @@
         </nav>
     </div>
 
+    <script src="/vendor/plyr/plyr.min.js"></script>
+    <script type="module">
+        import PhotoSwipe from '/vendor/photoswipe/photoswipe.esm.min.js';
+        window.PhotoSwipe = PhotoSwipe;
+        window.dispatchEvent(new Event('vibedrop:photoswipe-ready'));
+    </script>
     <script src="/app.js"></script>
 </body>
 </html>

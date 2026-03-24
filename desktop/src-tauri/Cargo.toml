@@ -10,6 +10,7 @@ serde_json = "1"
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 enigo = "0.2"
@@ -29,3 +30,9 @@ image = { version = "0.25", default-features = false, features = ["gif", "jpeg",
 mime_guess = "2"
 walkdir = "2"
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSFilePromiseReceiver", "NSPasteboard", "NSPasteboardItem", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSOperation", "NSString", "NSURL"] }

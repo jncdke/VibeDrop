@@ -9,5 +9,9 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs"
+  "type": "commonjs",
+  "dependencies": {
+    "photoswipe": "^5.4.4",
+    "plyr": "^3.8.4"
+  }
 }
