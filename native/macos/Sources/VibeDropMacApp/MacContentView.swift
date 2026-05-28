@@ -246,7 +246,7 @@ private struct DropSendCard: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("发送到手机").font(.system(size: 22, weight: .bold))
-                        Text(model.selectedPeer.map { "目标：\($0.deviceName)" } ?? "当前没有已连接手机")
+                        Text(model.selectedFilePeer.map { "目标：\($0.deviceName)" } ?? "当前没有可接收文件的手机")
                             .font(.system(size: 13))
                             .foregroundStyle(.secondary)
                     }

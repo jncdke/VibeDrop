@@ -49,6 +49,8 @@ final class VibeDropHTTPHandler: ChannelInboundHandler, RemovableChannelHandler 
             let requestId = String(value.dropFirst("/pair/status/".count))
             let response = pairManager.status(requestId: requestId, configuration: configuration)
             sendEncodable(context: context, response)
+        case (.POST, "/share-extension/paths"):
+            handleShareExtensionPaths(context: context)
         default:
             sendJSON(context: context, status: .notFound, payload: ["error": "not_found"])
         }
@@ -75,6 +77,54 @@ final class VibeDropHTTPHandler: ChannelInboundHandler, RemovableChannelHandler 
                 payload: ["error": error.localizedDescription]
             )
         }
+    }
+
+    private func handleShareExtensionPaths(context: ChannelHandlerContext) {
+        do {
+            var body = requestBody ?? context.channel.allocator.buffer(capacity: 0)
+            let bytes = body.readBytes(length: body.readableBytes) ?? []
+            let data = Data(bytes)
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let paths = (object?["paths"] as? [String])?
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty } ?? []
+            guard !paths.isEmpty else {
+                sendJSON(context: context, status: .badRequest, payload: ["error": "no_paths"])
+                return
+            }
+            let source = (object?["source"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let queueURL = try Self.enqueueShareRequest(paths: paths, source: source)
+            sendJSON(
+                context: context,
+                status: .ok,
+                payload: [
+                    "status": "queued",
+                    "request": queueURL.lastPathComponent,
+                    "count": "\(paths.count)"
+                ]
+            )
+        } catch {
+            sendJSON(
+                context: context,
+                status: .internalServerError,
+                payload: ["error": error.localizedDescription]
+            )
+        }
+    }
+
+    private static func enqueueShareRequest(paths: [String], source: String?) throws -> URL {
+        let queueDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".vibedrop", isDirectory: true)
+            .appendingPathComponent("finder-share-requests", isDirectory: true)
+        try FileManager.default.createDirectory(at: queueDirectory, withIntermediateDirectories: true)
+        let requestURL = queueDirectory.appendingPathComponent("share-\(Int(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString).json")
+        let payload: [String: Any] = [
+            "paths": paths,
+            "source": source?.isEmpty == false ? source! : "share-extension"
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: requestURL, options: .atomic)
+        return requestURL
     }
 
     private func sendEncodable<T: Encodable>(

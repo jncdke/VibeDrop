@@ -56,6 +56,13 @@ final class MacNativeAppModel: ObservableObject {
         return connectedClients.first(where: { $0.peer.sessionId == selectedSessionId })?.peer
     }
 
+    var selectedFilePeer: ConnectedPeer? {
+        if let selectedPeer, selectedPeer.canReceiveFiles {
+            return selectedPeer
+        }
+        return connectedClients.first(where: { $0.peer.canReceiveFiles })?.peer
+    }
+
     func startIfNeeded() {
         guard !started else { return }
         started = true
@@ -131,6 +138,7 @@ final class MacNativeAppModel: ObservableObject {
         }
         recentHistory = (try? database?.fetchAll()) ?? []
         diagnosticEvents = diagnosticLogStore?.recent(limit: 60) ?? []
+        processPendingFinderShareRequests()
     }
 
     func approvePairRequest(_ request: PairRequestInfo) {
@@ -161,7 +169,7 @@ final class MacNativeAppModel: ObservableObject {
             log("transfer", "send_blocked", ["reason": "service_not_ready", "itemCount": "\(urls.count)"])
             return
         }
-        guard let peer = selectedPeer else {
+        guard let peer = selectedFilePeer else {
             serviceError = "当前没有可接收文件的手机"
             log("transfer", "send_blocked", ["reason": "no_peer", "itemCount": "\(urls.count)"])
             return
@@ -387,10 +395,58 @@ final class MacNativeAppModel: ObservableObject {
         lastConnectedClientKeys = keys
     }
 
+    private func processPendingFinderShareRequests() {
+        guard outboundService != nil, selectedFilePeer != nil else { return }
+        let queueDirectory = Self.finderShareRequestsDirectory()
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: queueDirectory,
+            includingPropertiesForKeys: nil
+        ) else { return }
+        let requests = entries
+            .filter { $0.pathExtension == "json" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard let requestURL = requests.first else { return }
+
+        do {
+            let request = try Self.loadQueuedShareRequest(at: requestURL)
+            let urls = request.paths.map { URL(fileURLWithPath: $0) }
+                .filter { FileManager.default.fileExists(atPath: $0.path) }
+            try? FileManager.default.removeItem(at: requestURL)
+            guard !urls.isEmpty else {
+                log("share", "request_dropped", ["reason": "no_existing_paths"])
+                return
+            }
+            log(
+                "share",
+                "request_accepted",
+                [
+                    "source": request.source ?? "unknown",
+                    "itemCount": "\(urls.count)"
+                ]
+            )
+            NSApp.activate(ignoringOtherApps: true)
+            sendFiles(urls)
+        } catch {
+            try? FileManager.default.removeItem(at: requestURL)
+            log("share", "request_invalid", ["error": error.localizedDescription])
+        }
+    }
+
     private static func fileStamp() -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd_HHmmss"
         return formatter.string(from: Date())
+    }
+
+    private static func finderShareRequestsDirectory() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".vibedrop", isDirectory: true)
+            .appendingPathComponent("finder-share-requests", isDirectory: true)
+    }
+
+    private static func loadQueuedShareRequest(at url: URL) throws -> QueuedFinderShareRequest {
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(QueuedFinderShareRequest.self, from: data)
     }
 
     private func importLegacyHistoryIfAvailable(
@@ -421,4 +477,9 @@ private struct MacHistoryExportArchive: Codable {
     var exportedAt: Date
     var sourceDevice: DeviceIdentity?
     var history: [HistoryEntry]
+}
+
+private struct QueuedFinderShareRequest: Codable {
+    var paths: [String]
+    var source: String?
 }
