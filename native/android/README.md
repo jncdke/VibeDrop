@@ -41,3 +41,11 @@ JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
 ```
 
 当前机器默认 Java 25 会让 Gradle Kotlin DSL 里的 Kotlin 编译器在解析 Java 版本时失败；Android Studio 自带 JBR 21 可以正常构建。
+
+真机安装原生 debug 预览包：
+
+```sh
+./scripts/deploy-native-android.sh --device <serial>
+```
+
+这个脚本安装的是 `com.vibedrop.mobile.nativepreview`，可以和当前 Tauri 正式包并排存在，便于逐项对照功能等价；真正覆盖 `com.vibedrop.mobile` 的 release 签名升级路径单独处理。
