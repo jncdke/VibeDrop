@@ -1170,7 +1170,23 @@ private fun HistoryScreen(
     var draftEndTime by remember { mutableStateOf("") }
     var dayWindowOffset by rememberSaveable { mutableIntStateOf(0) }
     var selectedHour by remember { mutableStateOf<HeatmapSelection?>(null) }
+    var previewRecord by remember { mutableStateOf<HistoryEntryWithItems?>(null) }
+    var previewIndex by remember { mutableIntStateOf(0) }
     val now = remember(entries.size) { System.currentTimeMillis() }
+
+    fun openHistoryItem(item: HistoryItemEntity) {
+        val mode = if (item.kind == "video") videoOpenMode else imageOpenMode
+        runCatching {
+            openHistoryMediaItem(context, item, mode)
+        }.onFailure { error ->
+            Toast.makeText(
+                context,
+                "无法打开：${error.message ?: "没有可用应用"}",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
     fun resetHeatmapWindow() {
         dayWindowOffset = 0
         selectedHour = null
@@ -1305,6 +1321,16 @@ private fun HistoryScreen(
             onDismiss = { showCustomFilterDialog = false },
             onClear = { clearCustomFilters() },
             onApply = { applyCustomFilterDialog() }
+        )
+    }
+
+    previewRecord?.let { record ->
+        HistoryMediaPreviewDialog(
+            record = record,
+            selectedIndex = previewIndex,
+            onSelectIndex = { previewIndex = it },
+            onOpenItem = { openHistoryItem(it) },
+            onDismiss = { previewRecord = null }
         )
     }
 
@@ -1579,17 +1605,10 @@ private fun HistoryScreen(
         items(filteredEntries, key = { it.entry.id }) { record ->
             HistoryCard(
                 record = record,
-                onOpenItem = { item ->
-                    val mode = if (item.kind == "video") videoOpenMode else imageOpenMode
-                    runCatching {
-                        openHistoryMediaItem(context, item, mode)
-                    }.onFailure { error ->
-                        Toast.makeText(
-                            context,
-                            "无法打开：${error.message ?: "没有可用应用"}",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    }
+                onPreviewItem = { item ->
+                    val sortedItems = record.items.sortedBy { it.itemIndex }
+                    previewRecord = record
+                    previewIndex = sortedItems.indexOfFirst { it.id == item.id }.takeIf { it >= 0 } ?: 0
                 }
             )
         }
@@ -1816,7 +1835,7 @@ private fun HistoryHeatmap(
 @Composable
 private fun HistoryCard(
     record: HistoryEntryWithItems,
-    onOpenItem: (HistoryItemEntity) -> Unit
+    onPreviewItem: (HistoryItemEntity) -> Unit
 ) {
     val entry = record.entry
     val items = remember(record.items) { record.items.sortedBy { it.itemIndex } }
@@ -1848,7 +1867,7 @@ private fun HistoryCard(
                     items.take(12).forEach { item ->
                         HistoryItemPreview(
                             item = item,
-                            onOpen = { onOpenItem(item) }
+                            onOpen = { onPreviewItem(item) }
                         )
                     }
                     if (items.size > 12) {
@@ -1872,8 +1891,140 @@ private fun HistoryCard(
 }
 
 @Composable
+private fun HistoryMediaPreviewDialog(
+    record: HistoryEntryWithItems,
+    selectedIndex: Int,
+    onSelectIndex: (Int) -> Unit,
+    onOpenItem: (HistoryItemEntity) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val items = remember(record.items) { record.items.sortedBy { it.itemIndex } }
+    val selected = items.getOrNull(selectedIndex.coerceIn(0, (items.size - 1).coerceAtLeast(0)))
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = selected?.fileName.orEmpty().ifBlank { "媒体预览" },
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                fontWeight = FontWeight.ExtraBold
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    text = record.entry.text.orEmpty().ifBlank { kindLabel(record.entry.kind) },
+                    color = Color(0xFF667085),
+                    fontSize = 13.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                selected?.let { item ->
+                    HistoryMediaPreviewStage(item)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items.forEachIndexed { index, candidate ->
+                            HistoryItemPreview(
+                                item = candidate,
+                                selected = candidate.id == item.id,
+                                onOpen = { onSelectIndex(index) }
+                            )
+                        }
+                    }
+                    Text(
+                        text = buildString {
+                            append(kindLabel(item.kind))
+                            item.mimeType?.takeIf { it.isNotBlank() }?.let { append(" · ").append(it) }
+                            item.sizeBytes?.let { append(" · ").append(formatBytes(it)) }
+                            append(" · ").append(itemStatusLabel(item.status))
+                        },
+                        color = Color(0xFF667085),
+                        fontSize = 12.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    item.error?.takeIf { it.isNotBlank() }?.let { error ->
+                        Text(
+                            text = error,
+                            color = Color(0xFFE5484D),
+                            fontSize = 12.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                } ?: Text("这条历史没有可预览的媒体项。", color = Color(0xFF667085))
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { selected?.let(onOpenItem) },
+                enabled = selected != null && selected.status != "failed"
+            ) {
+                Text("系统打开")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("关闭")
+            }
+        }
+    )
+}
+
+@Composable
+private fun HistoryMediaPreviewStage(item: HistoryItemEntity) {
+    val bitmap = remember(item.thumbnailDataUrl) { decodeThumbnailDataUrl(item.thumbnailDataUrl) }
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(260.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(Color(0xFF111827)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit
+            )
+        } else {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = itemKindShortLabel(item),
+                    color = Color.White,
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.ExtraBold
+                )
+                Text(
+                    text = item.fileName.orEmpty().ifBlank { kindLabel(item.kind) },
+                    color = Color(0xFFD0D5DD),
+                    fontSize = 13.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = itemStatusLabel(item.status),
+                    color = if (item.status == "failed") Color(0xFFFFA3A3) else Color(0xFFD0D5DD),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun HistoryItemPreview(
     item: HistoryItemEntity,
+    selected: Boolean = false,
     onOpen: () -> Unit
 ) {
     val bitmap = remember(item.thumbnailDataUrl) { decodeThumbnailDataUrl(item.thumbnailDataUrl) }
@@ -1884,8 +2035,8 @@ private fun HistoryItemPreview(
             .background(Color(0xFFF4F7FB))
             .clickable(onClick = onOpen)
             .border(
-                width = 1.dp,
-                color = statusBorderColor(item.status),
+                width = if (selected) 2.dp else 1.dp,
+                color = if (selected) Color(0xFF168DF7) else statusBorderColor(item.status),
                 shape = RoundedCornerShape(14.dp)
             )
             .padding(7.dp),
@@ -3000,6 +3151,18 @@ private fun kindLabel(kind: String): String = when (kind) {
 
 private fun formatTime(timestampMillis: Long): String {
     return SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.CHINA).format(Date(timestampMillis))
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1024L) return "${bytes}B"
+    val units = listOf("KB", "MB", "GB", "TB")
+    var value = bytes.toDouble() / 1024.0
+    var unitIndex = 0
+    while (value >= 1024.0 && unitIndex < units.lastIndex) {
+        value /= 1024.0
+        unitIndex += 1
+    }
+    return "%.1f%s".format(Locale.US, value, units[unitIndex])
 }
 
 private fun historyArchiveFileName(): String {

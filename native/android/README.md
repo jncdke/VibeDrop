@@ -30,7 +30,7 @@
 9. 发送页“传图到剪贴板”使用 Android 图片选择器读取图片并发送 `image_clipboard`；“传到收件箱”使用系统文件选择器读取单个或多个 URI，并按 192KiB 分片发送 `incoming_file_start/chunk/complete`，多文件会附带 `history_session_id/history_item_index/history_item_count` 让 Mac 历史聚合，发送时监控 OkHttp WebSocket 队列做背压，完成前失败会回传 `incoming_file_error` 让 Mac 清理临时状态；如果内容提供方不给文件大小，会先流式暂存到 App cache 取得长度再发送，完成后清理缓存，并等待 Mac 返回 `incoming_file_saved` 后才写成功历史。
 10. Mac 拖拽/分享发送到原生 Android 时，`DesktopConnectionController` 会接收 `incoming_history_session_start` 与 `incoming_file_start/chunk/complete`，`IncomingFileReceiver` 写入临时文件、校验大小、保存到 MediaStore，并按会话写入 Room 聚合历史。
 11. Android 系统分享进入的单张图片可以直接点任意设备卡片的“传图到剪贴板”发送到该 Mac，也可以点“传到收件箱”；分享进入的一个或多个文件可以直接点任意设备卡片的“传到收件箱”，成功后才清除 pending 分享内容。
-12. 设置页支持图片/视频历史打开策略：系统默认、相册、浏览器或每次询问；历史媒体 item 点击后会通过 Android `ACTION_VIEW` 和 FileProvider/MediaStore URI 打开。历史页支持发送端和接收端分离筛选，候选项显示数量并按数量排序。
+12. 设置页支持图片/视频历史打开策略：系统默认、相册、浏览器或每次询问；历史媒体 item 点击后会先进入 VibeDrop 内部预览，再按当前策略通过 Android `ACTION_VIEW` 和 FileProvider/MediaStore URI 打开。历史页支持发送端和接收端分离筛选，候选项显示数量并按数量排序。
 13. 设置页连接诊断卡支持直接编辑或删除已保存 Mac；编辑保留原设备 ID，只更新显示名、host、端口和 PIN，删除不会清空历史记录。
 14. 设置页“测试连接”会为每台已保存 Mac 打开一次性 WebSocket，发送 v1 `auth` 并等待 `status ok`，所以可以区分 host/端口不可达、PIN 错误和真实可发送状态；测试 socket 不复用也不打断当前发送连接。
 15. 设置页连接诊断卡支持上移/下移已保存 Mac；顺序写入 Room，发送页卡片顺序、设置页卡片顺序和后台剪贴板同步遍历顺序保持一致。
