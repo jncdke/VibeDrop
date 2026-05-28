@@ -71,7 +71,10 @@ import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import com.vibedrop.mobile.nativeapp.data.local.HistoryItemEntity
 import com.vibedrop.mobile.nativeapp.data.repository.HistoryEntryWithItems
 import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
+import com.vibedrop.mobile.nativeapp.platform.AndroidDeviceIdentity
+import com.vibedrop.mobile.nativeapp.platform.AndroidNetworkDiagnosticsSnapshot
 import com.vibedrop.mobile.nativeapp.platform.ContentTransferResult
+import com.vibedrop.mobile.nativeapp.platform.loadAndroidNetworkDiagnostics
 import com.vibedrop.mobile.nativeapp.platform.readClipboardText
 import com.vibedrop.mobile.nativeapp.platform.sendImageUriToMacClipboard
 import com.vibedrop.mobile.nativeapp.platform.sendUriToDesktopInbox
@@ -230,6 +233,9 @@ fun VibeDropApp(container: AppContainer) {
                     modifier = Modifier.weight(1f)
                 )
                 else -> SettingsScreen(
+                    identity = container.androidIdentity,
+                    devices = devices,
+                    controllers = controllers,
                     discoveredDesktops = discoveredDesktops,
                     discoveryStatus = discoveryStatus,
                     discoveryBusy = discoveryBusy,
@@ -1258,6 +1264,9 @@ private fun HistoryChip(text: String) {
 
 @Composable
 private fun SettingsScreen(
+    identity: AndroidDeviceIdentity,
+    devices: List<DesktopDevice>,
+    controllers: Map<String, DesktopConnectionController>,
     discoveredDesktops: List<DiscoveredDesktop>,
     discoveryStatus: String,
     discoveryBusy: Boolean,
@@ -1281,7 +1290,15 @@ private fun SettingsScreen(
     var portText by rememberSaveable { mutableStateOf("9001") }
     var pin by rememberSaveable { mutableStateOf("1234") }
     var clearArmed by rememberSaveable { mutableStateOf(false) }
+    var networkDiagnostics by remember { mutableStateOf<AndroidNetworkDiagnosticsSnapshot?>(null) }
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        networkDiagnostics = withContext(Dispatchers.IO) {
+            loadAndroidNetworkDiagnostics(context)
+        }
+    }
 
     LazyColumn(
         modifier = modifier.fillMaxWidth(),
@@ -1300,6 +1317,21 @@ private fun SettingsScreen(
                 text = "可以先扫描局域网配对 Mac；扫描不到时再手动填写 host、端口和 PIN。",
                 color = Color(0xFF667085),
                 fontSize = 15.sp
+            )
+        }
+        item {
+            ConnectionDiagnosticsCard(
+                identity = identity,
+                devices = devices,
+                controllers = controllers,
+                diagnostics = networkDiagnostics,
+                onRefresh = {
+                    scope.launch {
+                        networkDiagnostics = withContext(Dispatchers.IO) {
+                            loadAndroidNetworkDiagnostics(context)
+                        }
+                    }
+                }
             )
         }
         item {
@@ -1493,6 +1525,181 @@ private fun SettingsScreen(
 }
 
 @Composable
+private fun ConnectionDiagnosticsCard(
+    identity: AndroidDeviceIdentity,
+    devices: List<DesktopDevice>,
+    controllers: Map<String, DesktopConnectionController>,
+    diagnostics: AndroidNetworkDiagnosticsSnapshot?,
+    onRefresh: () -> Unit
+) {
+    val connectedCount = controllers.values.count { it.connection.status == ConnectionStatus.Connected }
+    val reconnectingCount = controllers.values.count { it.connection.status == ConnectionStatus.Connecting }
+    val recentErrors = devices
+        .mapNotNull { device ->
+            val connection = controllers[device.id]?.connection ?: return@mapNotNull null
+            connection.lastError
+                ?.takeIf { it.isNotBlank() }
+                ?.let { "${device.displayName}: ${statusLabel(connection.status)} · $it" }
+        }
+        .distinct()
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White)
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("连接诊断", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        text = "只显示网络、设备和连接状态，不读取正文内容。",
+                        color = Color(0xFF667085),
+                        fontSize = 13.sp
+                    )
+                }
+                OutlinedButton(onClick = onRefresh) {
+                    Text("刷新")
+                }
+            }
+
+            DiagnosticRow("本机", identity.deviceName)
+            DiagnosticRow("设备 ID", shortIdentity(identity.deviceId))
+            DiagnosticRow("已保存 Mac", "${devices.size} 台")
+            DiagnosticRow("当前连接", "${connectedCount} 已连接 · ${reconnectingCount} 重连中")
+
+            val activeNetwork = diagnostics?.activeTransports?.joinToString(" + ").orEmpty()
+            DiagnosticRow("当前网络", activeNetwork.ifBlank { "未识别到活动网络" })
+            diagnostics?.let { snapshot ->
+                DiagnosticRow(
+                    "网络能力",
+                    buildString {
+                        append(if (snapshot.hasInternetCapability) "有 INTERNET 能力" else "缺少 INTERNET 能力")
+                        append(" · ")
+                        append(if (snapshot.isValidated) "系统已验证联网" else "系统未验证联网")
+                    }
+                )
+                if (snapshot.activeTransports.contains("VPN")) {
+                    Text(
+                        text = "检测到 VPN：如果同步或局域网发现失败，优先确认 VPN 是否接管了本地网络路由。",
+                        color = Color(0xFFE5484D),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                if (snapshot.localAddresses.isNotEmpty()) {
+                    Text("本机局域网地址", color = Color(0xFF98A2B3), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        snapshot.localAddresses.take(8).forEach { address ->
+                            DiagnosticChip("${address.interfaceName} ${address.hostAddress}")
+                        }
+                    }
+                }
+            } ?: Text("正在读取系统网络状态...", color = Color(0xFF98A2B3), fontSize = 13.sp)
+
+            if (devices.isNotEmpty()) {
+                Text("已保存连接", color = Color(0xFF98A2B3), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                devices.forEach { device ->
+                    val connection = controllers[device.id]?.connection ?: device.connection
+                    Column(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color(0xFFF8FAFC))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(CircleShape)
+                                    .background(statusColor(connection.status))
+                            )
+                            Text(
+                                text = device.displayName,
+                                modifier = Modifier
+                                    .padding(start = 8.dp)
+                                    .weight(1f),
+                                color = Color(0xFF111827),
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(statusLabel(connection.status), color = Color(0xFF667085), fontSize = 12.sp)
+                        }
+                        Text(
+                            text = "${device.host}:${device.port}",
+                            color = Color(0xFF667085),
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        connection.lastError?.takeIf { it.isNotBlank() }?.let { error ->
+                            Text(
+                                text = error,
+                                color = Color(0xFFE5484D),
+                                fontSize = 12.sp,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (recentErrors.isNotEmpty()) {
+                Text("最近错误", color = Color(0xFF98A2B3), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                recentErrors.take(4).forEach { error ->
+                    Text(error, color = Color(0xFFE5484D), fontSize = 12.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiagnosticRow(label: String, value: String) {
+    Row(verticalAlignment = Alignment.Top) {
+        Text(
+            text = label,
+            modifier = Modifier.width(86.dp),
+            color = Color(0xFF98A2B3),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            text = value,
+            modifier = Modifier.weight(1f),
+            color = Color(0xFF111827),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
+private fun DiagnosticChip(text: String) {
+    Text(
+        text = text,
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(Color(0xFFEFF4FA))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        color = Color(0xFF526174),
+        fontSize = 12.sp,
+        fontWeight = FontWeight.Bold,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
+    )
+}
+
+@Composable
 private fun DiscoveredDesktopCard(
     desktop: DiscoveredDesktop,
     pairing: Boolean,
@@ -1583,6 +1790,10 @@ private fun statusLabel(status: ConnectionStatus): String = when (status) {
     ConnectionStatus.Connecting -> "连接中..."
     ConnectionStatus.Disconnected -> "未连接"
     ConnectionStatus.Error -> "连接失败"
+}
+
+private fun shortIdentity(value: String): String {
+    return if (value.length <= 28) value else "${value.take(18)}...${value.takeLast(6)}"
 }
 
 private fun kindLabel(kind: String): String = when (kind) {
