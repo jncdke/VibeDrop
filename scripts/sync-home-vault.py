@@ -1925,8 +1925,43 @@ function deviceDisplayName(name, id) {
   return name || id || '未知设备';
 }
 
-function deviceFilterValue(name, id) {
-  return deviceDisplayName(name, id);
+function shortDeviceId(id) {
+  const text = String(id || '').trim();
+  if (!text) return '';
+  if (text.length <= 16) return text;
+  return `...${text.slice(-12)}`;
+}
+
+function historyDeviceIdentity(entry, role) {
+  if (role === 'sender') {
+    return {
+      id: entry.senderId || '',
+      name: entry.senderName || '',
+      host: '',
+    };
+  }
+  return {
+    id: entry.receiverId || entry.receiverServerId || '',
+    name: entry.receiverName || '',
+    host: entry.receiverHost || '',
+  };
+}
+
+function deviceFilterKey(identity) {
+  const id = String(identity.id || '').trim();
+  const name = String(identity.name || '').trim();
+  if (id) return `id:${id}`;
+  if (name) return `name:${name}`;
+  return 'unknown';
+}
+
+function deviceFilterLabel(identity, duplicateNames) {
+  const label = deviceDisplayName(identity.name, identity.id);
+  const id = String(identity.id || '').trim();
+  if (id && duplicateNames.has(label) && id !== label) {
+    return `${label} · ${shortDeviceId(id)}`;
+  }
+  return label;
 }
 
 function incrementCount(map, key) {
@@ -1937,31 +1972,48 @@ function optionLabel(label, count) {
   return `${label} (${count})`;
 }
 
-function compareByCountThenName(counts) {
+function compareByCountThenName(counts, labels = new Map()) {
   return (a, b) => {
     const countDiff = (counts.get(b) || 0) - (counts.get(a) || 0);
     if (countDiff !== 0) return countDiff;
-    return a.localeCompare(b, 'zh-CN');
+    return (labels.get(a) || a).localeCompare(labels.get(b) || b, 'zh-CN');
   };
 }
 
 function populateDeviceFilter(selectId, entries, role) {
   const select = document.getElementById(selectId);
   const counts = new Map();
+  const identities = new Map();
+  const nameIds = new Map();
   entries.forEach((entry) => {
-    const label = role === 'sender'
-      ? deviceFilterValue(entry.senderName, entry.senderId)
-      : deviceFilterValue(entry.receiverName, entry.receiverId);
-    if (label) {
-      incrementCount(counts, label);
+    const identity = historyDeviceIdentity(entry, role);
+    const key = deviceFilterKey(identity);
+    identities.set(key, identity);
+    incrementCount(counts, key);
+    const label = deviceDisplayName(identity.name, identity.id);
+    const id = String(identity.id || '').trim();
+    if (label && id) {
+      if (!nameIds.has(label)) nameIds.set(label, new Set());
+      nameIds.get(label).add(id);
     }
   });
+  const duplicateNames = new Set(
+    Array.from(nameIds.entries())
+      .filter(([, ids]) => ids.size > 1)
+      .map(([label]) => label)
+  );
+  const labels = new Map(
+    Array.from(counts.keys()).map((key) => [
+      key,
+      deviceFilterLabel(identities.get(key) || {}, duplicateNames),
+    ])
+  );
   const selected = select.value || 'all';
-  const options = ['all', ...Array.from(counts.keys()).sort(compareByCountThenName(counts))];
+  const options = ['all', ...Array.from(counts.keys()).sort(compareByCountThenName(counts, labels))];
   select.innerHTML = options.map((value) => {
     const label = value === 'all'
       ? optionLabel(role === 'sender' ? '全部发送端' : '全部接收端', entries.length)
-      : optionLabel(value, counts.get(value) || 0);
+      : optionLabel(labels.get(value) || value, counts.get(value) || 0);
     return `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`;
   }).join('');
   select.value = options.includes(selected) ? selected : 'all';
@@ -2045,9 +2097,9 @@ function entryMatches(entry, query, kind, senderFilter, receiverFilter) {
   ].filter(Boolean).join('\\n').toLowerCase();
   const queryOk = !query || haystack.includes(query);
   if (!queryOk) return false;
-  const senderOk = senderFilter === 'all' || deviceFilterValue(entry.senderName, entry.senderId) === senderFilter;
+  const senderOk = senderFilter === 'all' || deviceFilterKey(historyDeviceIdentity(entry, 'sender')) === senderFilter;
   if (!senderOk) return false;
-  const receiverOk = receiverFilter === 'all' || deviceFilterValue(entry.receiverName, entry.receiverId) === receiverFilter;
+  const receiverOk = receiverFilter === 'all' || deviceFilterKey(historyDeviceIdentity(entry, 'receiver')) === receiverFilter;
   if (!receiverOk) return false;
   return entryMatchesKind(entry, kind);
 }
