@@ -1881,7 +1881,7 @@ private fun HistoryCard(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 HistoryChip(kindLabel(entry.kind))
-                HistoryChip(entry.status)
+                HistoryChip(historyStatusLabel(entry.status))
                 entry.itemCount?.takeIf { it > 1 }?.let { HistoryChip("${it} 项") }
                 entry.senderName?.takeIf { it.isNotBlank() }?.let { HistoryChip(it) }
                 entry.receiverName?.takeIf { it.isNotBlank() }?.let { HistoryChip(it) }
