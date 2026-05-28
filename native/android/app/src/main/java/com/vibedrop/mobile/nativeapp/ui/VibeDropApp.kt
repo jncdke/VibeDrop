@@ -3218,6 +3218,16 @@ private data class HistoryIdentityContext(
     val desktops: List<DesktopDevice>
 )
 
+private data class HistoryEndpointIdentity(
+    val id: String?,
+    val name: String?,
+    val baseDeviceId: String?,
+    val role: String?,
+    val host: String?,
+    val ip: String?,
+    val port: Int?
+)
+
 private data class ResolvedHistoryEndpoint(
     val key: String,
     val label: String
@@ -3254,14 +3264,10 @@ private fun buildHistoryEndpointFilters(
 ): List<HistoryEndpointFilter> {
     val counts = linkedMapOf<String, Pair<String, Int>>()
     entries.forEach { record ->
-        val (id, name) = when (endpoint) {
-            HistoryEndpoint.Sender -> record.entry.senderDeviceId to record.entry.senderName
-            HistoryEndpoint.Receiver -> record.entry.receiverDeviceId to record.entry.receiverName
-        }
-        val label = name?.takeIf { it.isNotBlank() } ?: id?.takeIf { it.isNotBlank() } ?: ""
+        val identity = record.entry.historyEndpointIdentity(endpoint)
+        val label = identity.name?.takeIf { it.isNotBlank() } ?: identity.id?.takeIf { it.isNotBlank() } ?: ""
         val resolved = resolveHistoryEndpoint(
-            id = id,
-            name = name,
+            participant = identity,
             direction = record.entry.direction,
             endpoint = endpoint,
             identityContext = identityContext
@@ -3290,8 +3296,7 @@ private fun HistoryEntryWithItems.matchesSenderFilter(
     identityContext: HistoryIdentityContext
 ): Boolean {
     return resolveHistoryEndpoint(
-        id = entry.senderDeviceId,
-        name = entry.senderName,
+        participant = entry.historyEndpointIdentity(HistoryEndpoint.Sender),
         direction = entry.direction,
         endpoint = HistoryEndpoint.Sender,
         identityContext = identityContext
@@ -3303,8 +3308,7 @@ private fun HistoryEntryWithItems.matchesReceiverFilter(
     identityContext: HistoryIdentityContext
 ): Boolean {
     return resolveHistoryEndpoint(
-        id = entry.receiverDeviceId,
-        name = entry.receiverName,
+        participant = entry.historyEndpointIdentity(HistoryEndpoint.Receiver),
         direction = entry.direction,
         endpoint = HistoryEndpoint.Receiver,
         identityContext = identityContext
@@ -3312,13 +3316,12 @@ private fun HistoryEntryWithItems.matchesReceiverFilter(
 }
 
 private fun resolveHistoryEndpoint(
-    id: String?,
-    name: String?,
+    participant: HistoryEndpointIdentity,
     direction: String,
     endpoint: HistoryEndpoint,
     identityContext: HistoryIdentityContext
 ): ResolvedHistoryEndpoint {
-    val labels = listOfNotNull(id?.trim(), name?.trim()).filter { it.isNotBlank() }
+    val labels = participant.historyIdentityLabels()
     val fallback = labels.firstOrNull().orEmpty()
     val androidLabels = listOf(
         identityContext.android.deviceId,
@@ -3350,9 +3353,44 @@ private fun resolveHistoryEndpoint(
     }
 
     return ResolvedHistoryEndpoint(
-        key = historyParticipantFallbackKey(id, fallback),
-        label = name?.takeIf { it.isNotBlank() } ?: id.orEmpty()
+        key = historyParticipantFallbackKey(participant.id, fallback),
+        label = participant.name?.takeIf { it.isNotBlank() } ?: participant.id.orEmpty()
     )
+}
+
+private fun HistoryEntryEntity.historyEndpointIdentity(endpoint: HistoryEndpoint): HistoryEndpointIdentity {
+    return when (endpoint) {
+        HistoryEndpoint.Sender -> HistoryEndpointIdentity(
+            id = senderDeviceId,
+            name = senderName,
+            baseDeviceId = senderBaseDeviceId,
+            role = senderRole,
+            host = senderHost,
+            ip = senderIp,
+            port = senderPort
+        )
+        HistoryEndpoint.Receiver -> HistoryEndpointIdentity(
+            id = receiverDeviceId,
+            name = receiverName,
+            baseDeviceId = receiverBaseDeviceId,
+            role = receiverRole,
+            host = receiverHost,
+            ip = receiverIp,
+            port = receiverPort
+        )
+    }
+}
+
+private fun HistoryEndpointIdentity.historyIdentityLabels(): List<String> {
+    return listOfNotNull(
+        id,
+        name,
+        baseDeviceId,
+        role,
+        host,
+        ip,
+        port?.toString()
+    ).filter { it.isNotBlank() }
 }
 
 private fun shouldTreatAsCurrentAndroidSender(
@@ -3464,8 +3502,18 @@ private fun HistoryEntryWithItems.matchesQuery(query: String): Boolean {
         rootEntry.text,
         rootEntry.senderDeviceId,
         rootEntry.senderName,
+        rootEntry.senderBaseDeviceId,
+        rootEntry.senderRole,
+        rootEntry.senderHost,
+        rootEntry.senderIp,
+        rootEntry.senderPort?.toString(),
         rootEntry.receiverDeviceId,
         rootEntry.receiverName,
+        rootEntry.receiverBaseDeviceId,
+        rootEntry.receiverRole,
+        rootEntry.receiverHost,
+        rootEntry.receiverIp,
+        rootEntry.receiverPort?.toString(),
         rootEntry.kind,
         kindLabel(rootEntry.kind),
         rootEntry.status,

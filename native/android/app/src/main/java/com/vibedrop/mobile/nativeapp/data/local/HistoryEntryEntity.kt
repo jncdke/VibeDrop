@@ -9,7 +9,9 @@ import androidx.room.PrimaryKey
     indices = [
         Index(value = ["timestampMillis"]),
         Index(value = ["senderDeviceId"]),
+        Index(value = ["senderBaseDeviceId"]),
         Index(value = ["receiverDeviceId"]),
+        Index(value = ["receiverBaseDeviceId"]),
         Index(value = ["kind"]),
         Index(value = ["status"])
     ]
@@ -23,8 +25,18 @@ data class HistoryEntryEntity(
     val text: String?,
     val senderDeviceId: String?,
     val senderName: String?,
+    val senderBaseDeviceId: String? = null,
+    val senderRole: String? = null,
+    val senderHost: String? = null,
+    val senderIp: String? = null,
+    val senderPort: Int? = null,
     val receiverDeviceId: String?,
     val receiverName: String?,
+    val receiverBaseDeviceId: String? = null,
+    val receiverRole: String? = null,
+    val receiverHost: String? = null,
+    val receiverIp: String? = null,
+    val receiverPort: Int? = null,
     val sessionId: String?,
     val itemCount: Int?,
     val saveTarget: String?,

@@ -9,7 +9,7 @@ import androidx.room.RoomDatabase
         HistoryEntryEntity::class,
         HistoryItemEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class VibeDropDatabase : RoomDatabase() {

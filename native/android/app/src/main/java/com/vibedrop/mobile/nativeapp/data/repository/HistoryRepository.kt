@@ -84,8 +84,15 @@ class HistoryRepository(
             text = text,
             senderDeviceId = identity.deviceId,
             senderName = identity.deviceName,
+            senderBaseDeviceId = identity.baseDeviceId,
+            senderRole = "primary",
             receiverDeviceId = target.stableId,
             receiverName = target.displayName,
+            receiverBaseDeviceId = target.stableId,
+            receiverRole = "desktop",
+            receiverHost = target.host,
+            receiverIp = target.ip,
+            receiverPort = target.port,
             sessionId = null,
             itemCount = null,
             saveTarget = if (pressEnter) "type_enter" else "type",
@@ -119,8 +126,15 @@ class HistoryRepository(
             text = "[$label] $fileName",
             senderDeviceId = identity.deviceId,
             senderName = identity.deviceName,
+            senderBaseDeviceId = identity.baseDeviceId,
+            senderRole = "primary",
             receiverDeviceId = target.stableId,
             receiverName = target.displayName,
+            receiverBaseDeviceId = target.stableId,
+            receiverRole = "desktop",
+            receiverHost = target.host,
+            receiverIp = target.ip,
+            receiverPort = target.port,
             sessionId = transferId,
             itemCount = 1,
             saveTarget = saveTarget,
@@ -199,8 +213,15 @@ class HistoryRepository(
             text = summary.second,
             senderDeviceId = identity.deviceId,
             senderName = identity.deviceName,
+            senderBaseDeviceId = identity.baseDeviceId,
+            senderRole = "primary",
             receiverDeviceId = target.stableId,
             receiverName = target.displayName,
+            receiverBaseDeviceId = target.stableId,
+            receiverRole = "desktop",
+            receiverHost = target.host,
+            receiverIp = target.ip,
+            receiverPort = target.port,
             sessionId = sessionId,
             itemCount = items.size,
             saveTarget = saveTarget,
@@ -268,8 +289,15 @@ class HistoryRepository(
             text = payload.firstString("text").ifBlank { existing?.text ?: summary.second },
             senderDeviceId = source.stableId,
             senderName = source.displayName,
+            senderBaseDeviceId = source.stableId,
+            senderRole = "desktop",
+            senderHost = source.host,
+            senderIp = source.ip,
+            senderPort = source.port,
             receiverDeviceId = identity.deviceId,
             receiverName = identity.deviceName,
+            receiverBaseDeviceId = identity.baseDeviceId,
+            receiverRole = "primary",
             sessionId = sessionId,
             itemCount = payload.optIntOrNull("item_count") ?: payload.optIntOrNull("itemCount") ?: mergedItems.size.coerceAtLeast(1),
             saveTarget = payload.firstString("save_target", "saveTarget").ifBlank { existing?.saveTarget ?: "download" },
@@ -411,8 +439,15 @@ class HistoryRepository(
             text = "[$label] ${result.fileName}",
             senderDeviceId = source.stableId,
             senderName = source.displayName,
+            senderBaseDeviceId = source.stableId,
+            senderRole = "desktop",
+            senderHost = source.host,
+            senderIp = source.ip,
+            senderPort = source.port,
             receiverDeviceId = identity.deviceId,
             receiverName = identity.deviceName,
+            receiverBaseDeviceId = identity.baseDeviceId,
+            receiverRole = "primary",
             sessionId = null,
             itemCount = 1,
             saveTarget = result.saveTarget,
@@ -481,6 +516,10 @@ class HistoryRepository(
         val receiverName = firstString("receiverName", "targetAlias", "targetName", "targetDeviceName", "target")
         val receiverId = firstString("receiverDeviceId", "targetServerId", "targetId", "serverId", "target")
             .ifBlank { receiverName }
+        val senderDeviceId = firstString("senderDeviceId", "sourceDeviceId", "sender_device_id", "source_device_id")
+            .ifBlank { identity.deviceId }
+        val senderName = firstString("senderName", "sourceDeviceName", "sender_name", "source_device_name")
+            .ifBlank { identity.deviceName }
         return HistoryEntryEntity(
             id = id,
             timestampMillis = timestampMillis,
@@ -488,10 +527,24 @@ class HistoryRepository(
             kind = firstString("kind").ifBlank { "text" },
             status = firstString("status").ifBlank { "success" },
             text = firstString("text"),
-            senderDeviceId = firstString("senderDeviceId", "sourceDeviceId").ifBlank { identity.deviceId },
-            senderName = firstString("senderName", "sourceDeviceName").ifBlank { identity.deviceName },
+            senderDeviceId = senderDeviceId,
+            senderName = senderName,
+            senderBaseDeviceId = firstString("senderBaseDeviceId", "sourceBaseDeviceId", "sender_base_device_id", "source_base_device_id")
+                .ifBlank { if (senderDeviceId == identity.deviceId) identity.baseDeviceId else "" }
+                .takeIf { it.isNotBlank() },
+            senderRole = firstString("senderRole", "sourceRole", "sender_role", "source_role").takeIf { it.isNotBlank() },
+            senderHost = firstString("senderHost", "sourceHost", "sender_host", "source_host").takeIf { it.isNotBlank() },
+            senderIp = firstString("senderIp", "sourceIp", "sender_ip", "source_ip", "client_ip").takeIf { it.isNotBlank() },
+            senderPort = firstInt("senderPort", "sourcePort", "sender_port", "source_port"),
             receiverDeviceId = receiverId.takeIf { it.isNotBlank() },
             receiverName = receiverName.takeIf { it.isNotBlank() },
+            receiverBaseDeviceId = firstString("receiverBaseDeviceId", "targetBaseDeviceId", "receiver_base_device_id", "target_base_device_id")
+                .takeIf { it.isNotBlank() },
+            receiverRole = firstString("receiverRole", "targetRole", "receiver_role", "target_role").takeIf { it.isNotBlank() },
+            receiverHost = firstString("receiverHost", "targetHost", "receiver_host", "target_host", "targetDeviceName", "hostname")
+                .takeIf { it.isNotBlank() },
+            receiverIp = firstString("receiverIp", "targetIp", "receiver_ip", "target_ip").takeIf { it.isNotBlank() },
+            receiverPort = firstInt("receiverPort", "targetPort", "receiver_port", "target_port"),
             sessionId = firstString("sessionId", "session_id").takeIf { it.isNotBlank() },
             itemCount = optIntOrNull("itemCount") ?: optIntOrNull("item_count"),
             saveTarget = firstString("saveTarget", "save_target").takeIf { it.isNotBlank() },
@@ -568,6 +621,13 @@ class HistoryRepository(
 
     private fun JSONObject.optIntOrNull(key: String): Int? {
         return if (has(key) && !isNull(key)) optInt(key) else null
+    }
+
+    private fun JSONObject.firstInt(vararg keys: String): Int? {
+        for (key in keys) {
+            if (has(key) && !isNull(key)) return optInt(key)
+        }
+        return null
     }
 
     private fun JSONObject.optLongOrNull(key: String): Long? {
