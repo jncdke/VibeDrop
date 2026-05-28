@@ -422,11 +422,29 @@ fun VibeDropApp(container: AppContainer) {
                             Toast.makeText(context, "历史已清空", Toast.LENGTH_SHORT).show()
                         }
                     },
-                    onSaveDevice = { name, host, port, pin ->
+                    onDeleteDevice = { device ->
                         scope.launch(Dispatchers.IO) {
-                            container.deviceRepository.saveManualDesktop(name, host, port, pin)
+                            container.deviceRepository.deleteDesktop(device.id)
+                            container.diagnosticLogStore.append("device", "deleted", JSONObject().put("deviceId", device.id).put("name", device.displayName))
                             withContext(Dispatchers.Main) {
-                                Toast.makeText(context, "已保存 Mac：${name.ifBlank { host }}", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "已删除 Mac：${device.displayName}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    onSaveDevice = { deviceId, name, host, port, pin ->
+                        scope.launch(Dispatchers.IO) {
+                            val saved = if (deviceId == null) {
+                                container.deviceRepository.saveManualDesktop(name, host, port, pin)
+                            } else {
+                                container.deviceRepository.updateDesktop(deviceId, name, host, port, pin)
+                            }
+                            container.diagnosticLogStore.append(
+                                "device",
+                                if (deviceId == null) "saved" else "updated",
+                                JSONObject().put("deviceId", saved.id).put("name", saved.displayName)
+                            )
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, "已保存 Mac：${saved.displayName}", Toast.LENGTH_SHORT).show()
                                 selectedTab = 0
                             }
                         }
@@ -1673,13 +1691,16 @@ private fun SettingsScreen(
     onExportHistory: () -> Unit,
     onShareHistory: () -> Unit,
     onClearHistory: () -> Unit,
-    onSaveDevice: (name: String, host: String, port: Int, pin: String) -> Unit,
+    onDeleteDevice: (DesktopDevice) -> Unit,
+    onSaveDevice: (deviceId: String?, name: String, host: String, port: Int, pin: String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var name by rememberSaveable { mutableStateOf("MacBook") }
     var host by rememberSaveable { mutableStateOf("overlorddeMacBook-Air-4.local") }
     var portText by rememberSaveable { mutableStateOf("9001") }
     var pin by rememberSaveable { mutableStateOf("1234") }
+    var editingDeviceId by rememberSaveable { mutableStateOf<String?>(null) }
+    var deleteArmedDeviceId by rememberSaveable { mutableStateOf<String?>(null) }
     var clearArmed by rememberSaveable { mutableStateOf(false) }
     var networkDiagnostics by remember { mutableStateOf<AndroidNetworkDiagnosticsSnapshot?>(null) }
     var backgroundDiagnostics by remember { mutableStateOf<BackgroundRunDiagnosticsSnapshot?>(null) }
@@ -1733,12 +1754,34 @@ private fun SettingsScreen(
                 devices = devices,
                 controllers = controllers,
                 diagnostics = networkDiagnostics,
+                editingDeviceId = editingDeviceId,
+                deleteArmedDeviceId = deleteArmedDeviceId,
                 onRefresh = {
                     scope.launch {
                         networkDiagnostics = withContext(Dispatchers.IO) {
                             loadAndroidNetworkDiagnostics(context)
                         }
                     }
+                },
+                onEditDevice = { device ->
+                    editingDeviceId = device.id
+                    deleteArmedDeviceId = null
+                    name = device.displayName
+                    host = device.host
+                    portText = device.port.toString()
+                    pin = device.pin.orEmpty()
+                    Toast.makeText(context, "已载入 ${device.displayName}，到下面“编辑 Mac”保存修改", Toast.LENGTH_SHORT).show()
+                },
+                onArmDeleteDevice = { device ->
+                    deleteArmedDeviceId = device.id
+                    Toast.makeText(context, "再次点击确认删除 ${device.displayName}", Toast.LENGTH_SHORT).show()
+                },
+                onDeleteDevice = { device ->
+                    deleteArmedDeviceId = null
+                    if (editingDeviceId == device.id) {
+                        editingDeviceId = null
+                    }
+                    onDeleteDevice(device)
                 }
             )
         }
@@ -1972,7 +2015,27 @@ private fun SettingsScreen(
                     modifier = Modifier.padding(18.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Text("手动 Mac", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (editingDeviceId == null) "手动 Mac" else "编辑 Mac",
+                            modifier = Modifier.weight(1f),
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                        if (editingDeviceId != null) {
+                            OutlinedButton(
+                                onClick = {
+                                    editingDeviceId = null
+                                    name = "MacBook"
+                                    host = "overlorddeMacBook-Air-4.local"
+                                    portText = "9001"
+                                    pin = "1234"
+                                }
+                            ) {
+                                Text("取消编辑")
+                            }
+                        }
+                    }
                     OutlinedTextField(
                         value = name,
                         onValueChange = { name = it },
@@ -2004,13 +2067,14 @@ private fun SettingsScreen(
                                 Toast.makeText(context, "Host、端口和 PIN 都要填写", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
-                            onSaveDevice(name, host, port, pin)
+                            onSaveDevice(editingDeviceId, name, host, port, pin)
+                            editingDeviceId = null
                         },
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(54.dp)
                     ) {
-                        Text("保存 Mac", fontWeight = FontWeight.ExtraBold)
+                        Text(if (editingDeviceId == null) "保存 Mac" else "保存修改", fontWeight = FontWeight.ExtraBold)
                     }
                 }
             }
@@ -2201,7 +2265,12 @@ private fun ConnectionDiagnosticsCard(
     devices: List<DesktopDevice>,
     controllers: Map<String, DesktopConnectionController>,
     diagnostics: AndroidNetworkDiagnosticsSnapshot?,
-    onRefresh: () -> Unit
+    editingDeviceId: String?,
+    deleteArmedDeviceId: String?,
+    onRefresh: () -> Unit,
+    onEditDevice: (DesktopDevice) -> Unit,
+    onArmDeleteDevice: (DesktopDevice) -> Unit,
+    onDeleteDevice: (DesktopDevice) -> Unit
 ) {
     val connectedCount = controllers.values.count { it.connection.status == ConnectionStatus.Connected }
     val reconnectingCount = controllers.values.count { it.connection.status == ConnectionStatus.Connecting }
@@ -2319,6 +2388,36 @@ private fun ConnectionDiagnosticsCard(
                                 maxLines = 2,
                                 overflow = TextOverflow.Ellipsis
                             )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = { onEditDevice(device) },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    if (editingDeviceId == device.id) "编辑中" else "编辑",
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    if (deleteArmedDeviceId == device.id) {
+                                        onDeleteDevice(device)
+                                    } else {
+                                        onArmDeleteDevice(device)
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    if (deleteArmedDeviceId == device.id) "确认删除" else "删除",
+                                    color = Color(0xFFE5484D),
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                            }
                         }
                     }
                 }

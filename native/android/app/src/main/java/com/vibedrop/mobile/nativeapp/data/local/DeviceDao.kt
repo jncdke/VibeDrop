@@ -19,6 +19,9 @@ interface DeviceDao {
     @Query("SELECT * FROM devices WHERE host IS NOT NULL AND port IS NOT NULL AND pin IS NOT NULL AND pin != ''")
     suspend fun getClipboardSyncDevices(): List<DeviceEntity>
 
+    @Query("DELETE FROM devices WHERE id = :id")
+    suspend fun deleteById(id: String)
+
     @Upsert
     suspend fun upsert(device: DeviceEntity)
 }

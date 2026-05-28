@@ -48,6 +48,35 @@ class DeviceRepository(
         return entity.toDesktopDevice()!!
     }
 
+    suspend fun updateDesktop(
+        deviceId: String,
+        displayName: String,
+        host: String,
+        port: Int,
+        pin: String
+    ): DesktopDevice {
+        val existing = deviceDao.findById(deviceId)
+        if (existing == null) {
+            return saveManualDesktop(displayName, host, port, pin)
+        }
+        val cleanHost = host.trim()
+        val cleanName = displayName.trim().ifBlank { cleanHost }
+        val updated = existing.copy(
+            displayName = cleanName,
+            host = cleanHost,
+            ip = cleanHost.takeIf { it.matches(Regex("""\d{1,3}(\.\d{1,3}){3}""")) },
+            port = port,
+            pin = pin.trim(),
+            updatedAt = System.currentTimeMillis()
+        )
+        deviceDao.upsert(updated)
+        return updated.toDesktopDevice()!!
+    }
+
+    suspend fun deleteDesktop(deviceId: String) {
+        deviceDao.deleteById(deviceId)
+    }
+
     suspend fun savePairedDesktop(
         discovered: DiscoveredDesktop,
         status: PairStatus
