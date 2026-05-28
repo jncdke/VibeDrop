@@ -53,6 +53,13 @@ final class MacConnectedClientRegistry: @unchecked Sendable {
         return values
     }
 
+    func hasFileReceiver() -> Bool {
+        lock.lock()
+        let hasReceiver = clients.values.contains { $0.peer.canReceiveFiles }
+        lock.unlock()
+        return hasReceiver
+    }
+
     func send(data: Data, toSessionId sessionId: UInt64) throws {
         lock.lock()
         let channel = clients[sessionId]?.channel

@@ -10,12 +10,18 @@ final class VibeDropHTTPHandler: ChannelInboundHandler, RemovableChannelHandler 
 
     private let configuration: MacServerConfiguration
     private let pairManager: PairRequestManager
+    private let connectedClients: MacConnectedClientRegistry
     private var requestHead: HTTPRequestHead?
     private var requestBody: ByteBuffer?
 
-    init(configuration: MacServerConfiguration, pairManager: PairRequestManager) {
+    init(
+        configuration: MacServerConfiguration,
+        pairManager: PairRequestManager,
+        connectedClients: MacConnectedClientRegistry
+    ) {
         self.configuration = configuration
         self.pairManager = pairManager
+        self.connectedClients = connectedClients
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -81,15 +87,24 @@ final class VibeDropHTTPHandler: ChannelInboundHandler, RemovableChannelHandler 
 
     private func handleShareExtensionPaths(context: ChannelHandlerContext) {
         do {
+            guard Self.isLoopbackRequest(context: context) else {
+                sendJSON(context: context, status: .forbidden, payload: ["error": "仅允许本机共享扩展调用"])
+                return
+            }
             var body = requestBody ?? context.channel.allocator.buffer(capacity: 0)
             let bytes = body.readBytes(length: body.readableBytes) ?? []
             let data = Data(bytes)
             let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             let paths = (object?["paths"] as? [String])?
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty } ?? []
+                .filter { !$0.isEmpty }
+                .filter { FileManager.default.fileExists(atPath: $0) } ?? []
             guard !paths.isEmpty else {
-                sendJSON(context: context, status: .badRequest, payload: ["error": "no_paths"])
+                sendJSON(context: context, status: .badRequest, payload: ["error": "没有可发送的文件或文件夹"])
+                return
+            }
+            guard connectedClients.hasFileReceiver() else {
+                sendJSON(context: context, status: .conflict, payload: ["error": "当前没有支持接收文件的手机在线设备"])
                 return
             }
             let source = (object?["source"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -125,6 +140,19 @@ final class VibeDropHTTPHandler: ChannelInboundHandler, RemovableChannelHandler 
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: requestURL, options: .atomic)
         return requestURL
+    }
+
+    private static func isLoopbackRequest(context: ChannelHandlerContext) -> Bool {
+        guard let ipAddress = context.channel.remoteAddress?.ipAddress else {
+            return false
+        }
+        if ipAddress == "::1" || ipAddress == "0:0:0:0:0:0:0:1" {
+            return true
+        }
+        if ipAddress == "127.0.0.1" || ipAddress == "::ffff:127.0.0.1" {
+            return true
+        }
+        return ipAddress.hasPrefix("127.")
     }
 
     private func sendEncodable<T: Encodable>(

@@ -90,7 +90,8 @@ public final class VibeDropMacServer: @unchecked Sendable {
                     channel.pipeline.addHandler(
                         VibeDropHTTPHandler(
                             configuration: configuration,
-                            pairManager: pairManager
+                            pairManager: pairManager,
+                            connectedClients: connectedClients
                         ),
                         name: VibeDropHTTPHandler.handlerName
                     )

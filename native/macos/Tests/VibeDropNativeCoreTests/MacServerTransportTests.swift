@@ -4,6 +4,41 @@ import VibeDropNativeCore
 @testable import VibeDropMacServer
 
 final class MacServerTransportTests: XCTestCase {
+    func testShareExtensionPathRequestRequiresConnectedFileReceiver() async throws {
+        let configuration = MacServerConfiguration(
+            serverId: "desktop_share_test",
+            pin: "2468",
+            hostname: "share-test.local",
+            ip: "127.0.0.1",
+            port: 0
+        )
+        let server = VibeDropMacServer(configuration: configuration, threadCount: 1)
+        try server.start(host: "127.0.0.1", enableUDPDiscovery: false)
+        defer { try? server.stop() }
+
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vibedrop-share-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let sharedFileURL = temporaryDirectory.appendingPathComponent("demo.txt")
+        try Data("demo".utf8).write(to: sharedFileURL)
+
+        let port = try XCTUnwrap(server.boundPort)
+        let shareURL = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/share-extension/paths"))
+        var request = URLRequest(url: shareURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "paths": [sharedFileURL.path],
+            "source": "finder-share-extension"
+        ])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 409)
+        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertEqual(object?["error"] as? String, "当前没有支持接收文件的手机在线设备")
+    }
+
     func testHTTPDiscoverAndWebSocketAuthPingOverLocalhost() async throws {
         let configuration = MacServerConfiguration(
             serverId: "desktop_transport_test",
