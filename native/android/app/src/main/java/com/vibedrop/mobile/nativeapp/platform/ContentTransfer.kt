@@ -17,7 +17,9 @@ data class ContentTransferResult(
     val sizeBytes: Long,
     val sourceUri: String?,
     val transferId: String?,
-    val savedPath: String? = null
+    val savedPath: String? = null,
+    val status: String = "success",
+    val error: String? = null
 )
 
 enum class ContentTransferStage {
@@ -73,7 +75,7 @@ suspend fun sendUriToDesktopInbox(
     controller: DesktopConnectionController,
     onProgress: (ContentTransferProgress) -> Unit = {}
 ): ContentTransferResult {
-    val meta = context.queryContentMeta(uri, fallbackName = "file.bin")
+    val meta = queryContentTransferMeta(context, uri)
     if (meta.sizeBytes <= 0L) {
         throw IllegalStateException("无法识别文件大小")
     }
@@ -150,6 +152,34 @@ suspend fun sendUriToDesktopInbox(
         controller.cancelIncomingFileAck(transferId)
         throw error
     }
+}
+
+fun queryContentTransferMeta(
+    context: Context,
+    uri: Uri,
+    fallbackName: String = "file.bin"
+): ContentTransferResult = context.queryContentMeta(uri, fallbackName)
+
+fun failedContentTransferResult(
+    context: Context,
+    uri: Uri,
+    error: Throwable,
+    fallbackName: String = "file.bin"
+): ContentTransferResult {
+    return runCatching { queryContentTransferMeta(context, uri, fallbackName) }
+        .getOrElse {
+            ContentTransferResult(
+                fileName = fallbackName,
+                mimeType = "application/octet-stream",
+                sizeBytes = -1L,
+                sourceUri = uri.toString(),
+                transferId = null
+            )
+        }
+        .copy(
+            status = "failed",
+            error = error.message ?: error.javaClass.simpleName
+        )
 }
 
 private fun Context.queryContentMeta(

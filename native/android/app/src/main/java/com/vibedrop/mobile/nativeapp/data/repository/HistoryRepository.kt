@@ -103,7 +103,8 @@ class HistoryRepository(
         transferId: String?,
         savedPath: String?,
         saveTarget: String,
-        status: String = "success"
+        status: String = "success",
+        error: String? = null
     ) {
         val kind = kindFromMime(mimeType)
         val label = kindLabel(kind)
@@ -138,7 +139,7 @@ class HistoryRepository(
             thumbnailPath = null,
             thumbnailDataUrl = null,
             status = status,
-            error = null
+            error = error
         )
         historyDao.upsertEntry(entry)
         historyDao.upsertItems(listOf(item))
@@ -147,8 +148,7 @@ class HistoryRepository(
     suspend fun recordSentContentBatch(
         target: DesktopDevice,
         results: List<ContentTransferResult>,
-        saveTarget: String,
-        status: String = "success"
+        saveTarget: String
     ) {
         val normalizedResults = results.filter { it.fileName.isNotBlank() }
         if (normalizedResults.isEmpty()) return
@@ -163,7 +163,8 @@ class HistoryRepository(
                 transferId = item.transferId,
                 savedPath = item.savedPath,
                 saveTarget = saveTarget,
-                status = status
+                status = item.status,
+                error = item.error
             )
             return
         }
@@ -184,8 +185,8 @@ class HistoryRepository(
                 savedPath = result.savedPath,
                 thumbnailPath = null,
                 thumbnailDataUrl = null,
-                status = status,
-                error = null
+                status = result.status,
+                error = result.error
             )
         }
         val summary = historyItemsSummary(items)

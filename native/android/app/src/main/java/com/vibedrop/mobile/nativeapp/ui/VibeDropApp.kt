@@ -85,6 +85,7 @@ import com.vibedrop.mobile.nativeapp.platform.ContentTransferStage
 import com.vibedrop.mobile.nativeapp.platform.DiagnosticLogEvent
 import com.vibedrop.mobile.nativeapp.platform.DiagnosticLogStore
 import com.vibedrop.mobile.nativeapp.platform.MediaOpenMode
+import com.vibedrop.mobile.nativeapp.platform.failedContentTransferResult
 import com.vibedrop.mobile.nativeapp.platform.loadAndroidNetworkDiagnostics
 import com.vibedrop.mobile.nativeapp.platform.loadBackgroundRunDiagnostics
 import com.vibedrop.mobile.nativeapp.platform.openAppNotificationSettings
@@ -244,7 +245,9 @@ fun VibeDropApp(container: AppContainer) {
                                 sourceUri = result.sourceUri,
                                 transferId = result.transferId,
                                 savedPath = result.savedPath,
-                                saveTarget = saveTarget
+                                saveTarget = saveTarget,
+                                status = result.status,
+                                error = result.error
                             )
                         }
                     },
@@ -564,29 +567,28 @@ private fun SendScreen(
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     uris.mapIndexed { index, uri ->
-                        sendUriToDesktopInbox(context, uri, controller) { progress ->
-                            val label = transferProgressLabel(progress, index, uris.size)
-                            scope.launch(Dispatchers.Main) {
-                                fileActionLabels[deviceId] = label
+                        runCatching {
+                            sendUriToDesktopInbox(context, uri, controller) { progress ->
+                                val label = transferProgressLabel(progress, index, uris.size)
+                                scope.launch(Dispatchers.Main) {
+                                    fileActionLabels[deviceId] = label
+                                }
                             }
+                        }.getOrElse { error ->
+                            failedContentTransferResult(context, uri, error)
                         }
                     }
                 }
             }
             result
                 .onSuccess { sentItems ->
-                    fileActionLabels[deviceId] = "✓"
+                    fileActionLabels[deviceId] = transferCompletionLabel(sentItems)
                     if (sentItems.size == 1) {
                         onRecordSentContent(device, sentItems.first(), "inbox")
                     } else {
                         onRecordSentContentBatch(device, sentItems, "inbox")
                     }
-                    val message = if (sentItems.size == 1) {
-                        "已发送到 Mac 收件箱：${sentItems.first().fileName}"
-                    } else {
-                        "已发送 ${sentItems.size} 个文件到 Mac 收件箱"
-                    }
-                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, transferSummaryMessage(sentItems), Toast.LENGTH_SHORT).show()
                 }
                 .onFailure {
                     fileActionLabels[deviceId] = "✗"
@@ -732,25 +734,34 @@ private fun SharedPayloadCard(
                             val result = runCatching {
                                 withContext(Dispatchers.IO) {
                                     payload.uris.mapIndexed { index, uri ->
-                                        sendUriToDesktopInbox(context, uri, controller) { progress ->
-                                            val label = transferProgressLabel(progress, index, payload.uris.size)
-                                            scope.launch(Dispatchers.Main) {
-                                                transferLabel = label
+                                        runCatching {
+                                            sendUriToDesktopInbox(context, uri, controller) { progress ->
+                                                val label = transferProgressLabel(progress, index, payload.uris.size)
+                                                scope.launch(Dispatchers.Main) {
+                                                    transferLabel = label
+                                                }
                                             }
+                                        }.getOrElse { error ->
+                                            failedContentTransferResult(context, uri, error)
                                         }
                                     }
                                 }
                             }
                             result
                                 .onSuccess { sentItems ->
-                                    transferLabel = "✓"
+                                    transferLabel = transferCompletionLabel(sentItems)
                                     if (sentItems.size == 1) {
                                         onRecordSentContent(device, sentItems.first(), "inbox")
                                     } else {
                                         onRecordSentContentBatch(device, sentItems, "inbox")
                                     }
-                                    Toast.makeText(context, "分享文件已发送到 ${device.displayName}", Toast.LENGTH_SHORT).show()
-                                    onDismiss()
+                                    Toast.makeText(context, transferSummaryMessage(sentItems), Toast.LENGTH_SHORT).show()
+                                    if (sentItems.any { it.status == "success" }) {
+                                        onDismiss()
+                                    } else {
+                                        delay(900)
+                                        transferLabel = null
+                                    }
                                 }
                                 .onFailure {
                                     transferLabel = "✗"
@@ -957,6 +968,34 @@ private fun transferProgressLabel(
         ContentTransferStage.Saving -> "${prefix}保存中"
         ContentTransferStage.Finished -> "${prefix}100%"
         ContentTransferStage.Sending -> "${prefix}${progress.progressPercent}%"
+    }
+}
+
+private fun transferCompletionLabel(items: List<ContentTransferResult>): String {
+    val successCount = items.count { it.status == "success" }
+    val failedCount = items.size - successCount
+    return when {
+        failedCount == 0 -> "✓"
+        successCount == 0 -> "✗"
+        else -> "$successCount/${items.size}"
+    }
+}
+
+private fun transferSummaryMessage(items: List<ContentTransferResult>): String {
+    val successCount = items.count { it.status == "success" }
+    val failedCount = items.size - successCount
+    if (items.size == 1) {
+        val item = items.first()
+        return if (item.status == "success") {
+            "已发送到 Mac 收件箱：${item.fileName}"
+        } else {
+            "文件发送失败：${item.error ?: "未知错误"}"
+        }
+    }
+    return when {
+        failedCount == 0 -> "已发送 ${items.size} 个文件到 Mac 收件箱"
+        successCount == 0 -> "${items.size} 个文件发送失败"
+        else -> "已发送 $successCount 项，失败 $failedCount 项"
     }
 }
 
