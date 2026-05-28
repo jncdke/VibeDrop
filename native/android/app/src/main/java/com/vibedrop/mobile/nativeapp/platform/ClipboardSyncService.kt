@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
 import androidx.room.Room
 import com.vibedrop.mobile.nativeapp.MainActivity
 import com.vibedrop.mobile.nativeapp.data.local.DeviceEntity
@@ -44,6 +45,8 @@ class ClipboardSyncService : Service() {
 
     private lateinit var database: VibeDropDatabase
     private lateinit var identity: AndroidDeviceIdentity
+    private var lastAppliedClipboardText: String? = null
+    private var lastAppliedClipboardAt = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -95,9 +98,22 @@ class ClipboardSyncService : Service() {
 
     private fun applyClipboard(text: String) {
         if (text.isBlank()) return
+        val now = System.currentTimeMillis()
+        if (lastAppliedClipboardText == text && now - lastAppliedClipboardAt < 1200L) return
+        lastAppliedClipboardText = text
+        lastAppliedClipboardAt = now
         mainHandler.post {
-            val manager = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            manager?.setPrimaryClip(ClipData.newPlainText("VibeDrop", text))
+            runCatching {
+                val manager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                manager.setPrimaryClip(ClipData.newPlainText("VibeDrop", text))
+            }.onFailure { error ->
+                Log.w(TAG, "后台直接写剪贴板失败，尝试透明 Activity", error)
+                runCatching {
+                    ClipboardFloatingActivity.launchWrite(applicationContext, text)
+                }.onFailure { fallbackError ->
+                    Log.e(TAG, "透明 Activity 写剪贴板也失败", fallbackError)
+                }
+            }
         }
     }
 
@@ -203,6 +219,7 @@ class ClipboardSyncService : Service() {
         private const val CHANNEL_ID = "vibedrop_native_clipboard_sync"
         private const val NOTIFICATION_ID = 1001
         private const val ACTION_REFRESH = "com.vibedrop.mobile.nativeapp.action.REFRESH_CLIPBOARD_SYNC"
+        private const val TAG = "VibeDrop.ClipboardSync"
 
         fun start(context: Context) {
             val intent = Intent(context, ClipboardSyncService::class.java).apply {
