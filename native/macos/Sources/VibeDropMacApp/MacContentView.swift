@@ -452,17 +452,23 @@ private struct HistoryView: View {
             let haystack = [
                 entry.text,
                 entry.kind,
+                kindLabel(entry.kind),
                 entry.status,
+                statusLabel(entry.status),
+                entry.sender?.deviceId,
                 entry.sender?.displayName,
+                entry.receiver?.deviceId,
                 entry.receiver?.displayName,
                 entry.items.map {
                     [
+                        $0.kind,
+                        kindLabel($0.kind),
                         $0.fileName,
                         $0.mimeType,
                         $0.status,
+                        statusLabel($0.status ?? ""),
                         $0.localPath,
-                        $0.savedPath,
-                        kindLabel($0.kind)
+                        $0.savedPath
                     ].compactMap { $0 }.joined(separator: " ")
                 }.joined(separator: " ")
             ].compactMap { $0 }.joined(separator: " ").lowercased()

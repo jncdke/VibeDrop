@@ -2891,18 +2891,25 @@ private fun HistoryEntryWithItems.matchesQuery(query: String): Boolean {
             item.fileName,
             item.mimeType,
             item.status,
+            historyStatusLabel(item.status),
+            itemStatusLabel(item.status),
             item.localPath,
             item.savedPath,
             item.thumbnailPath,
+            item.kind,
             kindLabel(item.kind)
         ).joinToString(" ")
     }
     val haystack = listOfNotNull(
         rootEntry.text,
+        rootEntry.senderDeviceId,
         rootEntry.senderName,
+        rootEntry.receiverDeviceId,
         rootEntry.receiverName,
+        rootEntry.kind,
         kindLabel(rootEntry.kind),
         rootEntry.status,
+        historyStatusLabel(rootEntry.status),
         rootEntry.saveTarget,
         rootEntry.direction,
         itemText
@@ -3168,4 +3175,9 @@ private fun itemStatusLabel(status: String?): String = when (status) {
     "partial" -> "部分完成"
     "pending" -> "接收中"
     else -> status.orEmpty().ifBlank { "未知状态" }
+}
+
+private fun historyStatusLabel(status: String?): String {
+    return historyStatusFilters.firstOrNull { it.status == status }?.label
+        ?: itemStatusLabel(status)
 }
