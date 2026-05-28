@@ -59,12 +59,14 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vibedrop.mobile.nativeapp.IncomingSharePayload
 import com.vibedrop.mobile.nativeapp.MainActivity
+import com.vibedrop.mobile.nativeapp.R
 import com.vibedrop.mobile.nativeapp.core.model.ConnectionSnapshot
 import com.vibedrop.mobile.nativeapp.core.model.ConnectionStatus
 import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
@@ -476,7 +478,12 @@ private fun Header(onSettings: () -> Unit) {
                 .background(Color(0xFF4E3F72)),
             contentAlignment = Alignment.Center
         ) {
-            Text("V", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Image(
+                painter = painterResource(id = R.drawable.vibedrop_mark),
+                contentDescription = "VibeDrop",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
         }
         Text(
             text = "VibeDrop",

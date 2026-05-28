@@ -36,10 +36,8 @@ struct MacContentView: View {
 
     private var header: some View {
         HStack(spacing: 14) {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color(red: 0.31, green: 0.25, blue: 0.43))
+            VibeDropBrandMark()
                 .frame(width: 42, height: 42)
-                .overlay(Image(systemName: "drop.fill").font(.system(size: 21)).foregroundColor(.white))
             VStack(alignment: .leading, spacing: 2) {
                 Text("VibeDrop")
                     .font(.system(size: 34, weight: .black))
@@ -56,6 +54,32 @@ struct MacContentView: View {
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 22)
+    }
+}
+
+private struct VibeDropBrandMark: View {
+    private let image: NSImage? = {
+        guard let url = Bundle.module.url(forResource: "VibeDropMark", withExtension: "png") else {
+            return nil
+        }
+        return NSImage(contentsOf: url)
+    }()
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(red: 0.31, green: 0.25, blue: 0.43))
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: "drop.fill")
+                    .font(.system(size: 21))
+                    .foregroundColor(.white)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 }
 

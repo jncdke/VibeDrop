@@ -78,6 +78,9 @@ let package = Package(
                 "VibeDropMacServer",
                 "VibeDropMacStorage",
                 "VibeDropNativeCore"
+            ],
+            resources: [
+                .process("Resources")
             ]
         ),
         .testTarget(
