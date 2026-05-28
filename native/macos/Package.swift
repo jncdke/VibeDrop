@@ -20,6 +20,10 @@ let package = Package(
             name: "VibeDropMacServer",
             targets: ["VibeDropMacServer"]
         ),
+        .library(
+            name: "VibeDropMacRuntime",
+            targets: ["VibeDropMacRuntime"]
+        ),
         .executable(
             name: "VibeDropMacServerPreview",
             targets: ["VibeDropMacServerPreview"]
@@ -48,16 +52,28 @@ let package = Package(
                 .product(name: "NIOWebSocket", package: "swift-nio")
             ]
         ),
+        .target(
+            name: "VibeDropMacRuntime",
+            dependencies: [
+                "VibeDropNativeCore",
+                "VibeDropMacServer",
+                "VibeDropMacStorage"
+            ]
+        ),
         .executableTarget(
             name: "VibeDropMacServerPreview",
-            dependencies: ["VibeDropMacServer"]
+            dependencies: [
+                "VibeDropMacRuntime",
+                "VibeDropMacServer"
+            ]
         ),
         .testTarget(
             name: "VibeDropNativeCoreTests",
             dependencies: [
                 "VibeDropNativeCore",
                 "VibeDropMacStorage",
-                "VibeDropMacServer"
+                "VibeDropMacServer",
+                "VibeDropMacRuntime"
             ]
         )
     ]
