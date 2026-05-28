@@ -15,6 +15,10 @@ let package = Package(
         .library(
             name: "VibeDropMacStorage",
             targets: ["VibeDropMacStorage"]
+        ),
+        .library(
+            name: "VibeDropMacServer",
+            targets: ["VibeDropMacServer"]
         )
     ],
     dependencies: [
@@ -29,11 +33,16 @@ let package = Package(
                 .product(name: "GRDB", package: "GRDB.swift")
             ]
         ),
+        .target(
+            name: "VibeDropMacServer",
+            dependencies: ["VibeDropNativeCore"]
+        ),
         .testTarget(
             name: "VibeDropNativeCoreTests",
             dependencies: [
                 "VibeDropNativeCore",
-                "VibeDropMacStorage"
+                "VibeDropMacStorage",
+                "VibeDropMacServer"
             ]
         )
     ]
