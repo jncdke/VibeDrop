@@ -20,7 +20,7 @@ data class ContentTransferResult(
     val savedPath: String? = null
 )
 
-fun sendImageUriToMacClipboard(
+suspend fun sendImageUriToMacClipboard(
     context: Context,
     uri: Uri,
     controller: DesktopConnectionController
@@ -43,12 +43,11 @@ fun sendImageUriToMacClipboard(
     } ?: throw IllegalStateException("无法读取图片")
 
     val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-    val sent = controller.sendImageClipboard(
+    controller.sendImageClipboard(
         fileName = meta.fileName,
         mimeType = meta.mimeType.ifBlank { "image/*" },
         imageBase64 = base64
     )
-    if (!sent) throw IllegalStateException("连接不可用")
     return meta.copy(
         sizeBytes = bytes.size.toLong(),
         sourceUri = uri.toString()

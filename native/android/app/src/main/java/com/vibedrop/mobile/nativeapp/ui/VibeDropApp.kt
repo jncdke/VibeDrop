@@ -601,16 +601,32 @@ private fun SendScreen(
                         Toast.makeText(context, "输入框和剪贴板都没有可发送文字", Toast.LENGTH_SHORT).show()
                         return@SendDeviceCard
                     }
-                    if (controller.sendText(text, pressEnter)) {
-                        drafts[device.id] = ""
-                        onRecordSentText(device, text, pressEnter)
-                    } else {
-                        Toast.makeText(context, "发送失败：连接不可用", Toast.LENGTH_SHORT).show()
+                    scope.launch {
+                        val result = runCatching {
+                            withContext(Dispatchers.IO) {
+                                controller.sendText(text, pressEnter)
+                            }
+                        }
+                        result
+                            .onSuccess {
+                                drafts[device.id] = ""
+                                onRecordSentText(device, text, pressEnter)
+                            }
+                            .onFailure {
+                                Toast.makeText(context, "发送失败：${it.message ?: "连接不可用"}", Toast.LENGTH_SHORT).show()
+                            }
                     }
                 },
                 onEnter = {
-                    if (!controller.sendEnter()) {
-                        Toast.makeText(context, "回车失败：连接不可用", Toast.LENGTH_SHORT).show()
+                    scope.launch {
+                        val result = runCatching {
+                            withContext(Dispatchers.IO) {
+                                controller.sendEnter()
+                            }
+                        }
+                        result.onFailure {
+                            Toast.makeText(context, "回车失败：${it.message ?: "连接不可用"}", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 },
                 onPickImage = {

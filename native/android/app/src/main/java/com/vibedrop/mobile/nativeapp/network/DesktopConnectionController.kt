@@ -24,6 +24,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
 import kotlin.math.min
+import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -52,6 +53,8 @@ class DesktopConnectionController(
     private var reconnectAttempt = 0
     private var reconnectRunnable: Runnable? = null
     private val pendingIncomingFileAcks = ConcurrentHashMap<String, CompletableDeferred<IncomingFileAck>>()
+    private val commandAckLock = Any()
+    private val pendingCommandAcks = ArrayDeque<CompletableDeferred<Unit>>()
 
     var connection by mutableStateOf(device.connection)
         private set
@@ -138,27 +141,38 @@ class DesktopConnectionController(
         )
     }
 
-    fun sendText(text: String, pressEnter: Boolean): Boolean {
-        if (!connection.canSend) return false
+    suspend fun sendText(text: String, pressEnter: Boolean) {
+        if (!connection.canSend) throw IllegalStateException("连接不可用")
         val action = if (pressEnter) VibeDropActions.TypeEnter else VibeDropActions.Type
+        val ack = trackCommandAck()
         val accepted = socket?.send(TextPayload(action, text).toJson().toString()) == true
         log("send_text", endpointDetail().put("action", action).put("length", text.length).put("accepted", accepted))
-        return accepted
+        if (!accepted) {
+            cancelCommandAck(ack)
+            throw IllegalStateException("发送入队失败")
+        }
+        awaitCommandAck(ack)
     }
 
-    fun sendEnter(): Boolean {
-        if (!connection.canSend) return false
+    suspend fun sendEnter() {
+        if (!connection.canSend) throw IllegalStateException("连接不可用")
+        val ack = trackCommandAck()
         val accepted = socket?.send(JSONObject().put("action", VibeDropActions.Enter).toString()) == true
         log("send_enter", endpointDetail().put("accepted", accepted))
-        return accepted
+        if (!accepted) {
+            cancelCommandAck(ack)
+            throw IllegalStateException("发送入队失败")
+        }
+        awaitCommandAck(ack)
     }
 
-    fun sendImageClipboard(
+    suspend fun sendImageClipboard(
         fileName: String,
         mimeType: String,
         imageBase64: String
-    ): Boolean {
-        if (!connection.canSend) return false
+    ) {
+        if (!connection.canSend) throw IllegalStateException("连接不可用")
+        val ack = trackCommandAck()
         val accepted = socket?.send(
             JSONObject()
                 .put("action", VibeDropActions.ImageClipboard)
@@ -168,7 +182,11 @@ class DesktopConnectionController(
                 .toString()
         ) == true
         log("send_image_clipboard", endpointDetail().put("fileName", fileName).put("mimeType", mimeType).put("accepted", accepted))
-        return accepted
+        if (!accepted) {
+            cancelCommandAck(ack)
+            throw IllegalStateException("发送入队失败")
+        }
+        awaitCommandAck(ack)
     }
 
     fun sendIncomingFileStart(
@@ -242,6 +260,45 @@ class DesktopConnectionController(
         pendingIncomingFileAcks.remove(transferId)?.cancel()
     }
 
+    private fun trackCommandAck(): CompletableDeferred<Unit> {
+        val deferred = CompletableDeferred<Unit>()
+        synchronized(commandAckLock) {
+            pendingCommandAcks.addLast(deferred)
+        }
+        return deferred
+    }
+
+    private suspend fun awaitCommandAck(
+        deferred: CompletableDeferred<Unit>,
+        timeoutMillis: Long = 10_000L
+    ) {
+        try {
+            withTimeout(timeoutMillis) {
+                deferred.await()
+            }
+        } finally {
+            cancelCommandAck(deferred)
+        }
+    }
+
+    private fun cancelCommandAck(deferred: CompletableDeferred<Unit>) {
+        synchronized(commandAckLock) {
+            pendingCommandAcks.remove(deferred)
+        }
+    }
+
+    private fun completeNextCommandAck(error: String? = null): Boolean {
+        val deferred = synchronized(commandAckLock) {
+            if (pendingCommandAcks.isEmpty()) null else pendingCommandAcks.removeFirst()
+        } ?: return false
+        if (error == null) {
+            deferred.complete(Unit)
+        } else {
+            deferred.completeExceptionally(IllegalStateException(error))
+        }
+        return true
+    }
+
     suspend fun waitForOutboundQueueBelow(
         maxQueuedBytes: Long = 2L * 1024L * 1024L,
         timeoutMillis: Long = 30_000L
@@ -261,6 +318,7 @@ class DesktopConnectionController(
         connectionToken += 1
         cancelScheduledReconnect()
         failPendingIncomingFileAcks("连接已关闭")
+        failPendingCommandAcks("连接已关闭")
         socket?.close(1000, "dispose")
         socket = null
         update(ConnectionSnapshot(ConnectionStatus.Disconnected))
@@ -272,19 +330,25 @@ class DesktopConnectionController(
         val action = objectValue.optString("action")
         when {
             status == "ok" -> {
-                reconnectAttempt = 0
-                log("auth_ok", endpointDetail())
-                update(ConnectionSnapshot(ConnectionStatus.Connected))
+                if (completeNextCommandAck()) {
+                    log("command_ok", endpointDetail())
+                } else {
+                    reconnectAttempt = 0
+                    log("auth_ok", endpointDetail())
+                    update(ConnectionSnapshot(ConnectionStatus.Connected))
+                }
             }
             status == "error" -> {
                 val error = objectValue.optString("error", "认证或发送失败")
                 log("server_error", endpointDetail().put("error", error))
-                update(
-                    ConnectionSnapshot(
-                        ConnectionStatus.Error,
-                        error
+                if (!completeNextCommandAck(error)) {
+                    update(
+                        ConnectionSnapshot(
+                            ConnectionStatus.Error,
+                            error
+                        )
                     )
-                )
+                }
             }
             action == VibeDropActions.Pong -> Unit
             action == VibeDropActions.IncomingHistorySessionStart -> onIncomingHistorySession(objectValue.toString())
@@ -356,6 +420,7 @@ class DesktopConnectionController(
             return
         }
         failPendingIncomingFileAcks(reason)
+        failPendingCommandAcks(reason)
         reconnectAttempt += 1
         val delayMillis = reconnectDelayMillis(reconnectAttempt)
         log(
@@ -393,6 +458,18 @@ class DesktopConnectionController(
             deferred.completeExceptionally(error)
         }
         pendingIncomingFileAcks.clear()
+    }
+
+    private fun failPendingCommandAcks(reason: String) {
+        val error = IllegalStateException(reason)
+        val pending = synchronized(commandAckLock) {
+            val items = pendingCommandAcks.toList()
+            pendingCommandAcks.clear()
+            items
+        }
+        pending.forEach { deferred ->
+            deferred.completeExceptionally(error)
+        }
     }
 
     private fun reconnectDelayMillis(attempt: Int): Long {
