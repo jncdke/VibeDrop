@@ -285,6 +285,12 @@ private struct HistoryView: View {
     @State private var query = ""
     @State private var timeFilter = "all"
     @State private var kindFilter = "all"
+    @State private var statusFilter = "all"
+    @State private var participantFilter = "all"
+
+    private var participantFilters: [HistoryParticipantFilter] {
+        buildHistoryParticipantFilters(entries: model.recentHistory)
+    }
 
     private var filteredEntries: [HistoryEntry] {
         let now = Date()
@@ -302,6 +308,14 @@ private struct HistoryView: View {
             if kindFilter != "all" &&
                 entry.kind != kindFilter &&
                 !entry.items.contains(where: { $0.kind == kindFilter }) {
+                return false
+            }
+            if statusFilter != "all" &&
+                entry.status != statusFilter &&
+                !entry.items.contains(where: { $0.status == statusFilter }) {
+                return false
+            }
+            if participantFilter != "all" && !entry.matchesParticipantFilter(participantFilter) {
                 return false
             }
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -339,6 +353,14 @@ private struct HistoryView: View {
                 HStack(spacing: 12) {
                     TextField("搜索内容、设备或文件名", text: $query)
                         .textFieldStyle(.roundedBorder)
+                    if !query.isEmpty {
+                        Button("清空") {
+                            query = ""
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                HStack(spacing: 12) {
                     Picker("", selection: $kindFilter) {
                         Text("全部类型").tag("all")
                         Text("文本").tag("text")
@@ -349,6 +371,22 @@ private struct HistoryView: View {
                     }
                     .pickerStyle(.menu)
                     .frame(width: 150)
+                    Picker("", selection: $statusFilter) {
+                        Text("全部状态").tag("all")
+                        Text("成功").tag("success")
+                        Text("进行中").tag("pending")
+                        Text("部分完成").tag("partial")
+                        Text("失败").tag("failed")
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 150)
+                    Picker("", selection: $participantFilter) {
+                        ForEach(participantFilters, id: \.key) { filter in
+                            Text(filter.label).tag(filter.key)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 220)
                     Picker("", selection: $timeFilter) {
                         Text("全部时间").tag("all")
                         Text("今天").tag("today")
@@ -553,6 +591,51 @@ private struct ExtraItemsTile: View {
             .frame(width: 78, height: 96)
             .background(Color(red: 0.9, green: 0.94, blue: 1.0), in: RoundedRectangle(cornerRadius: 14))
     }
+}
+
+private struct HistoryParticipantFilter: Equatable {
+    var key: String
+    var label: String
+}
+
+private func buildHistoryParticipantFilters(entries: [HistoryEntry]) -> [HistoryParticipantFilter] {
+    var counts: [String: (label: String, count: Int)] = [:]
+    for entry in entries {
+        for participant in [entry.sender, entry.receiver] {
+            guard let participant else { continue }
+            let label = participant.displayName.isEmpty ? participant.deviceId : participant.displayName
+            let key = historyParticipantKey(id: participant.deviceId, fallback: label)
+            let current = counts[key]
+            counts[key] = (label: label, count: (current?.count ?? 0) + 1)
+        }
+    }
+    return [HistoryParticipantFilter(key: "all", label: "全部设备")] +
+        counts
+            .sorted { left, right in
+                if left.value.count == right.value.count {
+                    return left.value.label.localizedStandardCompare(right.value.label) == .orderedAscending
+                }
+                return left.value.count > right.value.count
+            }
+            .prefix(16)
+            .map { key, value in
+                HistoryParticipantFilter(key: key, label: "\(value.label) (\(value.count))")
+            }
+}
+
+private extension HistoryEntry {
+    func matchesParticipantFilter(_ key: String) -> Bool {
+        let senderLabel = sender?.displayName.isEmpty == false ? sender?.displayName : sender?.deviceId
+        let receiverLabel = receiver?.displayName.isEmpty == false ? receiver?.displayName : receiver?.deviceId
+        return historyParticipantKey(id: sender?.deviceId, fallback: senderLabel ?? "") == key ||
+            historyParticipantKey(id: receiver?.deviceId, fallback: receiverLabel ?? "") == key
+    }
+}
+
+private func historyParticipantKey(id: String?, fallback: String) -> String {
+    (id?.isEmpty == false ? id! : fallback)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
 }
 
 private func kindLabel(_ kind: String) -> String {
