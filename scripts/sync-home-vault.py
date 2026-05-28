@@ -156,6 +156,52 @@ def normalize_kind(entry: dict[str, Any], fallback: str = "text") -> str:
     return fallback
 
 
+def clean_label(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def source_receiver_device(source: str) -> dict[str, str]:
+    source = str(source or "")
+    if source.startswith("macbook:"):
+        return {"id": "macbook", "name": "MacBook", "host": "", "server_id": ""}
+    return {"id": "", "name": "", "host": "", "server_id": ""}
+
+
+def derive_device_roles(entry: dict[str, Any], source: str = "") -> dict[str, str]:
+    direction = clean_label(pick(entry, "direction"))
+    client_id = clean_label(pick(entry, "client_id", "clientId", "deviceId"))
+    client_name = clean_label(pick(entry, "client_name", "clientName", "deviceName")) or client_id
+    target_id = clean_label(pick(entry, "target_id", "targetId", "target"))
+    target_host = clean_label(pick(entry, "targetHost", "targetDeviceName", "hostname"))
+    target_server_id = clean_label(pick(entry, "targetServerId", "serverId", "target_server_id"))
+    target_name = (
+        target_host
+        or clean_label(pick(entry, "targetName", "targetAlias", "target"))
+        or target_server_id
+        or target_id
+    )
+    source_receiver = source_receiver_device(source)
+
+    client = {"id": client_id, "name": client_name, "host": "", "server_id": ""}
+    target = {"id": target_id, "name": target_name, "host": target_host, "server_id": target_server_id}
+
+    if direction == "desktop_to_mobile":
+        sender = target if target["name"] or target["id"] else source_receiver
+        receiver = client
+    else:
+        sender = client
+        receiver = target if target["name"] or target["id"] else source_receiver
+
+    return {
+        "sender_id": sender.get("id", ""),
+        "sender_name": sender.get("name", "") or sender.get("id", "") or "未知发送端",
+        "receiver_id": receiver.get("id", ""),
+        "receiver_name": receiver.get("name", "") or receiver.get("id", "") or "未知接收端",
+        "receiver_host": receiver.get("host", ""),
+        "receiver_server_id": receiver.get("server_id", ""),
+    }
+
+
 def expand_local_path(raw_path: str | None) -> tuple[pathlib.Path | None, str | None]:
     if not raw_path:
         return None, "no-path"
@@ -214,6 +260,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             client_ip TEXT,
             client_id TEXT,
             client_name TEXT,
+            sender_id TEXT,
+            sender_name TEXT,
+            receiver_id TEXT,
+            receiver_name TEXT,
+            receiver_host TEXT,
+            receiver_server_id TEXT,
             kind TEXT,
             file_name TEXT,
             direction TEXT,
@@ -273,6 +325,17 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(history_entries)")}
+    for column_name, column_type in [
+        ("sender_id", "TEXT"),
+        ("sender_name", "TEXT"),
+        ("receiver_id", "TEXT"),
+        ("receiver_name", "TEXT"),
+        ("receiver_host", "TEXT"),
+        ("receiver_server_id", "TEXT"),
+    ]:
+        if column_name not in existing_columns:
+            conn.execute(f"ALTER TABLE history_entries ADD COLUMN {column_name} {column_type}")
     conn.commit()
 
 
@@ -354,7 +417,12 @@ def parse_android_history_payload(payload: str, source: str, source_file: str) -
     except json.JSONDecodeError:
         stat["bad_count"] = 1
         return records, stat, "bad_json"
+    envelope: dict[str, Any] = {}
     if isinstance(data, dict):
+        envelope = {
+            "clientId": clean_label(data.get("deviceId") or data.get("clientId")),
+            "clientName": clean_label(data.get("deviceName") or data.get("clientName")),
+        }
         for key in ["history", "entries", "items", "data"]:
             if isinstance(data.get(key), list):
                 data = data[key]
@@ -367,6 +435,11 @@ def parse_android_history_payload(payload: str, source: str, source_file: str) -
         if not isinstance(entry, dict):
             stat["bad_count"] += 1
             continue
+        entry = dict(entry)
+        if envelope.get("clientId") and not pick(entry, "client_id", "clientId", "deviceId"):
+            entry["clientId"] = envelope["clientId"]
+        if envelope.get("clientName") and not pick(entry, "client_name", "clientName", "deviceName"):
+            entry["clientName"] = envelope["clientName"]
         raw_line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
         stat["parsed_count"] += 1
         records.append(
@@ -592,14 +665,16 @@ def upsert_history_entry(
     item_count = pick(entry, "item_count", "itemCount")
     if item_count is None and isinstance(pick(entry, "items", "Items"), list):
         item_count = len(pick(entry, "items", "Items"))
+    device_roles = derive_device_roles(entry, record["source"])
 
     conn.execute(
         """
         INSERT INTO history_entries (
             entry_id, first_seen_at, last_seen_at, timestamp, source, source_file, line_no, text,
-            client_ip, client_id, client_name, kind, file_name, direction, status, session_id,
+            client_ip, client_id, client_name, sender_id, sender_name, receiver_id, receiver_name,
+            receiver_host, receiver_server_id, kind, file_name, direction, status, session_id,
             item_count, save_target, thumbnail_data_url, raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(entry_id) DO UPDATE SET
             last_seen_at=excluded.last_seen_at,
             timestamp=excluded.timestamp,
@@ -610,6 +685,12 @@ def upsert_history_entry(
             client_ip=excluded.client_ip,
             client_id=excluded.client_id,
             client_name=excluded.client_name,
+            sender_id=excluded.sender_id,
+            sender_name=excluded.sender_name,
+            receiver_id=excluded.receiver_id,
+            receiver_name=excluded.receiver_name,
+            receiver_host=excluded.receiver_host,
+            receiver_server_id=excluded.receiver_server_id,
             kind=excluded.kind,
             file_name=excluded.file_name,
             direction=excluded.direction,
@@ -632,6 +713,12 @@ def upsert_history_entry(
             pick(entry, "client_ip", "clientIp"),
             pick(entry, "client_id", "clientId"),
             pick(entry, "client_name", "clientName"),
+            device_roles["sender_id"],
+            device_roles["sender_name"],
+            device_roles["receiver_id"],
+            device_roles["receiver_name"],
+            device_roles["receiver_host"],
+            device_roles["receiver_server_id"],
             kind,
             pick(entry, "file_name", "fileName"),
             pick(entry, "direction"),
@@ -720,7 +807,9 @@ def generate_viewer(root: pathlib.Path, conn: sqlite3.Connection, report: dict[s
     for row in conn.execute(
         """
         SELECT entry_id, timestamp, source, source_file, line_no, text, client_ip, client_id,
-               client_name, kind, file_name, direction, status, save_target, thumbnail_data_url
+               client_name, sender_id, sender_name, receiver_id, receiver_name, receiver_host,
+               receiver_server_id, kind, file_name, direction, status, save_target,
+               thumbnail_data_url, raw_json
         FROM history_entries
         ORDER BY COALESCE(timestamp, '') DESC, entry_id DESC
         """
@@ -735,13 +824,25 @@ def generate_viewer(root: pathlib.Path, conn: sqlite3.Connection, report: dict[s
             client_ip,
             client_id,
             client_name,
+            sender_id,
+            sender_name,
+            receiver_id,
+            receiver_name,
+            receiver_host,
+            receiver_server_id,
             kind,
             file_name,
             direction,
             status,
             save_target,
             thumbnail_data_url,
+            raw_json,
         ) = row
+        try:
+            raw_entry = json.loads(raw_json)
+        except (TypeError, json.JSONDecodeError):
+            raw_entry = {}
+        fallback_roles = derive_device_roles(raw_entry if isinstance(raw_entry, dict) else {}, source)
         entries[entry_id] = {
             "id": entry_id,
             "timestamp": timestamp,
@@ -752,6 +853,12 @@ def generate_viewer(root: pathlib.Path, conn: sqlite3.Connection, report: dict[s
             "clientIp": client_ip,
             "clientId": client_id,
             "clientName": client_name,
+            "senderId": sender_id or fallback_roles["sender_id"],
+            "senderName": sender_name or fallback_roles["sender_name"],
+            "receiverId": receiver_id or fallback_roles["receiver_id"],
+            "receiverName": receiver_name or fallback_roles["receiver_name"],
+            "receiverHost": receiver_host or fallback_roles["receiver_host"],
+            "receiverServerId": receiver_server_id or fallback_roles["receiver_server_id"],
             "kind": kind or "text",
             "fileName": file_name,
             "direction": direction,
@@ -932,6 +1039,68 @@ def write_source_stats(conn: sqlite3.Connection, snapshot_id: str, stats: list[d
         )
 
 
+def backfill_device_roles(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT entry_id, source, raw_json
+        FROM history_entries
+        WHERE COALESCE(sender_name, '') = '' OR COALESCE(receiver_name, '') = ''
+        """
+    ).fetchall()
+    for entry_id, source, raw_json in rows:
+        try:
+            entry = json.loads(raw_json)
+        except (TypeError, json.JSONDecodeError):
+            entry = {}
+        if not isinstance(entry, dict):
+            entry = {}
+        roles = derive_device_roles(entry, source)
+        conn.execute(
+            """
+            UPDATE history_entries
+            SET sender_id = COALESCE(NULLIF(sender_id, ''), ?),
+                sender_name = COALESCE(NULLIF(sender_name, ''), ?),
+                receiver_id = COALESCE(NULLIF(receiver_id, ''), ?),
+                receiver_name = COALESCE(NULLIF(receiver_name, ''), ?),
+                receiver_host = COALESCE(NULLIF(receiver_host, ''), ?),
+                receiver_server_id = COALESCE(NULLIF(receiver_server_id, ''), ?)
+            WHERE entry_id = ?
+            """,
+            (
+                roles["sender_id"],
+                roles["sender_name"],
+                roles["receiver_id"],
+                roles["receiver_name"],
+                roles["receiver_host"],
+                roles["receiver_server_id"],
+                entry_id,
+            ),
+        )
+
+
+def canonicalize_receiver_names(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT receiver_server_id,
+               MAX(NULLIF(receiver_host, '')) AS preferred_host
+        FROM history_entries
+        WHERE COALESCE(receiver_server_id, '') != ''
+        GROUP BY receiver_server_id
+        """
+    ).fetchall()
+    for server_id, preferred_host in rows:
+        if not preferred_host:
+            continue
+        conn.execute(
+            """
+            UPDATE history_entries
+            SET receiver_name = ?
+            WHERE receiver_server_id = ?
+            """,
+            (preferred_host, server_id),
+        )
+
+
 def build_report(conn: sqlite3.Connection, snapshot_id: str, args: argparse.Namespace, source_stats: list[dict[str, Any]], android_status: str, counts: dict[str, int]) -> dict[str, Any]:
     unique_entries = conn.execute("SELECT COUNT(*) FROM snapshot_entries WHERE snapshot_id = ?", (snapshot_id,)).fetchone()[0]
     total_entries = conn.execute("SELECT COUNT(*) FROM history_entries").fetchone()[0]
@@ -1065,6 +1234,8 @@ def main() -> int:
         current_counts = upsert_history_entry(conn, snapshot_id, record, staging_root / "objects", now)
         for key, value in current_counts.items():
             counts[key] += value
+    backfill_device_roles(conn)
+    canonicalize_receiver_names(conn)
 
     report = build_report(conn, snapshot_id, args, source_stats, android_status, counts)
     conn.execute(
@@ -1142,6 +1313,12 @@ VIEWER_HTML = """<!doctype html>
     <section class="summary" id="summary"></section>
     <section class="toolbar">
       <input id="searchInput" type="search" placeholder="搜索文本、文件名、设备、路径">
+      <select id="senderFilter" aria-label="发送端筛选">
+        <option value="all">全部发送端</option>
+      </select>
+      <select id="receiverFilter" aria-label="接收端筛选">
+        <option value="all">全部接收端</option>
+      </select>
       <select id="kindFilter" aria-label="类型筛选">
         <option value="all">全部类型</option>
         <option value="text">文本</option>
@@ -1254,7 +1431,7 @@ main {
 
 .toolbar {
   display: grid;
-  grid-template-columns: 1fr 180px 100px;
+  grid-template-columns: minmax(240px, 1fr) 180px 180px 180px 100px;
   gap: 10px;
   margin: 18px 0 10px;
 }
@@ -1517,6 +1694,41 @@ function formatSyncMeta(report) {
   ].filter(Boolean).join(' · ');
 }
 
+function deviceDisplayName(name, id) {
+  return name || id || '未知设备';
+}
+
+function deviceFilterValue(name, id) {
+  return deviceDisplayName(name, id);
+}
+
+function populateDeviceFilter(selectId, entries, role) {
+  const select = document.getElementById(selectId);
+  const values = new Set();
+  entries.forEach((entry) => {
+    const label = role === 'sender'
+      ? deviceFilterValue(entry.senderName, entry.senderId)
+      : deviceFilterValue(entry.receiverName, entry.receiverId);
+    if (label && label !== '未知设备') {
+      values.add(label);
+    }
+  });
+  const selected = select.value || 'all';
+  const options = ['all', ...Array.from(values).sort((a, b) => a.localeCompare(b, 'zh-CN'))];
+  select.innerHTML = options.map((value) => {
+    const label = value === 'all'
+      ? role === 'sender' ? '全部发送端' : '全部接收端'
+      : value;
+    return `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`;
+  }).join('');
+  select.value = options.includes(selected) ? selected : 'all';
+}
+
+function populateDeviceFilters() {
+  populateDeviceFilter('senderFilter', state.entries, 'sender');
+  populateDeviceFilter('receiverFilter', state.entries, 'receiver');
+}
+
 function renderSummary(report) {
   const totalEntries = report.totalEntryCountInDb ?? report.uniqueEntryCount ?? 0;
   const previewMissingCount = state.entries.reduce((count, entry) => {
@@ -1532,12 +1744,18 @@ function renderSummary(report) {
   document.getElementById('syncMeta').textContent = formatSyncMeta(report);
 }
 
-function entryMatches(entry, query, kind) {
+function entryMatches(entry, query, kind, senderFilter, receiverFilter) {
   const haystack = [
     entry.timestamp,
     entry.text,
     entry.clientName,
     entry.clientIp,
+    entry.senderName,
+    entry.senderId,
+    entry.receiverName,
+    entry.receiverId,
+    entry.receiverHost,
+    entry.receiverServerId,
     entry.kind,
     entry.fileName,
     entry.source,
@@ -1552,6 +1770,10 @@ function entryMatches(entry, query, kind) {
   ].filter(Boolean).join('\\n').toLowerCase();
   const queryOk = !query || haystack.includes(query);
   if (!queryOk) return false;
+  const senderOk = senderFilter === 'all' || deviceFilterValue(entry.senderName, entry.senderId) === senderFilter;
+  if (!senderOk) return false;
+  const receiverOk = receiverFilter === 'all' || deviceFilterValue(entry.receiverName, entry.receiverId) === receiverFilter;
+  if (!receiverOk) return false;
   if (kind === 'all') return true;
   if (kind === 'missing') return entry.media.some((item) => !item.objectUrl && !item.thumbnailDataUrl);
   if (kind === 'text') return (entry.kind || 'text') === 'text' && entry.media.length === 0;
@@ -1597,9 +1819,12 @@ function renderEntries() {
   timeline.innerHTML = state.filtered.map((entry) => {
     const title = entry.fileName || entry.media[0]?.fileName || entry.kind || '文本';
     const body = entry.text || '';
+    const senderLabel = deviceDisplayName(entry.senderName, entry.senderId);
+    const receiverLabel = deviceDisplayName(entry.receiverName, entry.receiverId);
     const meta = [
       entry.kind || 'text',
-      entry.clientName || entry.clientIp,
+      senderLabel !== '未知设备' ? `发送端 ${senderLabel}` : '',
+      receiverLabel !== '未知设备' ? `接收端 ${receiverLabel}` : '',
       entry.status,
       entry.source,
       entry.sourceFile ? `line ${entry.lineNo}` : '',
@@ -1620,7 +1845,9 @@ function renderEntries() {
 function applyFilters() {
   const query = document.getElementById('searchInput').value.trim().toLowerCase();
   const kind = document.getElementById('kindFilter').value;
-  state.filtered = state.entries.filter((entry) => entryMatches(entry, query, kind));
+  const sender = document.getElementById('senderFilter').value;
+  const receiver = document.getElementById('receiverFilter').value;
+  state.filtered = state.entries.filter((entry) => entryMatches(entry, query, kind, sender, receiver));
   renderEntries();
 }
 
@@ -1630,13 +1857,18 @@ async function main() {
   state.report = payload.stats || {};
   state.entries = payload.entries || [];
   state.filtered = state.entries;
+  populateDeviceFilters();
   renderSummary(state.report);
   renderEntries();
   document.getElementById('searchInput').addEventListener('input', applyFilters);
   document.getElementById('kindFilter').addEventListener('change', applyFilters);
+  document.getElementById('senderFilter').addEventListener('change', applyFilters);
+  document.getElementById('receiverFilter').addEventListener('change', applyFilters);
   document.getElementById('resetButton').addEventListener('click', () => {
     document.getElementById('searchInput').value = '';
     document.getElementById('kindFilter').value = 'all';
+    document.getElementById('senderFilter').value = 'all';
+    document.getElementById('receiverFilter').value = 'all';
     applyFilters();
   });
 }

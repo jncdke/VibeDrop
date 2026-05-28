@@ -16,7 +16,7 @@
 1. 在 Mac mini 外置盘创建稳定的 `VibeDropVault` 数据库目录。
 2. 首次迁移 MacBook 当前可读取的 VibeDrop 桌面端历史、媒体、调试日志和基础元数据。
 3. 媒体按内容哈希去重保存，重复图片或重复文件只存一份。
-4. 生成 SQLite 索引、JSON 查看数据和静态网页查看器，用户可在局域网浏览器中核对时间、文本、图片缩略图；有缩略图但没有原图的 Android 记录视为可正常预览，不在界面上提示原图缺失。
+4. 生成 SQLite 索引、JSON 查看数据和静态网页查看器，用户可在局域网浏览器中核对时间、文本、图片缩略图、发送端设备和接收端设备；有缩略图但没有原图的 Android 记录视为可正常预览，不在界面上提示原图缺失。
 5. 生成迁移报告，明确哪些源文件已读取、多少行被解析、多少媒体成功入库、哪些媒体缺失、Android 私有历史是否已导入。
 6. 为后续每小时同步保留增量结构，不采用无限增长的全量快照文件夹。
 
@@ -49,7 +49,7 @@ VibeDropVault/
 
 媒体对象路径由文件内容决定：`objects/<sha256 前两位>/<sha256><原扩展名>`。这和 Apple Photos 用固定分桶降低单目录压力的思路类似，但这里用完整内容哈希做去重和校验，比按 UUID 首字符更适合备份与同步。
 
-SQLite 保存四类核心索引：`history_entries` 保存历史记录，`media_objects` 保存去重文件对象，`history_media` 保存历史和媒体对象的关联，`snapshots/snapshot_entries/source_files` 保存每次同步的可追溯状态。
+SQLite 保存四类核心索引：`history_entries` 保存历史记录，`media_objects` 保存去重文件对象，`history_media` 保存历史和媒体对象的关联，`snapshots/snapshot_entries/source_files` 保存每次同步的可追溯状态。`history_entries` 还保存规范化的 `sender_id/sender_name/receiver_id/receiver_name/receiver_host/receiver_server_id`，用于区分多个手机发送端和多台 Mac 接收端。
 
 ## 查看器入口
 
@@ -70,7 +70,7 @@ Vault 根目录必须生成 `open-home-vault-viewer.webloc`，用于在 Mac mini
 
 ## 校验方式
 
-同步报告需要至少包含：源历史文件行数、解析成功数、解析失败数、去重后历史条数、媒体引用数、成功入库媒体数、原始文件缺失数、对象库新增/复用状态、Android 导入状态、远端路径、Vault 路径和查看器 URL。查看器界面只把既没有对象文件也没有缩略图的媒体显示为缺失；有缩略图的记录直接展示缩略图，不额外提示原图状态。查看器顶部同步信息必须把 `androidStatus` 等机器状态翻译成用户可读文案，例如 `Android 上传：2 份 / 4712 条`，不能直接展示 `skipped;vault_inbox:...` 或空路径 `无`。
+同步报告需要至少包含：源历史文件行数、解析成功数、解析失败数、去重后历史条数、媒体引用数、成功入库媒体数、原始文件缺失数、对象库新增/复用状态、Android 导入状态、远端路径、Vault 路径和查看器 URL。查看器界面只把既没有对象文件也没有缩略图的媒体显示为缺失；有缩略图的记录直接展示缩略图，不额外提示原图状态。查看器顶部同步信息必须把 `androidStatus` 等机器状态翻译成用户可读文案，例如 `Android 上传：2 份 / 4712 条`，不能直接展示 `skipped;vault_inbox:...` 或空路径 `无`。查看器还必须显示并支持筛选发送端、接收端，`desktop_to_mobile` 方向的记录要把桌面端识别为发送端、手机识别为接收端。
 
 ## 后续演进
 
