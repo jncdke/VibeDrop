@@ -74,7 +74,9 @@ import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import com.vibedrop.mobile.nativeapp.platform.AndroidDeviceIdentity
 import com.vibedrop.mobile.nativeapp.platform.AndroidNetworkDiagnosticsSnapshot
 import com.vibedrop.mobile.nativeapp.platform.ContentTransferResult
+import com.vibedrop.mobile.nativeapp.platform.MediaOpenMode
 import com.vibedrop.mobile.nativeapp.platform.loadAndroidNetworkDiagnostics
+import com.vibedrop.mobile.nativeapp.platform.openHistoryMediaItem
 import com.vibedrop.mobile.nativeapp.platform.readClipboardText
 import com.vibedrop.mobile.nativeapp.platform.sendImageUriToMacClipboard
 import com.vibedrop.mobile.nativeapp.platform.sendUriToDesktopInbox
@@ -103,6 +105,8 @@ fun VibeDropApp(container: AppContainer) {
     var homeVaultUrl by rememberSaveable { mutableStateOf(container.homeVaultRepository.loadEndpoint()) }
     var homeVaultStatus by remember { mutableStateOf("还未同步") }
     var homeVaultBusy by remember { mutableStateOf(false) }
+    var imageOpenMode by rememberSaveable { mutableStateOf(container.mediaOpenPreferences.loadImageMode()) }
+    var videoOpenMode by rememberSaveable { mutableStateOf(container.mediaOpenPreferences.loadVideoMode()) }
     var pendingExportJson by remember { mutableStateOf<String?>(null) }
     val devices by container.deviceRepository.observeDevices().collectAsState(initial = emptyList())
     val history by container.historyRepository.observeRecentWithItems(limit = 1000).collectAsState(initial = emptyList())
@@ -230,6 +234,8 @@ fun VibeDropApp(container: AppContainer) {
                 )
                 1 -> HistoryScreen(
                     entries = history,
+                    imageOpenMode = imageOpenMode,
+                    videoOpenMode = videoOpenMode,
                     modifier = Modifier.weight(1f)
                 )
                 else -> SettingsScreen(
@@ -243,7 +249,17 @@ fun VibeDropApp(container: AppContainer) {
                     homeVaultUrl = homeVaultUrl,
                     homeVaultStatus = homeVaultStatus,
                     homeVaultBusy = homeVaultBusy,
+                    imageOpenMode = imageOpenMode,
+                    videoOpenMode = videoOpenMode,
                     onHomeVaultUrlChange = { homeVaultUrl = it },
+                    onImageOpenModeChange = { mode ->
+                        imageOpenMode = mode
+                        container.mediaOpenPreferences.saveImageMode(mode)
+                    },
+                    onVideoOpenModeChange = { mode ->
+                        videoOpenMode = mode
+                        container.mediaOpenPreferences.saveVideoMode(mode)
+                    },
                     onDiscover = {
                         if (discoveryBusy) return@SettingsScreen
                         scope.launch {
@@ -801,8 +817,11 @@ private fun SendDeviceCard(
 @Composable
 private fun HistoryScreen(
     entries: List<HistoryEntryWithItems>,
+    imageOpenMode: MediaOpenMode,
+    videoOpenMode: MediaOpenMode,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     var query by rememberSaveable { mutableStateOf("") }
     var selectedType by rememberSaveable { mutableStateOf("all") }
     var selectedStatus by rememberSaveable { mutableStateOf("all") }
@@ -1039,7 +1058,21 @@ private fun HistoryScreen(
             }
         }
         items(filteredEntries, key = { it.entry.id }) { record ->
-            HistoryCard(record)
+            HistoryCard(
+                record = record,
+                onOpenItem = { item ->
+                    val mode = if (item.kind == "video") videoOpenMode else imageOpenMode
+                    runCatching {
+                        openHistoryMediaItem(context, item, mode)
+                    }.onFailure { error ->
+                        Toast.makeText(
+                            context,
+                            "无法打开：${error.message ?: "没有可用应用"}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            )
         }
     }
 }
@@ -1161,7 +1194,10 @@ private fun HistoryHeatmap(
 }
 
 @Composable
-private fun HistoryCard(record: HistoryEntryWithItems) {
+private fun HistoryCard(
+    record: HistoryEntryWithItems,
+    onOpenItem: (HistoryItemEntity) -> Unit
+) {
     val entry = record.entry
     val items = remember(record.items) { record.items.sortedBy { it.itemIndex } }
     Card(
@@ -1190,7 +1226,10 @@ private fun HistoryCard(record: HistoryEntryWithItems) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items.take(12).forEach { item ->
-                        HistoryItemPreview(item)
+                        HistoryItemPreview(
+                            item = item,
+                            onOpen = { onOpenItem(item) }
+                        )
                     }
                     if (items.size > 12) {
                         HistoryMoreItemsChip(items.size - 12)
@@ -1213,13 +1252,17 @@ private fun HistoryCard(record: HistoryEntryWithItems) {
 }
 
 @Composable
-private fun HistoryItemPreview(item: HistoryItemEntity) {
+private fun HistoryItemPreview(
+    item: HistoryItemEntity,
+    onOpen: () -> Unit
+) {
     val bitmap = remember(item.thumbnailDataUrl) { decodeThumbnailDataUrl(item.thumbnailDataUrl) }
     Column(
         modifier = Modifier
             .width(92.dp)
             .clip(RoundedCornerShape(14.dp))
             .background(Color(0xFFF4F7FB))
+            .clickable(onClick = onOpen)
             .border(
                 width = 1.dp,
                 color = statusBorderColor(item.status),
@@ -1319,7 +1362,11 @@ private fun SettingsScreen(
     homeVaultUrl: String,
     homeVaultStatus: String,
     homeVaultBusy: Boolean,
+    imageOpenMode: MediaOpenMode,
+    videoOpenMode: MediaOpenMode,
     onHomeVaultUrlChange: (String) -> Unit,
+    onImageOpenModeChange: (MediaOpenMode) -> Unit,
+    onVideoOpenModeChange: (MediaOpenMode) -> Unit,
     onDiscover: () -> Unit,
     onPairDesktop: (DiscoveredDesktop) -> Unit,
     onSyncHomeVault: () -> Unit,
@@ -1451,6 +1498,35 @@ private fun SettingsScreen(
                     ) {
                         Text(if (homeVaultBusy) "同步中" else "同步到 Mac mini", fontWeight = FontWeight.ExtraBold)
                     }
+                }
+            }
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Text("媒体打开方式", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        text = "控制历史页里点击图片或视频时交给哪个系统入口打开。",
+                        color = Color(0xFF667085),
+                        fontSize = 14.sp
+                    )
+                    MediaOpenModeSelector(
+                        title = "图片",
+                        selected = imageOpenMode,
+                        onSelect = onImageOpenModeChange
+                    )
+                    MediaOpenModeSelector(
+                        title = "视频",
+                        selected = videoOpenMode,
+                        onSelect = onVideoOpenModeChange
+                    )
                 }
             }
         }
@@ -1742,6 +1818,27 @@ private fun DiagnosticChip(text: String) {
         maxLines = 1,
         overflow = TextOverflow.Ellipsis
     )
+}
+
+@Composable
+private fun MediaOpenModeSelector(
+    title: String,
+    selected: MediaOpenMode,
+    onSelect: (MediaOpenMode) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(title, color = Color(0xFF98A2B3), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            MediaOpenMode.entries.forEach { mode ->
+                HistoryFilterButton(mode.label, selected == mode) {
+                    onSelect(mode)
+                }
+            }
+        }
+    }
 }
 
 @Composable
