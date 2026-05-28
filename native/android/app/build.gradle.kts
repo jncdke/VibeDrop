@@ -13,13 +13,14 @@ android {
         applicationId = "com.vibedrop.mobile"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0-native-preview"
+        versionCode = 1100
+        versionName = "0.2.0-native"
     }
 
     buildTypes {
         debug {
             applicationIdSuffix = ".nativepreview"
+            versionNameSuffix = "-preview"
             isDebuggable = true
             manifestPlaceholders["usesCleartextTraffic"] = "true"
         }

@@ -16,6 +16,7 @@
 10. 当前已接入 Mac -> Android 的分片文件接收，图片/视频保存到系统媒体库，其他文件保存到下载集合，并回传 `incoming_file_saved`。
 11. 当前已接入桌面端 `incoming_history_session_start`，Android 会先创建批量/归档传输的聚合历史，再在每个文件保存成功后更新对应 item 状态。
 12. 当前已接入已保存 Mac 的持久排序，设置页可以上移/下移，发送页和后台剪贴板同步会复用同一顺序。
+13. 当前原生 release `versionCode` 从 `1100` 起步，高于旧 Tauri Android `1004`，为后续覆盖安装并迁移私有历史保留路径。
 
 ## 当前可用闭环
 
