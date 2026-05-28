@@ -867,7 +867,8 @@ private fun HistoryScreen(
     var query by rememberSaveable { mutableStateOf("") }
     var selectedType by rememberSaveable { mutableStateOf("all") }
     var selectedStatus by rememberSaveable { mutableStateOf("all") }
-    var selectedParticipant by rememberSaveable { mutableStateOf("all") }
+    var selectedSender by rememberSaveable { mutableStateOf("all") }
+    var selectedReceiver by rememberSaveable { mutableStateOf("all") }
     var selectedTime by rememberSaveable { mutableStateOf(HistoryTimeFilter.All) }
     var selectedHourFilter by rememberSaveable { mutableStateOf(HistoryHourFilter.All) }
     var customStartDate by rememberSaveable { mutableStateOf("") }
@@ -936,13 +937,15 @@ private fun HistoryScreen(
         showCustomFilterDialog = false
         resetHeatmapWindow()
     }
-    val participantFilters = remember(entries) { buildHistoryParticipantFilters(entries) }
+    val senderFilters = remember(entries) { buildHistoryEndpointFilters(entries, HistoryEndpoint.Sender) }
+    val receiverFilters = remember(entries) { buildHistoryEndpointFilters(entries, HistoryEndpoint.Receiver) }
     val baseFiltered = remember(
         entries,
         query,
         selectedType,
         selectedStatus,
-        selectedParticipant,
+        selectedSender,
+        selectedReceiver,
         selectedTime,
         selectedHourFilter,
         customStartDate,
@@ -965,7 +968,10 @@ private fun HistoryScreen(
                     record.items.any { it.status == selectedStatus }
             }
             .filter { record ->
-                selectedParticipant == "all" || record.matchesParticipantFilter(selectedParticipant)
+                selectedSender == "all" || record.matchesSenderFilter(selectedSender)
+            }
+            .filter { record ->
+                selectedReceiver == "all" || record.matchesReceiverFilter(selectedReceiver)
             }
             .filter {
                 it.entry.matchesTimeFilter(
@@ -1138,9 +1144,20 @@ private fun HistoryScreen(
                         modifier = Modifier.horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        participantFilters.forEach { filter ->
-                            HistoryFilterButton(filter.label, selectedParticipant == filter.key) {
-                                selectedParticipant = filter.key
+                        senderFilters.forEach { filter ->
+                            HistoryFilterButton(filter.label, selectedSender == filter.key) {
+                                selectedSender = filter.key
+                                resetHeatmapWindow()
+                            }
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        receiverFilters.forEach { filter ->
+                            HistoryFilterButton(filter.label, selectedReceiver == filter.key) {
+                                selectedReceiver = filter.key
                                 resetHeatmapWindow()
                             }
                         }
@@ -2631,7 +2648,12 @@ private data class HistoryTypeFilter(val kind: String, val label: String)
 
 private data class HistoryStatusFilter(val status: String, val label: String)
 
-private data class HistoryParticipantFilter(val key: String, val label: String)
+private enum class HistoryEndpoint {
+    Sender,
+    Receiver
+}
+
+private data class HistoryEndpointFilter(val key: String, val label: String)
 
 private data class HeatmapSelection(
     val dayStartMillis: Long,
@@ -2657,31 +2679,43 @@ private val historyStatusFilters = listOf(
 
 private const val DAY_MILLIS = 24L * 60L * 60L * 1000L
 
-private fun buildHistoryParticipantFilters(entries: List<HistoryEntryWithItems>): List<HistoryParticipantFilter> {
+private fun buildHistoryEndpointFilters(
+    entries: List<HistoryEntryWithItems>,
+    endpoint: HistoryEndpoint
+): List<HistoryEndpointFilter> {
     val counts = linkedMapOf<String, Pair<String, Int>>()
     entries.forEach { record ->
-        listOf(
-            record.entry.senderDeviceId to record.entry.senderName,
-            record.entry.receiverDeviceId to record.entry.receiverName
-        ).forEach { (id, name) ->
-            val label = name?.takeIf { it.isNotBlank() } ?: id?.takeIf { it.isNotBlank() } ?: return@forEach
-            val key = historyParticipantKey(id, label)
-            val current = counts[key]
-            counts[key] = label to ((current?.second ?: 0) + 1)
+        val (id, name) = when (endpoint) {
+            HistoryEndpoint.Sender -> record.entry.senderDeviceId to record.entry.senderName
+            HistoryEndpoint.Receiver -> record.entry.receiverDeviceId to record.entry.receiverName
         }
+        val label = name?.takeIf { it.isNotBlank() } ?: id?.takeIf { it.isNotBlank() } ?: return@forEach
+        val key = historyParticipantKey(id, label)
+        val current = counts[key]
+        counts[key] = label to ((current?.second ?: 0) + 1)
     }
-    return listOf(HistoryParticipantFilter("all", "全部设备")) +
+    val allLabel = when (endpoint) {
+        HistoryEndpoint.Sender -> "全部发送端"
+        HistoryEndpoint.Receiver -> "全部接收端"
+    }
+    return listOf(HistoryEndpointFilter("all", "$allLabel (${entries.size})")) +
         counts.entries
-            .sortedByDescending { it.value.second }
+            .sortedWith(
+                compareByDescending<Map.Entry<String, Pair<String, Int>>> { it.value.second }
+                    .thenBy { it.value.first }
+            )
             .take(12)
-            .map { (key, value) -> HistoryParticipantFilter(key, "${value.first} (${value.second})") }
+            .map { (key, value) -> HistoryEndpointFilter(key, "${value.first} (${value.second})") }
 }
 
-private fun HistoryEntryWithItems.matchesParticipantFilter(key: String): Boolean {
+private fun HistoryEntryWithItems.matchesSenderFilter(key: String): Boolean {
     val senderLabel = entry.senderName?.takeIf { it.isNotBlank() } ?: entry.senderDeviceId.orEmpty()
+    return historyParticipantKey(entry.senderDeviceId, senderLabel) == key
+}
+
+private fun HistoryEntryWithItems.matchesReceiverFilter(key: String): Boolean {
     val receiverLabel = entry.receiverName?.takeIf { it.isNotBlank() } ?: entry.receiverDeviceId.orEmpty()
-    return historyParticipantKey(entry.senderDeviceId, senderLabel) == key ||
-        historyParticipantKey(entry.receiverDeviceId, receiverLabel) == key
+    return historyParticipantKey(entry.receiverDeviceId, receiverLabel) == key
 }
 
 private fun historyParticipantKey(id: String?, fallback: String): String {
