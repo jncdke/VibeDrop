@@ -1710,6 +1710,14 @@ function optionLabel(label, count) {
   return `${label} (${count})`;
 }
 
+function compareByCountThenName(counts) {
+  return (a, b) => {
+    const countDiff = (counts.get(b) || 0) - (counts.get(a) || 0);
+    if (countDiff !== 0) return countDiff;
+    return a.localeCompare(b, 'zh-CN');
+  };
+}
+
 function populateDeviceFilter(selectId, entries, role) {
   const select = document.getElementById(selectId);
   const counts = new Map();
@@ -1722,7 +1730,7 @@ function populateDeviceFilter(selectId, entries, role) {
     }
   });
   const selected = select.value || 'all';
-  const options = ['all', ...Array.from(counts.keys()).sort((a, b) => a.localeCompare(b, 'zh-CN'))];
+  const options = ['all', ...Array.from(counts.keys()).sort(compareByCountThenName(counts))];
   select.innerHTML = options.map((value) => {
     const label = value === 'all'
       ? optionLabel(role === 'sender' ? '全部发送端' : '全部接收端', entries.length)
