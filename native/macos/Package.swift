@@ -11,13 +11,30 @@ let package = Package(
         .library(
             name: "VibeDropNativeCore",
             targets: ["VibeDropNativeCore"]
+        ),
+        .library(
+            name: "VibeDropMacStorage",
+            targets: ["VibeDropMacStorage"]
         )
+    ],
+    dependencies: [
+        .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0")
     ],
     targets: [
         .target(name: "VibeDropNativeCore"),
+        .target(
+            name: "VibeDropMacStorage",
+            dependencies: [
+                "VibeDropNativeCore",
+                .product(name: "GRDB", package: "GRDB.swift")
+            ]
+        ),
         .testTarget(
             name: "VibeDropNativeCoreTests",
-            dependencies: ["VibeDropNativeCore"]
+            dependencies: [
+                "VibeDropNativeCore",
+                "VibeDropMacStorage"
+            ]
         )
     ]
 )
