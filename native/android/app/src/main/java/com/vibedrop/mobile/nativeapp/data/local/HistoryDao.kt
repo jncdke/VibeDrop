@@ -22,6 +22,9 @@ interface HistoryDao {
     @Query("SELECT * FROM history_items WHERE entryId = :entryId ORDER BY itemIndex ASC")
     suspend fun getItemsForEntry(entryId: String): List<HistoryItemEntity>
 
+    @Query("SELECT * FROM history_items ORDER BY entryId ASC, itemIndex ASC")
+    suspend fun getAllItems(): List<HistoryItemEntity>
+
     @Query("SELECT COUNT(*) FROM history_entries")
     suspend fun countEntries(): Int
 

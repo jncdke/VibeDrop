@@ -1,17 +1,12 @@
 package com.vibedrop.mobile.nativeapp.data.repository
 
 import android.content.Context
-import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 
 class HomeVaultRepository(
@@ -34,7 +29,7 @@ class HomeVaultRepository(
 
     fun syncHistory(
         endpoint: String,
-        entries: List<HistoryEntryEntity>
+        entries: List<HistoryEntryWithItems>
     ): HomeVaultSyncResult {
         val cleanEndpoint = endpoint.trim().ifBlank { DEFAULT_ENDPOINT }
         val url = normalizeEndpoint(cleanEndpoint)
@@ -59,32 +54,17 @@ class HomeVaultRepository(
         )
     }
 
-    private fun buildPayload(entries: List<HistoryEntryEntity>): JSONObject {
+    private fun buildPayload(entries: List<HistoryEntryWithItems>): JSONObject {
         val history = JSONArray()
         entries.forEach { entry ->
-            history.put(
-                JSONObject()
-                    .put("id", entry.id)
-                    .put("timestamp", isoTimestamp(entry.timestampMillis))
-                    .put("text", entry.text.orEmpty())
-                    .put("kind", entry.kind)
-                    .put("direction", entry.direction)
-                    .put("status", entry.status)
-                    .put("target", entry.receiverName.orEmpty())
-                    .put("targetName", entry.receiverName.orEmpty())
-                    .put("targetDeviceName", entry.receiverName.orEmpty())
-                    .put("targetServerId", entry.receiverDeviceId.orEmpty())
-                    .put("sessionId", entry.sessionId.orEmpty())
-                    .put("itemCount", entry.itemCount ?: JSONObject.NULL)
-                    .put("saveTarget", entry.saveTarget.orEmpty())
-            )
+            history.put(entry.toHistoryJsonObject())
         }
         return JSONObject()
             .put("schemaVersion", 1)
             .put("app", "VibeDrop")
             .put("deviceId", "native_android_preview")
             .put("deviceName", "VibeDrop Native Preview")
-            .put("exportedAt", isoTimestamp(System.currentTimeMillis()))
+            .put("exportedAt", historyIsoTimestamp(System.currentTimeMillis()))
             .put("history", history)
     }
 
@@ -95,12 +75,6 @@ class HomeVaultRepository(
         } else {
             "$trimmed/api/android-history"
         }
-    }
-
-    private fun isoTimestamp(timestampMillis: Long): String {
-        val formatter = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
-        formatter.timeZone = TimeZone.getTimeZone("UTC")
-        return formatter.format(Date(timestampMillis))
     }
 
     companion object {

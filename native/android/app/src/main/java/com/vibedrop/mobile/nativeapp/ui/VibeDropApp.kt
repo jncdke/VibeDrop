@@ -302,7 +302,7 @@ fun VibeDropApp(container: AppContainer) {
                             val result = runCatching {
                                 withContext(Dispatchers.IO) {
                                     container.homeVaultRepository.saveEndpoint(homeVaultUrl)
-                                    val entries = container.historyRepository.loadAllEntries()
+                                    val entries = container.historyRepository.loadAllEntriesWithItems()
                                     container.homeVaultRepository.syncHistory(homeVaultUrl, entries)
                                 }
                             }
@@ -323,7 +323,7 @@ fun VibeDropApp(container: AppContainer) {
                         scope.launch {
                             val json = withContext(Dispatchers.IO) {
                                 container.historyRepository.exportArchive(
-                                    container.historyRepository.loadAllEntries()
+                                    container.historyRepository.loadAllEntriesWithItems()
                                 )
                             }
                             pendingExportJson = json
@@ -336,7 +336,7 @@ fun VibeDropApp(container: AppContainer) {
                                 val fileName = historyArchiveFileName()
                                 val json = withContext(Dispatchers.IO) {
                                     container.historyRepository.exportArchive(
-                                        container.historyRepository.loadAllEntries()
+                                        container.historyRepository.loadAllEntriesWithItems()
                                     )
                                 }
                                 shareHistoryJson(context, fileName, json)

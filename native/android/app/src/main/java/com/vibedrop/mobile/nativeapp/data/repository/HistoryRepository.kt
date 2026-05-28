@@ -9,7 +9,6 @@ import kotlinx.coroutines.flow.Flow
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.UUID
 import java.util.Locale
 import java.util.TimeZone
@@ -22,6 +21,17 @@ class HistoryRepository(
     }
 
     suspend fun loadAllEntries(): List<HistoryEntryEntity> = historyDao.getAllEntries()
+
+    suspend fun loadAllEntriesWithItems(): List<HistoryEntryWithItems> {
+        val entries = historyDao.getAllEntries()
+        val itemsByEntryId = historyDao.getAllItems().groupBy { it.entryId }
+        return entries.map { entry ->
+            HistoryEntryWithItems(
+                entry = entry,
+                items = itemsByEntryId[entry.id].orEmpty()
+            )
+        }
+    }
 
     suspend fun countEntries(): Int = historyDao.countEntries()
 
@@ -141,39 +151,26 @@ class HistoryRepository(
                 historyDao.upsertEntry(entry)
                 imported += 1
             }
+            val historyItems = item.toHistoryItems(entry.id)
+            if (historyItems.isNotEmpty()) {
+                historyDao.deleteItemsForEntry(entry.id)
+                historyDao.upsertItems(historyItems)
+            }
         }
         return imported
     }
 
-    fun exportArchive(entries: List<HistoryEntryEntity>): String {
+    fun exportArchive(entries: List<HistoryEntryWithItems>): String {
         val history = JSONArray()
         entries.forEach { entry ->
-            history.put(
-                JSONObject()
-                    .put("id", entry.id)
-                    .put("timestamp", isoTimestamp(entry.timestampMillis))
-                    .put("timestampMillis", entry.timestampMillis)
-                    .put("text", entry.text.orEmpty())
-                    .put("kind", entry.kind)
-                    .put("direction", entry.direction)
-                    .put("status", entry.status)
-                    .put("senderDeviceId", entry.senderDeviceId.orEmpty())
-                    .put("senderName", entry.senderName.orEmpty())
-                    .put("receiverDeviceId", entry.receiverDeviceId.orEmpty())
-                    .put("receiverName", entry.receiverName.orEmpty())
-                    .put("targetDeviceName", entry.receiverName.orEmpty())
-                    .put("targetServerId", entry.receiverDeviceId.orEmpty())
-                    .put("sessionId", entry.sessionId.orEmpty())
-                    .put("itemCount", entry.itemCount ?: JSONObject.NULL)
-                    .put("saveTarget", entry.saveTarget.orEmpty())
-            )
+            history.put(entry.toHistoryJsonObject())
         }
         return JSONObject()
             .put("schemaVersion", 1)
             .put("app", "VibeDrop")
             .put("deviceId", "native_android_preview")
             .put("deviceName", "VibeDrop Native Preview")
-            .put("exportedAt", isoTimestamp(System.currentTimeMillis()))
+            .put("exportedAt", historyIsoTimestamp(System.currentTimeMillis()))
             .put("history", history)
             .toString(2)
     }
@@ -352,6 +349,37 @@ class HistoryRepository(
         )
     }
 
+    private fun JSONObject.toHistoryItems(entryId: String): List<HistoryItemEntity> {
+        val array = optJSONArray("items") ?: optJSONArray("Items") ?: return emptyList()
+        val items = mutableListOf<HistoryItemEntity>()
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val itemIndex = item.optIntOrNull("itemIndex")
+                ?: item.optIntOrNull("item_index")
+                ?: index
+            val mimeType = item.firstString("mimeType", "mime_type")
+            val kind = item.firstString("kind").ifBlank { kindFromMime(mimeType) }
+            items += HistoryItemEntity(
+                id = "$entryId:item:$itemIndex",
+                entryId = entryId,
+                itemIndex = itemIndex,
+                kind = kind,
+                fileName = item.firstString("fileName", "file_name").takeIf { it.isNotBlank() },
+                mimeType = mimeType.takeIf { it.isNotBlank() },
+                sizeBytes = item.optLongOrNull("sizeBytes") ?: item.optLongOrNull("size_bytes"),
+                localPath = item.firstString("localPath", "local_path", "filePath", "file_path")
+                    .takeIf { it.isNotBlank() },
+                savedPath = item.firstString("savedPath", "saved_path").takeIf { it.isNotBlank() },
+                thumbnailPath = item.firstString("thumbnailPath", "thumbnail_path").takeIf { it.isNotBlank() },
+                thumbnailDataUrl = item.firstString("thumbnailDataUrl", "thumbnail_data_url")
+                    .takeIf { it.isNotBlank() },
+                status = item.firstString("status").ifBlank { "success" },
+                error = item.firstString("error").takeIf { it.isNotBlank() }
+            )
+        }
+        return items.sortedBy { it.itemIndex }
+    }
+
     private fun JSONObject.firstString(vararg keys: String): String {
         for (key in keys) {
             val value = optString(key, "")
@@ -389,9 +417,4 @@ class HistoryRepository(
         return runCatching { value.toLong() }.getOrDefault(System.currentTimeMillis())
     }
 
-    private fun isoTimestamp(timestampMillis: Long): String {
-        val formatter = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
-        formatter.timeZone = TimeZone.getTimeZone("UTC")
-        return formatter.format(Date(timestampMillis))
-    }
 }
