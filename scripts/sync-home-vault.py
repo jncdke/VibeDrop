@@ -1212,11 +1212,12 @@ h1 {
 }
 
 .sync-meta {
-  max-width: 420px;
+  max-width: 560px;
   color: #667085;
   font-size: 14px;
   line-height: 1.45;
   text-align: right;
+  overflow-wrap: anywhere;
 }
 
 main {
@@ -1456,6 +1457,66 @@ function metric(label, value) {
   return `<div class="metric"><p class="metric-label">${label}</p><p class="metric-value">${value}</p></div>`;
 }
 
+function parsedStatusCount(status, marker) {
+  const match = String(status || '').match(new RegExp(`${marker}:(\\\\d+):parsed:(\\\\d+)`));
+  if (!match) return null;
+  return {
+    files: Number(match[1]),
+    entries: Number(match[2]),
+  };
+}
+
+function formatAndroidStatus(report) {
+  const status = String(report.androidStatus || '').trim();
+  const inbox = parsedStatusCount(status, 'vault_inbox');
+  if (inbox) {
+    return inbox.files > 0
+      ? `Android 上传：${inbox.files} 份 / ${inbox.entries} 条`
+      : 'Android 上传：暂无';
+  }
+
+  const publicExport = parsedStatusCount(status, 'public_exports');
+  if (publicExport) {
+    return publicExport.files > 0
+      ? `Android 导出：${publicExport.files} 份 / ${publicExport.entries} 条`
+      : 'Android 导出：暂无';
+  }
+
+  const privateImport = status.match(/private_imported:(\\d+)/);
+  if (privateImport) {
+    return `Android 直读：${Number(privateImport[1])} 条`;
+  }
+
+  if (!status || status === 'skipped') {
+    return 'Android：本次未直读手机';
+  }
+  if (status.includes('no_adb_device')) {
+    return 'Android：未连接调试设备';
+  }
+  if (status.includes('adb_not_found')) {
+    return 'Android：ADB 不可用';
+  }
+  if (status.includes('private_not_imported')) {
+    return 'Android：私有历史未直读';
+  }
+  return `Android：${status}`;
+}
+
+function formatVaultLocation(report) {
+  const vaultRoot = report.vaultRoot || report.remoteRoot || '';
+  if (vaultRoot) return `Vault：${vaultRoot}`;
+  if (report.viewerUrl) return `Viewer：${report.viewerUrl}`;
+  return 'Vault：本地';
+}
+
+function formatSyncMeta(report) {
+  return [
+    `最近刷新：${formatTime(report.createdAt)}`,
+    formatAndroidStatus(report),
+    formatVaultLocation(report),
+  ].filter(Boolean).join(' · ');
+}
+
 function renderSummary(report) {
   const totalEntries = report.totalEntryCountInDb ?? report.uniqueEntryCount ?? 0;
   const previewMissingCount = state.entries.reduce((count, entry) => {
@@ -1468,8 +1529,7 @@ function renderSummary(report) {
     metric('无预览媒体', previewMissingCount),
     metric('对象总数', report.totalObjectCountInDb ?? 0),
   ].join('');
-  document.getElementById('syncMeta').textContent =
-    `同步 ${text(report.createdAt)} · Android ${text(report.androidStatus)} · ${text(report.remoteRoot)}`;
+  document.getElementById('syncMeta').textContent = formatSyncMeta(report);
 }
 
 function entryMatches(entry, query, kind) {
