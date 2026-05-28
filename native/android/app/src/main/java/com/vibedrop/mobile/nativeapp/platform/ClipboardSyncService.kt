@@ -18,6 +18,7 @@ import androidx.room.Room
 import com.vibedrop.mobile.nativeapp.MainActivity
 import com.vibedrop.mobile.nativeapp.data.local.DeviceEntity
 import com.vibedrop.mobile.nativeapp.data.local.VibeDropDatabase
+import com.vibedrop.mobile.nativeapp.data.local.VibeDropMigrations
 import com.vibedrop.mobile.nativeapp.protocol.AuthPayload
 import com.vibedrop.mobile.nativeapp.protocol.VibeDropActions
 import kotlinx.coroutines.CoroutineScope
@@ -60,7 +61,9 @@ class ClipboardSyncService : Service() {
             applicationContext,
             VibeDropDatabase::class.java,
             "vibedrop-native.db"
-        ).build()
+        )
+            .addMigrations(*VibeDropMigrations.ALL)
+            .build()
         reloadConnections()
     }
 
