@@ -20,6 +20,19 @@ data class ContentTransferResult(
     val savedPath: String? = null
 )
 
+enum class ContentTransferStage {
+    Sending,
+    Saving,
+    Finished
+}
+
+data class ContentTransferProgress(
+    val stage: ContentTransferStage,
+    val sentBytes: Long,
+    val totalBytes: Long,
+    val progressPercent: Int
+)
+
 suspend fun sendImageUriToMacClipboard(
     context: Context,
     uri: Uri,
@@ -57,7 +70,8 @@ suspend fun sendImageUriToMacClipboard(
 suspend fun sendUriToDesktopInbox(
     context: Context,
     uri: Uri,
-    controller: DesktopConnectionController
+    controller: DesktopConnectionController,
+    onProgress: (ContentTransferProgress) -> Unit = {}
 ): ContentTransferResult {
     val meta = context.queryContentMeta(uri, fallbackName = "file.bin")
     if (meta.sizeBytes <= 0L) {
@@ -72,8 +86,17 @@ suspend fun sendUriToDesktopInbox(
     }
 
     try {
+        onProgress(
+            ContentTransferProgress(
+                stage = ContentTransferStage.Sending,
+                sentBytes = 0,
+                totalBytes = meta.sizeBytes,
+                progressPercent = 0
+            )
+        )
         context.contentResolver.openInputStream(uri)?.use { input ->
             val buffer = ByteArray(FILE_CHUNK_BYTES)
+            var sentBytes = 0L
             while (true) {
                 val read = input.read(buffer)
                 if (read <= 0) break
@@ -82,6 +105,18 @@ suspend fun sendUriToDesktopInbox(
                 if (!controller.sendIncomingFileChunk(transferId, base64)) {
                     throw IllegalStateException("发送分片失败")
                 }
+                sentBytes += read.toLong()
+                val progress = ((sentBytes.toDouble() / meta.sizeBytes.toDouble()) * 100.0)
+                    .toInt()
+                    .coerceIn(1, 99)
+                onProgress(
+                    ContentTransferProgress(
+                        stage = ContentTransferStage.Sending,
+                        sentBytes = sentBytes.coerceAtMost(meta.sizeBytes),
+                        totalBytes = meta.sizeBytes,
+                        progressPercent = progress
+                    )
+                )
                 controller.waitForOutboundQueueBelow()
             }
         } ?: throw IllegalStateException("无法读取文件")
@@ -89,7 +124,23 @@ suspend fun sendUriToDesktopInbox(
         if (!controller.sendIncomingFileComplete(transferId)) {
             throw IllegalStateException("发送完成消息失败")
         }
+        onProgress(
+            ContentTransferProgress(
+                stage = ContentTransferStage.Saving,
+                sentBytes = meta.sizeBytes,
+                totalBytes = meta.sizeBytes,
+                progressPercent = 100
+            )
+        )
         val ack = controller.awaitIncomingFileAck(transferId)
+        onProgress(
+            ContentTransferProgress(
+                stage = ContentTransferStage.Finished,
+                sentBytes = meta.sizeBytes,
+                totalBytes = meta.sizeBytes,
+                progressPercent = 100
+            )
+        )
         return meta.copy(
             sourceUri = uri.toString(),
             transferId = transferId,

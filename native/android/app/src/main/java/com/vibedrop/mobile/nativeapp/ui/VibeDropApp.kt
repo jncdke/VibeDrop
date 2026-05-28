@@ -79,7 +79,9 @@ import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import com.vibedrop.mobile.nativeapp.platform.AndroidDeviceIdentity
 import com.vibedrop.mobile.nativeapp.platform.AndroidNetworkDiagnosticsSnapshot
 import com.vibedrop.mobile.nativeapp.platform.BackgroundRunDiagnosticsSnapshot
+import com.vibedrop.mobile.nativeapp.platform.ContentTransferProgress
 import com.vibedrop.mobile.nativeapp.platform.ContentTransferResult
+import com.vibedrop.mobile.nativeapp.platform.ContentTransferStage
 import com.vibedrop.mobile.nativeapp.platform.DiagnosticLogEvent
 import com.vibedrop.mobile.nativeapp.platform.DiagnosticLogStore
 import com.vibedrop.mobile.nativeapp.platform.MediaOpenMode
@@ -514,6 +516,8 @@ private fun SendScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val drafts = remember { mutableStateMapOf<String, String>() }
+    val imageActionLabels = remember { mutableStateMapOf<String, String>() }
+    val fileActionLabels = remember { mutableStateMapOf<String, String>() }
     var pendingImageDeviceId by remember { mutableStateOf<String?>(null) }
     var pendingFileDeviceId by remember { mutableStateOf<String?>(null) }
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -523,6 +527,7 @@ private fun SendScreen(
         val controller = controllers[deviceId] ?: return@rememberLauncherForActivityResult
         val device = devices.firstOrNull { it.id == deviceId } ?: return@rememberLauncherForActivityResult
         scope.launch {
+            imageActionLabels[deviceId] = "发送中..."
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     sendImageUriToMacClipboard(context, uri, controller)
@@ -530,12 +535,16 @@ private fun SendScreen(
             }
             result
                 .onSuccess {
+                    imageActionLabels[deviceId] = "✓"
                     onRecordSentContent(device, it, "clipboard")
                     Toast.makeText(context, "已发送图片到 Mac 剪贴板：${it.fileName}", Toast.LENGTH_SHORT).show()
                 }
                 .onFailure {
+                    imageActionLabels[deviceId] = "✗"
                     Toast.makeText(context, "图片发送失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
                 }
+            delay(800)
+            imageActionLabels.remove(deviceId)
         }
     }
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
@@ -545,15 +554,22 @@ private fun SendScreen(
         val controller = controllers[deviceId] ?: return@rememberLauncherForActivityResult
         val device = devices.firstOrNull { it.id == deviceId } ?: return@rememberLauncherForActivityResult
         scope.launch {
+            fileActionLabels[deviceId] = "准备中..."
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    uris.map { uri ->
-                        sendUriToDesktopInbox(context, uri, controller)
+                    uris.mapIndexed { index, uri ->
+                        sendUriToDesktopInbox(context, uri, controller) { progress ->
+                            val label = transferProgressLabel(progress, index, uris.size)
+                            scope.launch(Dispatchers.Main) {
+                                fileActionLabels[deviceId] = label
+                            }
+                        }
                     }
                 }
             }
             result
                 .onSuccess { sentItems ->
+                    fileActionLabels[deviceId] = "✓"
                     sentItems.forEach { item ->
                         onRecordSentContent(device, item, "inbox")
                     }
@@ -565,8 +581,11 @@ private fun SendScreen(
                     Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
                 }
                 .onFailure {
+                    fileActionLabels[deviceId] = "✗"
                     Toast.makeText(context, "文件发送失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
                 }
+            delay(900)
+            fileActionLabels.remove(deviceId)
         }
     }
 
@@ -609,6 +628,8 @@ private fun SendScreen(
                 device = device,
                 connection = controller.connection,
                 draft = drafts[device.id].orEmpty(),
+                imageActionLabel = imageActionLabels[device.id],
+                fileActionLabel = fileActionLabels[device.id],
                 onDraftChange = { drafts[device.id] = it },
                 onSend = { pressEnter ->
                     val fromInput = drafts[device.id].orEmpty().trim()
@@ -668,6 +689,7 @@ private fun SharedPayloadCard(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var transferLabel by remember(payload.id) { mutableStateOf<String?>(null) }
     val target = devices.firstOrNull { controllers[it.id]?.connection?.status == ConnectionStatus.Connected }
         ?: devices.firstOrNull()
     Card(
@@ -696,30 +718,40 @@ private fun SharedPayloadCard(
                         val device = target ?: return@Button
                         val controller = controllers[device.id] ?: return@Button
                         scope.launch {
+                            transferLabel = "准备中..."
                             val result = runCatching {
                                 withContext(Dispatchers.IO) {
-                                    payload.uris.forEach { uri ->
-                                        val sent = sendUriToDesktopInbox(context, uri, controller)
+                                    payload.uris.forEachIndexed { index, uri ->
+                                        val sent = sendUriToDesktopInbox(context, uri, controller) { progress ->
+                                            val label = transferProgressLabel(progress, index, payload.uris.size)
+                                            scope.launch(Dispatchers.Main) {
+                                                transferLabel = label
+                                            }
+                                        }
                                         onRecordSentContent(device, sent, "inbox")
                                     }
                                 }
                             }
                             result
                                 .onSuccess {
+                                    transferLabel = "✓"
                                     Toast.makeText(context, "分享文件已发送到 ${device.displayName}", Toast.LENGTH_SHORT).show()
                                     onDismiss()
                                 }
                                 .onFailure {
+                                    transferLabel = "✗"
                                     Toast.makeText(context, "分享发送失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                                    delay(900)
+                                    transferLabel = null
                                 }
                         }
                     },
-                    enabled = target != null && controllers[target.id]?.connection?.status == ConnectionStatus.Connected,
+                    enabled = transferLabel == null && target != null && controllers[target.id]?.connection?.status == ConnectionStatus.Connected,
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF168DF7))
                 ) {
                     Text(
-                        text = target?.let { "发送到 ${it.displayName}" } ?: "无可用 Mac",
+                        text = transferLabel ?: target?.let { "发送到 ${it.displayName}" } ?: "无可用 Mac",
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         fontWeight = FontWeight.ExtraBold
@@ -773,6 +805,8 @@ private fun SendDeviceCard(
     device: DesktopDevice,
     connection: ConnectionSnapshot,
     draft: String,
+    imageActionLabel: String?,
+    fileActionLabel: String?,
     onDraftChange: (String) -> Unit,
     onSend: (pressEnter: Boolean) -> Unit,
     onEnter: () -> Unit,
@@ -872,20 +906,43 @@ private fun SendDeviceCard(
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedButton(
                     onClick = onPickImage,
-                    enabled = connected,
+                    enabled = connected && imageActionLabel == null,
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text("传图到剪贴板", fontWeight = FontWeight.Bold)
+                    Text(
+                        imageActionLabel ?: "传图到剪贴板",
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
                 OutlinedButton(
                     onClick = onPickFile,
-                    enabled = connected,
+                    enabled = connected && fileActionLabel == null,
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text("传到收件箱", fontWeight = FontWeight.Bold)
+                    Text(
+                        fileActionLabel ?: "传到收件箱",
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
         }
+    }
+}
+
+private fun transferProgressLabel(
+    progress: ContentTransferProgress,
+    itemIndex: Int,
+    totalItems: Int
+): String {
+    val prefix = if (totalItems > 1) "${itemIndex + 1}/$totalItems · " else ""
+    return when (progress.stage) {
+        ContentTransferStage.Saving -> "${prefix}保存中"
+        ContentTransferStage.Finished -> "${prefix}100%"
+        ContentTransferStage.Sending -> "${prefix}${progress.progressPercent}%"
     }
 }
 
