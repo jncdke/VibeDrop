@@ -128,8 +128,10 @@ class ClipboardSyncService : Service() {
     private inner class ClipboardConnection(
         private val device: DeviceEntity
     ) : WebSocketListener() {
+        @Volatile
         private var socket: WebSocket? = null
         private var reconnectAttempt = 0
+        private var reconnectRunnable: Runnable? = null
         private var closed = false
 
         fun matches(other: DeviceEntity): Boolean {
@@ -138,6 +140,7 @@ class ClipboardSyncService : Service() {
 
         fun connect() {
             if (closed) return
+            cancelScheduledReconnect()
             val host = device.host ?: return
             val port = device.port ?: return
             log("connect_start")
@@ -149,13 +152,16 @@ class ClipboardSyncService : Service() {
 
         fun close() {
             closed = true
+            cancelScheduledReconnect()
             log("connection_close_requested")
             socket?.close(1000, "clipboard sync stop")
             socket = null
         }
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (!isCurrent(webSocket)) return
             reconnectAttempt = 0
+            cancelScheduledReconnect()
             log("socket_open", JSONObject().put("httpCode", response.code))
             webSocket.send(
                 AuthPayload(
@@ -172,34 +178,63 @@ class ClipboardSyncService : Service() {
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (!isCurrent(webSocket)) return
             val json = runCatching { JSONObject(text) }.getOrNull() ?: return
-            if (json.optString("action") == VibeDropActions.Clipboard) {
-                log("clipboard_received", JSONObject().put("length", json.optString("text").length))
-                applyClipboard(json.optString("text"))
+            when {
+                json.optString("status") == "ok" -> {
+                    log("auth_ok")
+                }
+                json.optString("status") == "error" -> {
+                    log("server_error", JSONObject().put("error", json.optString("error", "认证失败")))
+                }
+                json.optString("action") == VibeDropActions.Clipboard -> {
+                    log("clipboard_received", JSONObject().put("length", json.optString("text").length))
+                    applyClipboard(json.optString("text"))
+                }
             }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (!isCurrent(webSocket)) return
             log("socket_closed", JSONObject().put("code", code).put("reason", reason))
+            socket = null
             scheduleReconnect()
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (!isCurrent(webSocket)) return
             log(
                 "socket_failure",
                 JSONObject()
                     .put("error", t.message ?: t.javaClass.simpleName)
                     .put("httpCode", response?.code ?: JSONObject.NULL)
             )
+            socket = null
             scheduleReconnect()
         }
 
         private fun scheduleReconnect() {
             if (closed) return
+            cancelScheduledReconnect()
             reconnectAttempt += 1
-            val delayMs = min(60_000L, 3_000L * reconnectAttempt)
+            val cappedAttempt = min(reconnectAttempt, 6)
+            val delayMs = min(60_000L, 1_000L shl (cappedAttempt - 1))
             log("schedule_reconnect", JSONObject().put("attempt", reconnectAttempt).put("delayMillis", delayMs))
-            mainHandler.postDelayed({ connect() }, delayMs)
+            val runnable = Runnable {
+                reconnectRunnable = null
+                connect()
+            }
+            reconnectRunnable = runnable
+            mainHandler.postDelayed(runnable, delayMs)
+        }
+
+        private fun cancelScheduledReconnect() {
+            reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+            reconnectRunnable = null
+        }
+
+        private fun isCurrent(webSocket: WebSocket): Boolean {
+            return !closed && socket === webSocket
         }
 
         private fun log(event: String, detail: JSONObject = JSONObject()) {
