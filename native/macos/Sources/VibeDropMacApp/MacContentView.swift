@@ -227,6 +227,8 @@ private struct DropSendCard: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    Button("选择文件") { chooseFiles() }
+                        .buttonStyle(.bordered)
                 }
                 RoundedRectangle(cornerRadius: 20)
                     .fill(isTargeted ? Color.blue.opacity(0.12) : Color(red: 0.95, green: 0.98, blue: 1.0))
@@ -284,6 +286,18 @@ private struct DropSendCard: View {
         }
         group.notify(queue: .main) {
             completion(urls)
+        }
+    }
+
+    private func chooseFiles() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = false
+        panel.title = "选择要发送到手机的文件"
+        if panel.runModal() == .OK {
+            model.sendFiles(panel.urls)
         }
     }
 
