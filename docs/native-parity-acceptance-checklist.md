@@ -44,7 +44,8 @@
 
 ## 自动验证已通过
 
-- `swift test`：21 个 macOS 原生测试全通过。
+- `swift test`：macOS 原生测试全通过。
+- Android `:app:testDebugUnitTest`：协议 fixture、auth payload、历史导出字段测试全通过。
 - `./scripts/deploy-native-macos.sh --skip-install --no-sign`：预览 `.app` 构建通过。
 - `./scripts/deploy-native-macos-release.sh --skip-install --no-sign`：正式 `.app` 和 Share Extension 嵌入通过。
 - `./scripts/deploy-native-macos-release.sh --skip-install`：稳定签名、Share Extension 签名、主 app 签名、`codesign --verify --deep --strict` 通过。

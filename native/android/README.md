@@ -47,6 +47,15 @@ JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
 
 当前机器默认 Java 25 会让 Gradle Kotlin DSL 里的 Kotlin 编译器在解析 Java 版本时失败；Android Studio 自带 JBR 21 可以正常构建。
 
+协议和历史导出本地回归测试：
+
+```sh
+JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
+  mobile/src-tauri/gen/android/gradlew -p native/android :app:testDebugUnitTest
+```
+
+这组测试会直接读取仓库里的 `docs/protocol-v1-fixtures`，用于防止后续原生重构无意改坏旧 Tauri v1 JSON 字段名。
+
 真机安装原生 debug 预览包：
 
 ```sh

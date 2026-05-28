@@ -62,5 +62,8 @@ dependencies {
     implementation(libs.room.runtime)
     ksp(libs.room.compiler)
 
+    testImplementation(libs.junit)
+    testImplementation(libs.org.json)
+
     debugImplementation(libs.compose.ui.tooling)
 }
