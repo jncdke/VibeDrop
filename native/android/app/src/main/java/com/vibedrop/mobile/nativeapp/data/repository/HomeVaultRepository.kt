@@ -1,6 +1,7 @@
 package com.vibedrop.mobile.nativeapp.data.repository
 
 import android.content.Context
+import com.vibedrop.mobile.nativeapp.platform.AndroidDeviceIdentity
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -10,7 +11,8 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 class HomeVaultRepository(
-    context: Context
+    context: Context,
+    private val identity: AndroidDeviceIdentity
 ) {
     private val prefs = context.getSharedPreferences("home_vault", Context.MODE_PRIVATE)
     private val client = OkHttpClient.Builder()
@@ -62,8 +64,8 @@ class HomeVaultRepository(
         return JSONObject()
             .put("schemaVersion", 1)
             .put("app", "VibeDrop")
-            .put("deviceId", "native_android_preview")
-            .put("deviceName", "VibeDrop Native Preview")
+            .put("deviceId", identity.deviceId)
+            .put("deviceName", identity.deviceName)
             .put("exportedAt", historyIsoTimestamp(System.currentTimeMillis()))
             .put("history", history)
     }

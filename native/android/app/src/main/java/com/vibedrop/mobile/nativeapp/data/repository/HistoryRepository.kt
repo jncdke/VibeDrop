@@ -4,6 +4,7 @@ import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
 import com.vibedrop.mobile.nativeapp.data.local.HistoryDao
 import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import com.vibedrop.mobile.nativeapp.data.local.HistoryItemEntity
+import com.vibedrop.mobile.nativeapp.platform.AndroidDeviceIdentity
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileResult
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
@@ -15,7 +16,8 @@ import java.util.Locale
 import java.util.TimeZone
 
 class HistoryRepository(
-    private val historyDao: HistoryDao
+    private val historyDao: HistoryDao,
+    private val identity: AndroidDeviceIdentity
 ) {
     fun observeRecent(limit: Int = 120): Flow<List<HistoryEntryEntity>> {
         return historyDao.observeRecent(limit)
@@ -64,8 +66,8 @@ class HistoryRepository(
             kind = "text",
             status = status,
             text = text,
-            senderDeviceId = "native_android_preview",
-            senderName = "VibeDrop Native Preview",
+            senderDeviceId = identity.deviceId,
+            senderName = identity.deviceName,
             receiverDeviceId = target.stableId,
             receiverName = target.displayName,
             sessionId = null,
@@ -97,8 +99,8 @@ class HistoryRepository(
             kind = kind,
             status = status,
             text = "[$label] $fileName",
-            senderDeviceId = "native_android_preview",
-            senderName = "VibeDrop Native Preview",
+            senderDeviceId = identity.deviceId,
+            senderName = identity.deviceName,
             receiverDeviceId = target.stableId,
             receiverName = target.displayName,
             sessionId = transferId,
@@ -183,8 +185,8 @@ class HistoryRepository(
             text = payload.firstString("text").ifBlank { existing?.text ?: summary.second },
             senderDeviceId = source.stableId,
             senderName = source.displayName,
-            receiverDeviceId = "native_android_preview",
-            receiverName = "VibeDrop Native Preview",
+            receiverDeviceId = identity.deviceId,
+            receiverName = identity.deviceName,
             sessionId = sessionId,
             itemCount = payload.optIntOrNull("item_count") ?: payload.optIntOrNull("itemCount") ?: mergedItems.size.coerceAtLeast(1),
             saveTarget = payload.firstString("save_target", "saveTarget").ifBlank { existing?.saveTarget ?: "download" },
@@ -233,8 +235,8 @@ class HistoryRepository(
         return JSONObject()
             .put("schemaVersion", 1)
             .put("app", "VibeDrop")
-            .put("deviceId", "native_android_preview")
-            .put("deviceName", "VibeDrop Native Preview")
+            .put("deviceId", identity.deviceId)
+            .put("deviceName", identity.deviceName)
             .put("exportedAt", historyIsoTimestamp(System.currentTimeMillis()))
             .put("history", history)
             .toString(2)
@@ -326,8 +328,8 @@ class HistoryRepository(
             text = "[$label] ${result.fileName}",
             senderDeviceId = source.stableId,
             senderName = source.displayName,
-            receiverDeviceId = "native_android_preview",
-            receiverName = "VibeDrop Native Preview",
+            receiverDeviceId = identity.deviceId,
+            receiverName = identity.deviceName,
             sessionId = null,
             itemCount = 1,
             saveTarget = result.saveTarget,

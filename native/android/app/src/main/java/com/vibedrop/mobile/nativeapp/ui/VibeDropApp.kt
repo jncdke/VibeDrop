@@ -152,8 +152,8 @@ fun VibeDropApp(container: AppContainer) {
             valueTransform = { device ->
                 DesktopConnectionController(
                     device = device,
-                    clientId = "native_android_preview",
-                    clientName = "VibeDrop Native Preview",
+                    clientId = container.androidIdentity.deviceId,
+                    clientName = container.androidIdentity.deviceName,
                     incomingFileReceiver = IncomingFileReceiver(appContext),
                     onIncomingHistorySession = { rawJson ->
                         scope.launch(Dispatchers.IO) {
@@ -271,8 +271,8 @@ fun VibeDropApp(container: AppContainer) {
                                 withContext(Dispatchers.IO) {
                                     container.discoveryRepository.requestPairing(
                                         desktop = desktop,
-                                        clientId = "native_android_preview",
-                                        clientName = "VibeDrop Native Preview"
+                                        clientId = container.androidIdentity.deviceId,
+                                        clientName = container.androidIdentity.deviceName
                                     )
                                 }
                             }.getOrElse { error ->

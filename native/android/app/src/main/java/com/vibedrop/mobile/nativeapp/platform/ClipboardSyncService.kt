@@ -43,11 +43,13 @@ class ClipboardSyncService : Service() {
     private val connections = LinkedHashMap<String, ClipboardConnection>()
 
     private lateinit var database: VibeDropDatabase
+    private lateinit var identity: AndroidDeviceIdentity
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
+        identity = loadAndroidDeviceIdentity(applicationContext)
         database = Room.databaseBuilder(
             applicationContext,
             VibeDropDatabase::class.java,
@@ -131,9 +133,9 @@ class ClipboardSyncService : Service() {
             webSocket.send(
                 AuthPayload(
                     pin = device.pin.orEmpty(),
-                    deviceId = "native_android_clipboard_${device.id.hashCode()}",
-                    baseDeviceId = "native_android_preview",
-                    deviceName = "VibeDrop Native Clipboard",
+                    deviceId = identity.clipboardDeviceId(device.id),
+                    baseDeviceId = identity.baseDeviceId,
+                    deviceName = identity.clipboardDeviceName(),
                     canReceiveFiles = false,
                     receivesClipboard = true,
                     deviceRole = "clipboard_sync"

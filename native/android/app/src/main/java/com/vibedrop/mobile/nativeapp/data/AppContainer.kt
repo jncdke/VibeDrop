@@ -8,9 +8,11 @@ import com.vibedrop.mobile.nativeapp.data.repository.DeviceRepository
 import com.vibedrop.mobile.nativeapp.data.repository.DiscoveryRepository
 import com.vibedrop.mobile.nativeapp.data.repository.HomeVaultRepository
 import com.vibedrop.mobile.nativeapp.data.repository.HistoryRepository
+import com.vibedrop.mobile.nativeapp.platform.loadAndroidDeviceIdentity
 
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
+    val androidIdentity = loadAndroidDeviceIdentity(appContext)
 
     val database: VibeDropDatabase = Room.databaseBuilder(
         appContext,
@@ -19,9 +21,9 @@ class AppContainer(context: Context) {
     ).build()
 
     val deviceRepository = DeviceRepository(database.deviceDao())
-    val historyRepository = HistoryRepository(database.historyDao())
+    val historyRepository = HistoryRepository(database.historyDao(), androidIdentity)
     val discoveryRepository = DiscoveryRepository(appContext)
-    val homeVaultRepository = HomeVaultRepository(appContext)
+    val homeVaultRepository = HomeVaultRepository(appContext, androidIdentity)
     val legacyHistoryImporter = LegacyHistoryImporter(
         context = appContext,
         deviceRepository = deviceRepository,
