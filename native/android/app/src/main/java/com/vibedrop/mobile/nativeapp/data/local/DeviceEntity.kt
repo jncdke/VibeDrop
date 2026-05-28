@@ -23,6 +23,7 @@ data class DeviceEntity(
     val aliasesJson: String,
     val capabilitiesJson: String,
     val lastSeenAt: Long?,
+    val sortOrder: Int,
     val createdAt: Long,
     val updatedAt: Long
 )

@@ -496,6 +496,26 @@ fun VibeDropApp(container: AppContainer) {
                             }
                         }
                     },
+                    onMoveDevice = { device, direction ->
+                        scope.launch(Dispatchers.IO) {
+                            container.deviceRepository.moveDesktop(device.id, direction)
+                            container.diagnosticLogStore.append(
+                                "device",
+                                "moved",
+                                JSONObject()
+                                    .put("deviceId", device.id)
+                                    .put("name", device.displayName)
+                                    .put("direction", direction)
+                            )
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(
+                                    context,
+                                    if (direction < 0) "已上移 ${device.displayName}" else "已下移 ${device.displayName}",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                    },
                     onSaveDevice = { deviceId, name, host, port, pin ->
                         scope.launch(Dispatchers.IO) {
                             val saved = if (deviceId == null) {
@@ -1980,6 +2000,7 @@ private fun SettingsScreen(
     onShareHistory: () -> Unit,
     onClearHistory: () -> Unit,
     onDeleteDevice: (DesktopDevice) -> Unit,
+    onMoveDevice: (DesktopDevice, Int) -> Unit,
     onSaveDevice: (deviceId: String?, name: String, host: String, port: Int, pin: String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -2074,7 +2095,8 @@ private fun SettingsScreen(
                         editingDeviceId = null
                     }
                     onDeleteDevice(device)
-                }
+                },
+                onMoveDevice = onMoveDevice
             )
         }
         item {
@@ -2566,7 +2588,8 @@ private fun ConnectionDiagnosticsCard(
     onTestConnections: () -> Unit,
     onEditDevice: (DesktopDevice) -> Unit,
     onArmDeleteDevice: (DesktopDevice) -> Unit,
-    onDeleteDevice: (DesktopDevice) -> Unit
+    onDeleteDevice: (DesktopDevice) -> Unit,
+    onMoveDevice: (DesktopDevice, Int) -> Unit
 ) {
     val connectedCount = controllers.values.count { it.connection.status == ConnectionStatus.Connected }
     val reconnectingCount = controllers.values.count { it.connection.status == ConnectionStatus.Connecting }
@@ -2648,7 +2671,7 @@ private fun ConnectionDiagnosticsCard(
 
             if (devices.isNotEmpty()) {
                 Text("已保存连接", color = Color(0xFF98A2B3), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                devices.forEach { device ->
+                devices.forEachIndexed { index, device ->
                     val connection = controllers[device.id]?.connection ?: device.connection
                     Column(
                         modifier = Modifier
@@ -2691,6 +2714,25 @@ private fun ConnectionDiagnosticsCard(
                                 maxLines = 2,
                                 overflow = TextOverflow.Ellipsis
                             )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = { onMoveDevice(device, -1) },
+                                enabled = index > 0,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("上移", fontWeight = FontWeight.Bold)
+                            }
+                            OutlinedButton(
+                                onClick = { onMoveDevice(device, 1) },
+                                enabled = index < devices.lastIndex,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("下移", fontWeight = FontWeight.Bold)
+                            }
                         }
                         Row(
                             modifier = Modifier.fillMaxWidth(),

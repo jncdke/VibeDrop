@@ -2,6 +2,8 @@ package com.vibedrop.mobile.nativeapp.data
 
 import android.content.Context
 import androidx.room.Room
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.vibedrop.mobile.nativeapp.data.legacy.LegacyHistoryImporter
 import com.vibedrop.mobile.nativeapp.data.local.VibeDropDatabase
 import com.vibedrop.mobile.nativeapp.data.repository.DeviceRepository
@@ -20,7 +22,9 @@ class AppContainer(context: Context) {
         appContext,
         VibeDropDatabase::class.java,
         "vibedrop-native.db"
-    ).build()
+    )
+        .addMigrations(MIGRATION_1_2)
+        .build()
 
     val deviceRepository = DeviceRepository(database.deviceDao())
     val historyRepository = HistoryRepository(database.historyDao(), androidIdentity)
@@ -33,4 +37,12 @@ class AppContainer(context: Context) {
         deviceRepository = deviceRepository,
         historyRepository = historyRepository
     )
+
+    private companion object {
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE devices ADD COLUMN sortOrder INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+    }
 }

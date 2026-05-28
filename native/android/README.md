@@ -1,6 +1,6 @@
 # VibeDrop native Android
 
-这是 Android 原生重构入口，目标技术栈是 Kotlin + Jetpack Compose + Room + OkHttp。当前阶段先建立可编译骨架、复刻发送页结构、沉淀协议与本地数据模型；后续阶段再接入真实 WebSocket、发现、配对、文件传输、后台剪贴板和 Home Vault。
+这是 Android 原生重构入口，目标技术栈是 Kotlin + Jetpack Compose + Room + OkHttp。当前阶段先建立可编译骨架、复刻发送页结构、沉淀协议与本地数据模型，并逐项补齐真实 WebSocket、发现、配对、文件传输、后台剪贴板和 Home Vault。
 
 ## 设计约束
 
@@ -15,6 +15,7 @@
 9. 当前已接入 Android -> Mac 的图片剪贴板发送和文件收件箱分片发送。
 10. 当前已接入 Mac -> Android 的分片文件接收，图片/视频保存到系统媒体库，其他文件保存到下载集合，并回传 `incoming_file_saved`。
 11. 当前已接入桌面端 `incoming_history_session_start`，Android 会先创建批量/归档传输的聚合历史，再在每个文件保存成功后更新对应 item 状态。
+12. 当前已接入已保存 Mac 的持久排序，设置页可以上移/下移，发送页和后台剪贴板同步会复用同一顺序。
 
 ## 当前可用闭环
 
@@ -32,6 +33,7 @@
 12. 设置页支持图片/视频历史打开策略：系统默认、相册、浏览器或每次询问；历史媒体 item 点击后会通过 Android `ACTION_VIEW` 和 FileProvider/MediaStore URI 打开。历史页支持发送端和接收端分离筛选，候选项显示数量并按数量排序。
 13. 设置页连接诊断卡支持直接编辑或删除已保存 Mac；编辑保留原设备 ID，只更新显示名、host、端口和 PIN，删除不会清空历史记录。
 14. 设置页“测试连接”会为每台已保存 Mac 打开一次性 WebSocket，发送 v1 `auth` 并等待 `status ok`，所以可以区分 host/端口不可达、PIN 错误和真实可发送状态；测试 socket 不复用也不打断当前发送连接。
+15. 设置页连接诊断卡支持上移/下移已保存 Mac；顺序写入 Room，发送页卡片顺序、设置页卡片顺序和后台剪贴板同步遍历顺序保持一致。
 
 ## 构建
 

@@ -29,19 +29,21 @@ class DeviceRepository(
         val cleanHost = host.trim()
         val cleanName = displayName.trim().ifBlank { cleanHost }
         val id = "manual:${cleanHost.lowercase()}:$port"
+        val existing = deviceDao.findById(id)
         val entity = DeviceEntity(
             id = id,
-            stableId = id,
+            stableId = existing?.stableId ?: id,
             displayName = cleanName,
             role = "desktop",
             host = cleanHost,
             ip = cleanHost.takeIf { it.matches(Regex("""\d{1,3}(\.\d{1,3}){3}""")) },
             port = port,
             pin = pin.trim(),
-            aliasesJson = "[]",
-            capabilitiesJson = "[]",
-            lastSeenAt = null,
-            createdAt = now,
+            aliasesJson = existing?.aliasesJson ?: "[]",
+            capabilitiesJson = existing?.capabilitiesJson ?: "[]",
+            lastSeenAt = existing?.lastSeenAt,
+            sortOrder = existing?.sortOrder ?: nextSortOrder(),
+            createdAt = existing?.createdAt ?: now,
             updatedAt = now
         )
         deviceDao.upsert(entity)
@@ -75,6 +77,20 @@ class DeviceRepository(
 
     suspend fun deleteDesktop(deviceId: String) {
         deviceDao.deleteById(deviceId)
+        normalizeSortOrders()
+    }
+
+    suspend fun moveDesktop(deviceId: String, direction: Int) {
+        if (direction == 0) return
+        val devices = orderedEntitiesForMutation()
+        val index = devices.indexOfFirst { it.id == deviceId }
+        if (index < 0) return
+        val targetIndex = (index + direction).coerceIn(0, devices.lastIndex)
+        if (targetIndex == index) return
+        val reordered = devices.toMutableList()
+        val item = reordered.removeAt(index)
+        reordered.add(targetIndex, item)
+        deviceDao.upsertAll(reordered.withNormalizedSortOrders())
     }
 
     suspend fun savePairedDesktop(
@@ -88,6 +104,7 @@ class DeviceRepository(
         val pin = status.pin.orEmpty()
         val id = "desktop:$serverId"
         val now = System.currentTimeMillis()
+        val existing = deviceDao.findById(id)
         val entity = DeviceEntity(
             id = id,
             stableId = serverId,
@@ -98,9 +115,10 @@ class DeviceRepository(
             port = port,
             pin = pin,
             aliasesJson = """["$hostname"]""",
-            capabilitiesJson = "[]",
+            capabilitiesJson = existing?.capabilitiesJson ?: "[]",
             lastSeenAt = now,
-            createdAt = now,
+            sortOrder = existing?.sortOrder ?: nextSortOrder(),
+            createdAt = existing?.createdAt ?: now,
             updatedAt = now
         )
         deviceDao.upsert(entity)
@@ -116,23 +134,48 @@ class DeviceRepository(
         pin: String?
     ) {
         val now = System.currentTimeMillis()
+        val existing = deviceDao.findById(id)
         deviceDao.upsert(
             DeviceEntity(
                 id = id,
-                stableId = id,
+                stableId = existing?.stableId ?: id,
                 displayName = displayName.ifBlank { host ?: ip ?: id },
                 role = "desktop",
                 host = host,
                 ip = ip,
                 port = port,
                 pin = pin,
-                aliasesJson = "[]",
-                capabilitiesJson = "[]",
-                lastSeenAt = null,
-                createdAt = now,
+                aliasesJson = existing?.aliasesJson ?: "[]",
+                capabilitiesJson = existing?.capabilitiesJson ?: "[]",
+                lastSeenAt = existing?.lastSeenAt,
+                sortOrder = existing?.sortOrder ?: nextSortOrder(),
+                createdAt = existing?.createdAt ?: now,
                 updatedAt = now
             )
         )
+    }
+
+    private suspend fun nextSortOrder(): Int {
+        val devices = deviceDao.getDevicesOrdered()
+        return ((devices.maxOfOrNull { it.sortOrder } ?: -10) + SORT_ORDER_STEP)
+            .coerceAtLeast(devices.size * SORT_ORDER_STEP)
+    }
+
+    private suspend fun normalizeSortOrders() {
+        val devices = deviceDao.getDevicesOrdered()
+        if (devices.isNotEmpty()) {
+            deviceDao.upsertAll(devices.withNormalizedSortOrders())
+        }
+    }
+
+    private suspend fun orderedEntitiesForMutation(): List<DeviceEntity> {
+        return deviceDao.getDevicesOrdered().withNormalizedSortOrders()
+    }
+
+    private fun List<DeviceEntity>.withNormalizedSortOrders(): List<DeviceEntity> {
+        return mapIndexed { index, entity ->
+            entity.copy(sortOrder = index * SORT_ORDER_STEP)
+        }
     }
 
     private fun DeviceEntity.toDesktopDevice(): DesktopDevice? {
@@ -148,5 +191,9 @@ class DeviceRepository(
             pin = pin,
             connection = ConnectionSnapshot(ConnectionStatus.Disconnected)
         )
+    }
+
+    private companion object {
+        const val SORT_ORDER_STEP = 10
     }
 }
