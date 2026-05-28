@@ -80,6 +80,10 @@ class DeviceRepository(
         normalizeSortOrders()
     }
 
+    suspend fun countDevices(): Int {
+        return deviceDao.countDevices()
+    }
+
     suspend fun moveDesktop(deviceId: String, direction: Int) {
         if (direction == 0) return
         val devices = orderedEntitiesForMutation()

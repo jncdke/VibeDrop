@@ -203,13 +203,22 @@ fun VibeDropApp(container: AppContainer) {
     }
 
     LaunchedEffect(Unit) {
-        val result = withContext(Dispatchers.IO) {
+        val deviceImport = withContext(Dispatchers.IO) {
+            container.legacyDeviceImporter.importIfNeeded()
+        }
+        if (deviceImport.error != null) {
+            Toast.makeText(context, "旧设备迁移失败：${deviceImport.error}", Toast.LENGTH_LONG).show()
+        } else if (deviceImport.imported > 0) {
+            Toast.makeText(context, "已迁移旧设备 ${deviceImport.imported} 台", Toast.LENGTH_SHORT).show()
+        }
+
+        val historyImport = withContext(Dispatchers.IO) {
             container.legacyHistoryImporter.importIfNeeded()
         }
-        if (result.error != null) {
-            Toast.makeText(context, "旧历史迁移失败：${result.error}", Toast.LENGTH_LONG).show()
-        } else if (result.imported > 0) {
-            Toast.makeText(context, "已迁移旧历史 ${result.imported} 条", Toast.LENGTH_SHORT).show()
+        if (historyImport.error != null) {
+            Toast.makeText(context, "旧历史迁移失败：${historyImport.error}", Toast.LENGTH_LONG).show()
+        } else if (historyImport.imported > 0) {
+            Toast.makeText(context, "已迁移旧历史 ${historyImport.imported} 条", Toast.LENGTH_SHORT).show()
         }
     }
 

@@ -2,6 +2,7 @@ package com.vibedrop.mobile.nativeapp.data
 
 import android.content.Context
 import androidx.room.Room
+import com.vibedrop.mobile.nativeapp.data.legacy.LegacyDeviceImporter
 import com.vibedrop.mobile.nativeapp.data.legacy.LegacyHistoryImporter
 import com.vibedrop.mobile.nativeapp.data.local.VibeDropDatabase
 import com.vibedrop.mobile.nativeapp.data.local.VibeDropMigrations
@@ -31,6 +32,10 @@ class AppContainer(context: Context) {
     val homeVaultRepository = HomeVaultRepository(appContext, androidIdentity)
     val mediaOpenPreferences = MediaOpenPreferences(appContext)
     val diagnosticLogStore = DiagnosticLogStore(appContext)
+    val legacyDeviceImporter = LegacyDeviceImporter(
+        context = appContext,
+        deviceRepository = deviceRepository
+    )
     val legacyHistoryImporter = LegacyHistoryImporter(
         context = appContext,
         deviceRepository = deviceRepository,
