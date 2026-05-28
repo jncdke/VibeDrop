@@ -3,94 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="1; url=http://minideMac-mini.local:8787/viewer/">
   <title>打开 VibeDrop Home Vault</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f5f7fb;
-      --panel: #ffffff;
-      --text: #111827;
-      --muted: #667085;
-      --border: #dbe3ef;
-      --primary: #1677ff;
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 32px;
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
-    }
-
-    main {
-      width: min(560px, 100%);
-      padding: 28px;
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      background: var(--panel);
-      box-shadow: 0 18px 48px rgba(15, 23, 42, 0.08);
-    }
-
-    h1 {
-      margin: 0 0 10px;
-      font-size: 28px;
-      line-height: 1.2;
-    }
-
-    p {
-      margin: 0 0 20px;
-      color: var(--muted);
-      line-height: 1.7;
-    }
-
-    .actions {
-      display: grid;
-      gap: 12px;
-    }
-
-    a {
-      display: block;
-      padding: 14px 16px;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      color: var(--text);
-      font-weight: 700;
-      text-decoration: none;
-      text-align: center;
-    }
-
-    a.primary {
-      border-color: var(--primary);
-      background: var(--primary);
-      color: #ffffff;
-    }
-
-    small {
-      display: block;
-      margin-top: 16px;
-      color: var(--muted);
-      line-height: 1.6;
-    }
-  </style>
+  <script>
+    window.location.replace("http://192.168.3.2:8787/viewer/");
+  </script>
 </head>
 <body>
-  <main>
-    <h1>VibeDrop 历史查看器</h1>
-    <p>正在打开 Mac mini Home Vault。如果浏览器没有自动跳转，点下面的入口。</p>
-    <div class="actions">
-      <a class="primary" href="http://minideMac-mini.local:8787/viewer/">打开局域网查看器</a>
-      <a href="http://192.168.3.2:8787/viewer/">IP 备用入口</a>
-    </div>
-    <small>这个文件适合放在项目目录里，从 MacBook 打开 Mac mini 上的 viewer。Vault 本机入口会优先使用 localhost。</small>
-  </main>
+  <noscript>
+    <p><a href="http://192.168.3.2:8787/viewer/">打开 VibeDrop 历史查看器</a></p>
+    <p><a href="http://minideMac-mini.local:8787/viewer/">局域网名称备用入口</a></p>
+  </noscript>
 </body>
 </html>

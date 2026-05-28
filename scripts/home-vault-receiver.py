@@ -186,7 +186,7 @@ def main() -> int:
         "--sync-script",
         default=str(pathlib.Path(__file__).with_name("sync-home-vault.py")),
     )
-    parser.add_argument("--viewer-url", default="http://minideMac-mini.local:8787/viewer/")
+    parser.add_argument("--viewer-url", default="http://192.168.3.2:8787/viewer/")
     parser.add_argument("--max-bytes", type=int, default=MAX_REQUEST_BYTES)
     parser.add_argument("--sync-timeout", type=int, default=180)
     parser.add_argument("--token", default=os.environ.get("VIBEDROP_VAULT_TOKEN", ""))

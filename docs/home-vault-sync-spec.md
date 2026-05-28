@@ -33,7 +33,8 @@ Vault 根目录：
 
 ```text
 VibeDropVault/
-  open-home-vault-viewer.html     # Mac mini 本机双击入口，跳转到 localhost viewer
+  open-home-vault-viewer.webloc   # Mac mini 本机双击入口，直接打开 localhost viewer
+  open-home-vault-viewer.html     # HTML 兜底入口，立即跳转到 viewer
   objects/00..ff/                 # 内容寻址对象库，固定 256 个桶
   db/vibedrop.sqlite              # 规范化索引、快照和校验记录
   viewer/index.html               # 静态查看器
@@ -52,7 +53,7 @@ SQLite 保存四类核心索引：`history_entries` 保存历史记录，`media_
 
 ## 查看器入口
 
-Vault 根目录必须生成 `open-home-vault-viewer.html`，用于在 Mac mini Finder 中双击打开历史查看器。入口页默认跳转到 `http://localhost:8787/viewer/`，并提供 `minideMac-mini.local` 和局域网 IP 备用链接。项目根目录也保留同名入口页，默认跳转到 `http://minideMac-mini.local:8787/viewer/`，用于在 MacBook 上一键查看 Mac mini Vault。
+Vault 根目录必须生成 `open-home-vault-viewer.webloc`，用于在 Mac mini Finder 中双击直接打开历史查看器；这个文件指向 `http://localhost:8787/viewer/`，不会先显示中转页面。Vault 根目录也保留 `open-home-vault-viewer.html` 作为兜底入口，但必须立即跳转，不展示中间卡片。项目根目录同样保留 `.webloc` 和 HTML 入口，默认指向 `http://192.168.3.2:8787/viewer/`，用于在 MacBook 上一键查看 Mac mini Vault，避免 `.local` 在浏览器或代理环境中返回 502。
 
 入口页只负责跳转到 HTTP viewer，不直接用 `file://` 加载 `viewer/index.html`。原因是查看器需要读取 `viewer/data/history.json` 和 `report.json`，浏览器直接打开本地 HTML 时可能拦截本地 JSON 读取；HTTP 服务路径更稳定，也和手机同步后刷新的静态 viewer 形态一致。
 
