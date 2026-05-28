@@ -17,7 +17,7 @@ final class VibeDropWebSocketHandler: ChannelInboundHandler {
         connectedClients: MacConnectedClientRegistry
     ) {
         self.session = MacWebSocketSession(
-            sessionId: UInt64(Date().timeIntervalSince1970 * 1000),
+            sessionId: MacWebSocketSessionID.next(),
             configuration: configuration
         )
         self.effectHandler = effectHandler
@@ -83,5 +83,19 @@ final class VibeDropWebSocketHandler: ChannelInboundHandler {
     ) {
         let frame = WebSocketFrame(fin: true, opcode: opcode, data: data)
         context.writeAndFlush(wrapOutboundOut(frame), promise: nil)
+    }
+}
+
+private enum MacWebSocketSessionID {
+    private static let lock = NSLock()
+    private static var last: UInt64 = 0
+
+    static func next() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        let timestamp = UInt64(Date().timeIntervalSince1970 * 1000)
+        let value = max(timestamp, last + 1)
+        last = value
+        return value
     }
 }
