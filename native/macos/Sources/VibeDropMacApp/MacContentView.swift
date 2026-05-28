@@ -301,6 +301,11 @@ private struct HistoryView: View {
     @State private var kindFilter = "all"
     @State private var statusFilter = "all"
     @State private var participantFilter = "all"
+    @State private var hourFilter = "all"
+    @State private var customStartDate = ""
+    @State private var customEndDate = ""
+    @State private var customStartTime = ""
+    @State private var customEndTime = ""
 
     private var participantFilters: [HistoryParticipantFilter] {
         buildHistoryParticipantFilters(entries: model.recentHistory)
@@ -309,15 +314,9 @@ private struct HistoryView: View {
     private var filteredEntries: [HistoryEntry] {
         let now = Date()
         return model.recentHistory.filter { entry in
-            switch timeFilter {
-            case "today":
-                guard Calendar.current.isDateInToday(entry.timestamp) else { return false }
-            case "7d":
-                guard entry.timestamp >= Calendar.current.date(byAdding: .day, value: -7, to: now) ?? now else { return false }
-            case "30d":
-                guard entry.timestamp >= Calendar.current.date(byAdding: .day, value: -30, to: now) ?? now else { return false }
-            default:
-                break
+            guard matchesHistoryDateFilter(entry.timestamp, filter: timeFilter, now: now, startDate: customStartDate, endDate: customEndDate),
+                  matchesHistoryHourFilter(entry.timestamp, filter: hourFilter, startTime: customStartTime, endTime: customEndTime) else {
+                return false
             }
             if kindFilter != "all" &&
                 entry.kind != kindFilter &&
@@ -406,9 +405,50 @@ private struct HistoryView: View {
                         Text("今天").tag("today")
                         Text("近7天").tag("7d")
                         Text("近30天").tag("30d")
+                        Text("自定义").tag("custom")
                     }
                     .pickerStyle(.segmented)
-                    .frame(width: 360)
+                    .frame(width: 440)
+                }
+                HStack(spacing: 12) {
+                    Picker("", selection: $hourFilter) {
+                        Text("全天").tag("all")
+                        Text("上午").tag("morning")
+                        Text("下午").tag("afternoon")
+                        Text("晚上").tag("evening")
+                        Text("凌晨").tag("night")
+                        Text("自定义时段").tag("custom")
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 150)
+                    if timeFilter == "custom" {
+                        TextField("开始日期 YYYY-MM-DD", text: $customStartDate)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 170)
+                        TextField("结束日期 YYYY-MM-DD", text: $customEndDate)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 170)
+                    }
+                    if hourFilter == "custom" {
+                        TextField("开始时间 HH:mm", text: $customStartTime)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 140)
+                        TextField("结束时间 HH:mm", text: $customEndTime)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 140)
+                    }
+                    if timeFilter == "custom" || hourFilter != "all" {
+                        Button("清除自定义") {
+                            timeFilter = "all"
+                            hourFilter = "all"
+                            customStartDate = ""
+                            customEndDate = ""
+                            customStartTime = ""
+                            customEndTime = ""
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    Spacer()
                 }
                 MacHistoryHeatmap(entries: filteredEntries)
                 if filteredEntries.isEmpty {
@@ -650,6 +690,102 @@ private func historyParticipantKey(id: String?, fallback: String) -> String {
     (id?.isEmpty == false ? id! : fallback)
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
+}
+
+private func matchesHistoryDateFilter(
+    _ date: Date,
+    filter: String,
+    now: Date,
+    startDate: String,
+    endDate: String
+) -> Bool {
+    let calendar = Calendar.current
+    let todayStart = calendar.startOfDay(for: now)
+    switch filter {
+    case "today":
+        return calendar.isDateInToday(date)
+    case "7d":
+        return date >= (calendar.date(byAdding: .day, value: -6, to: todayStart) ?? todayStart)
+    case "30d":
+        return date >= (calendar.date(byAdding: .day, value: -29, to: todayStart) ?? todayStart)
+    case "custom":
+        let entryKey = historyDateKey(date)
+        let start = normalizedHistoryDateInput(startDate)
+        let end = normalizedHistoryDateInput(endDate)
+        if !startDate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && start == nil { return false }
+        if !endDate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && end == nil { return false }
+        if let start, entryKey < start { return false }
+        if let end, entryKey > end { return false }
+        return true
+    default:
+        return true
+    }
+}
+
+private func matchesHistoryHourFilter(
+    _ date: Date,
+    filter: String,
+    startTime: String,
+    endTime: String
+) -> Bool {
+    let minute = Calendar.current.component(.hour, from: date) * 60 + Calendar.current.component(.minute, from: date)
+    let range: ClosedRange<Int>
+    switch filter {
+    case "morning":
+        range = 6 * 60...(11 * 60 + 59)
+    case "afternoon":
+        range = 12 * 60...(17 * 60 + 59)
+    case "evening":
+        range = 18 * 60...(23 * 60 + 59)
+    case "night":
+        range = 0...(5 * 60 + 59)
+    case "custom":
+        let trimmedStart = startTime.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedEnd = endTime.trimmingCharacters(in: .whitespacesAndNewlines)
+        let start = trimmedStart.isEmpty ? 0 : parseHistoryClockMinutes(trimmedStart)
+        let end = trimmedEnd.isEmpty ? (23 * 60 + 59) : parseHistoryClockMinutes(trimmedEnd)
+        guard let start, let end, start <= end else { return false }
+        range = start...end
+    default:
+        return true
+    }
+    return range.contains(minute)
+}
+
+private func historyDateKey(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "zh_CN")
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.dateFormat = "yyyy-MM-dd"
+    return formatter.string(from: date)
+}
+
+private func normalizedHistoryDateInput(_ value: String) -> String? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "zh_CN")
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.dateFormat = "yyyy-MM-dd"
+    formatter.isLenient = false
+    guard let date = formatter.date(from: trimmed), formatter.string(from: date) == trimmed else {
+        return nil
+    }
+    return trimmed
+}
+
+private func parseHistoryClockMinutes(_ value: String) -> Int? {
+    let parts = value.split(separator: ":")
+    guard parts.count == 2,
+          parts[0].count == 2,
+          parts[1].count == 2,
+          let hour = Int(parts[0]),
+          let minute = Int(parts[1]),
+          (0...23).contains(hour),
+          (0...59).contains(minute) else {
+        return nil
+    }
+    return hour * 60 + minute
 }
 
 private func kindLabel(_ kind: String) -> String {
