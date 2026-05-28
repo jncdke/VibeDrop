@@ -30,6 +30,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -827,11 +828,88 @@ private fun HistoryScreen(
     var selectedStatus by rememberSaveable { mutableStateOf("all") }
     var selectedParticipant by rememberSaveable { mutableStateOf("all") }
     var selectedTime by rememberSaveable { mutableStateOf(HistoryTimeFilter.All) }
+    var selectedHourFilter by rememberSaveable { mutableStateOf(HistoryHourFilter.All) }
+    var customStartDate by rememberSaveable { mutableStateOf("") }
+    var customEndDate by rememberSaveable { mutableStateOf("") }
+    var customStartTime by rememberSaveable { mutableStateOf("") }
+    var customEndTime by rememberSaveable { mutableStateOf("") }
+    var showCustomFilterDialog by rememberSaveable { mutableStateOf(false) }
+    var draftStartDate by remember { mutableStateOf("") }
+    var draftEndDate by remember { mutableStateOf("") }
+    var draftHourFilter by remember { mutableStateOf(HistoryHourFilter.All) }
+    var draftStartTime by remember { mutableStateOf("") }
+    var draftEndTime by remember { mutableStateOf("") }
     var dayWindowOffset by rememberSaveable { mutableIntStateOf(0) }
     var selectedHour by remember { mutableStateOf<HeatmapSelection?>(null) }
     val now = remember(entries.size) { System.currentTimeMillis() }
+    fun resetHeatmapWindow() {
+        dayWindowOffset = 0
+        selectedHour = null
+    }
+    fun openCustomFilterDialog(forceHourFilter: HistoryHourFilter? = null) {
+        draftStartDate = customStartDate
+        draftEndDate = customEndDate
+        draftHourFilter = forceHourFilter ?: selectedHourFilter
+        draftStartTime = customStartTime
+        draftEndTime = customEndTime
+        showCustomFilterDialog = true
+    }
+    fun applyCustomFilterDialog() {
+        val cleanedStartDate = draftStartDate.trim()
+        val cleanedEndDate = draftEndDate.trim()
+        val cleanedStartTime = draftStartTime.trim()
+        val cleanedEndTime = draftEndTime.trim()
+        val validationError = validateHistoryCustomFilters(
+            cleanedStartDate,
+            cleanedEndDate,
+            draftHourFilter,
+            cleanedStartTime,
+            cleanedEndTime
+        )
+        if (validationError != null) {
+            Toast.makeText(context, validationError, Toast.LENGTH_SHORT).show()
+            return
+        }
+        customStartDate = cleanedStartDate
+        customEndDate = cleanedEndDate
+        selectedTime = if (cleanedStartDate.isNotBlank() || cleanedEndDate.isNotBlank()) {
+            HistoryTimeFilter.Custom
+        } else if (selectedTime == HistoryTimeFilter.Custom) {
+            HistoryTimeFilter.All
+        } else {
+            selectedTime
+        }
+        selectedHourFilter = draftHourFilter
+        customStartTime = if (draftHourFilter == HistoryHourFilter.Custom) cleanedStartTime else ""
+        customEndTime = if (draftHourFilter == HistoryHourFilter.Custom) cleanedEndTime else ""
+        showCustomFilterDialog = false
+        resetHeatmapWindow()
+    }
+    fun clearCustomFilters() {
+        customStartDate = ""
+        customEndDate = ""
+        customStartTime = ""
+        customEndTime = ""
+        selectedTime = HistoryTimeFilter.All
+        selectedHourFilter = HistoryHourFilter.All
+        showCustomFilterDialog = false
+        resetHeatmapWindow()
+    }
     val participantFilters = remember(entries) { buildHistoryParticipantFilters(entries) }
-    val baseFiltered = remember(entries, query, selectedType, selectedStatus, selectedParticipant, selectedTime, now) {
+    val baseFiltered = remember(
+        entries,
+        query,
+        selectedType,
+        selectedStatus,
+        selectedParticipant,
+        selectedTime,
+        selectedHourFilter,
+        customStartDate,
+        customEndDate,
+        customStartTime,
+        customEndTime,
+        now
+    ) {
         entries
             .asSequence()
             .filter { it.matchesQuery(query) }
@@ -848,7 +926,17 @@ private fun HistoryScreen(
             .filter { record ->
                 selectedParticipant == "all" || record.matchesParticipantFilter(selectedParticipant)
             }
-            .filter { it.entry.matchesTimeFilter(selectedTime, now) }
+            .filter {
+                it.entry.matchesTimeFilter(
+                    selectedTime,
+                    selectedHourFilter,
+                    now,
+                    customStartDate,
+                    customEndDate,
+                    customStartTime,
+                    customEndTime
+                )
+            }
             .toList()
     }
     val visibleDays = remember(baseFiltered, now, dayWindowOffset) {
@@ -867,6 +955,24 @@ private fun HistoryScreen(
         } ?: baseFiltered
     }
     val peak = heatmapCounts.maxByOrNull { it.value }
+
+    if (showCustomFilterDialog) {
+        HistoryCustomFilterDialog(
+            startDate = draftStartDate,
+            endDate = draftEndDate,
+            hourFilter = draftHourFilter,
+            startTime = draftStartTime,
+            endTime = draftEndTime,
+            onStartDateChange = { draftStartDate = it },
+            onEndDateChange = { draftEndDate = it },
+            onHourFilterChange = { draftHourFilter = it },
+            onStartTimeChange = { draftStartTime = it },
+            onEndTimeChange = { draftEndTime = it },
+            onDismiss = { showCustomFilterDialog = false },
+            onClear = { clearCustomFilters() },
+            onApply = { applyCustomFilterDialog() }
+        )
+    }
 
     LazyColumn(
         modifier = modifier.fillMaxWidth(),
@@ -901,7 +1007,7 @@ private fun HistoryScreen(
                         value = query,
                         onValueChange = {
                             query = it
-                            selectedHour = null
+                            resetHeatmapWindow()
                         },
                         placeholder = { Text("搜索文本、文件名、设备、状态") },
                         modifier = Modifier.fillMaxWidth(),
@@ -912,7 +1018,7 @@ private fun HistoryScreen(
                                 TextButton(
                                     onClick = {
                                         query = ""
-                                        selectedHour = null
+                                        resetHeatmapWindow()
                                     }
                                 ) {
                                     Text("清空")
@@ -926,23 +1032,43 @@ private fun HistoryScreen(
                     ) {
                         HistoryFilterButton("全部时间", selectedTime == HistoryTimeFilter.All) {
                             selectedTime = HistoryTimeFilter.All
-                            dayWindowOffset = 0
-                            selectedHour = null
+                            resetHeatmapWindow()
                         }
                         HistoryFilterButton("今天", selectedTime == HistoryTimeFilter.Today) {
                             selectedTime = HistoryTimeFilter.Today
-                            dayWindowOffset = 0
-                            selectedHour = null
+                            resetHeatmapWindow()
                         }
                         HistoryFilterButton("近7天", selectedTime == HistoryTimeFilter.Last7Days) {
                             selectedTime = HistoryTimeFilter.Last7Days
-                            dayWindowOffset = 0
-                            selectedHour = null
+                            resetHeatmapWindow()
                         }
                         HistoryFilterButton("近30天", selectedTime == HistoryTimeFilter.Last30Days) {
                             selectedTime = HistoryTimeFilter.Last30Days
-                            dayWindowOffset = 0
-                            selectedHour = null
+                            resetHeatmapWindow()
+                        }
+                        HistoryFilterButton(
+                            historyCustomDateLabel(customStartDate, customEndDate),
+                            selectedTime == HistoryTimeFilter.Custom
+                        ) {
+                            openCustomFilterDialog()
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        HistoryHourFilter.entries.forEach { filter ->
+                            HistoryFilterButton(
+                                historyHourFilterLabel(filter, customStartTime, customEndTime),
+                                selectedHourFilter == filter
+                            ) {
+                                if (filter == HistoryHourFilter.Custom) {
+                                    openCustomFilterDialog(HistoryHourFilter.Custom)
+                                } else {
+                                    selectedHourFilter = filter
+                                    resetHeatmapWindow()
+                                }
+                            }
                         }
                     }
                     Row(
@@ -952,8 +1078,7 @@ private fun HistoryScreen(
                         historyTypeFilters.forEach { filter ->
                             HistoryFilterButton(filter.label, selectedType == filter.kind) {
                                 selectedType = filter.kind
-                                dayWindowOffset = 0
-                                selectedHour = null
+                                resetHeatmapWindow()
                             }
                         }
                     }
@@ -964,8 +1089,7 @@ private fun HistoryScreen(
                         historyStatusFilters.forEach { filter ->
                             HistoryFilterButton(filter.label, selectedStatus == filter.status) {
                                 selectedStatus = filter.status
-                                dayWindowOffset = 0
-                                selectedHour = null
+                                resetHeatmapWindow()
                             }
                         }
                     }
@@ -976,10 +1100,23 @@ private fun HistoryScreen(
                         participantFilters.forEach { filter ->
                             HistoryFilterButton(filter.label, selectedParticipant == filter.key) {
                                 selectedParticipant = filter.key
-                                dayWindowOffset = 0
-                                selectedHour = null
+                                resetHeatmapWindow()
                             }
                         }
+                    }
+                    historyActiveFilterSummary(
+                        selectedTime,
+                        selectedHourFilter,
+                        customStartDate,
+                        customEndDate,
+                        customStartTime,
+                        customEndTime
+                    ).takeIf { it.isNotBlank() }?.let { summary ->
+                        Text(
+                            text = summary,
+                            color = Color(0xFF667085),
+                            fontSize = 13.sp
+                        )
                     }
                 }
             }
@@ -1131,6 +1268,107 @@ private fun HistoryFilterButton(
         fontWeight = FontWeight.ExtraBold,
         fontSize = 13.sp,
         maxLines = 1
+    )
+}
+
+@Composable
+private fun HistoryCustomFilterDialog(
+    startDate: String,
+    endDate: String,
+    hourFilter: HistoryHourFilter,
+    startTime: String,
+    endTime: String,
+    onStartDateChange: (String) -> Unit,
+    onEndDateChange: (String) -> Unit,
+    onHourFilterChange: (HistoryHourFilter) -> Unit,
+    onStartTimeChange: (String) -> Unit,
+    onEndTimeChange: (String) -> Unit,
+    onDismiss: () -> Unit,
+    onClear: () -> Unit,
+    onApply: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text("自定义筛选", fontWeight = FontWeight.ExtraBold)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("日期范围", color = Color(0xFF111827), fontWeight = FontWeight.Bold)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = startDate,
+                        onValueChange = onStartDateChange,
+                        label = { Text("开始日期") },
+                        placeholder = { Text("2026-05-01") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = endDate,
+                        onValueChange = onEndDateChange,
+                        label = { Text("结束日期") },
+                        placeholder = { Text("2026-05-28") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Text("一天内时段", color = Color(0xFF111827), fontWeight = FontWeight.Bold)
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    HistoryHourFilter.entries.forEach { filter ->
+                        HistoryFilterButton(
+                            historyHourFilterLabel(filter, startTime, endTime),
+                            hourFilter == filter
+                        ) {
+                            onHourFilterChange(filter)
+                        }
+                    }
+                }
+                if (hourFilter == HistoryHourFilter.Custom) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = startTime,
+                            onValueChange = onStartTimeChange,
+                            label = { Text("开始时间") },
+                            placeholder = { Text("09:00") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        OutlinedTextField(
+                            value = endTime,
+                            onValueChange = onEndTimeChange,
+                            label = { Text("结束时间") },
+                            placeholder = { Text("18:30") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+                Text(
+                    text = "日期使用 YYYY-MM-DD，时间使用 HH:mm；留空表示不限制这一端。",
+                    color = Color(0xFF667085),
+                    fontSize = 12.sp
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onApply) {
+                Text("应用")
+            }
+        },
+        dismissButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = onClear) {
+                    Text("清除")
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("取消")
+                }
+            }
+        }
     )
 }
 
@@ -1997,7 +2235,17 @@ private enum class HistoryTimeFilter {
     All,
     Today,
     Last7Days,
-    Last30Days
+    Last30Days,
+    Custom
+}
+
+private enum class HistoryHourFilter {
+    All,
+    Morning,
+    Afternoon,
+    Evening,
+    Night,
+    Custom
 }
 
 private data class HistoryTypeFilter(val kind: String, val label: String)
@@ -2091,15 +2339,95 @@ private fun HistoryEntryWithItems.matchesQuery(query: String): Boolean {
 
 private fun HistoryEntryEntity.matchesTimeFilter(
     filter: HistoryTimeFilter,
-    now: Long
+    hourFilter: HistoryHourFilter,
+    now: Long,
+    customStartDate: String,
+    customEndDate: String,
+    customStartTime: String,
+    customEndTime: String
 ): Boolean {
     val todayStart = startOfDay(now)
-    return when (filter) {
+    val matchesDate = when (filter) {
         HistoryTimeFilter.All -> true
         HistoryTimeFilter.Today -> timestampMillis >= todayStart
         HistoryTimeFilter.Last7Days -> timestampMillis >= todayStart - 6L * DAY_MILLIS
         HistoryTimeFilter.Last30Days -> timestampMillis >= todayStart - 29L * DAY_MILLIS
+        HistoryTimeFilter.Custom -> matchesCustomDateRange(timestampMillis, customStartDate, customEndDate)
     }
+    return matchesDate && matchesHourRange(timestampMillis, hourFilter, customStartTime, customEndTime)
+}
+
+private fun matchesCustomDateRange(timestampMillis: Long, startDate: String, endDate: String): Boolean {
+    val dayKey = dateKey(timestampMillis)
+    if (startDate.isNotBlank() && dayKey < startDate) return false
+    if (endDate.isNotBlank() && dayKey > endDate) return false
+    return true
+}
+
+private fun matchesHourRange(
+    timestampMillis: Long,
+    filter: HistoryHourFilter,
+    customStartTime: String,
+    customEndTime: String
+): Boolean {
+    val minute = minuteOfDay(timestampMillis)
+    val range = when (filter) {
+        HistoryHourFilter.All -> return true
+        HistoryHourFilter.Morning -> 6 * 60 to 11 * 60 + 59
+        HistoryHourFilter.Afternoon -> 12 * 60 to 17 * 60 + 59
+        HistoryHourFilter.Evening -> 18 * 60 to 23 * 60 + 59
+        HistoryHourFilter.Night -> 0 to 5 * 60 + 59
+        HistoryHourFilter.Custom -> {
+            val start = parseClockMinutes(customStartTime) ?: 0
+            val end = parseClockMinutes(customEndTime) ?: 23 * 60 + 59
+            start to end
+        }
+    }
+    return minute in range.first..range.second
+}
+
+private fun validateHistoryCustomFilters(
+    startDate: String,
+    endDate: String,
+    hourFilter: HistoryHourFilter,
+    startTime: String,
+    endTime: String
+): String? {
+    if (startDate.isNotBlank() && !isValidDateKey(startDate)) return "开始日期格式应为 YYYY-MM-DD"
+    if (endDate.isNotBlank() && !isValidDateKey(endDate)) return "结束日期格式应为 YYYY-MM-DD"
+    if (startDate.isNotBlank() && endDate.isNotBlank() && startDate > endDate) return "开始日期不能晚于结束日期"
+    if (hourFilter != HistoryHourFilter.Custom) return null
+    val startMinutes = if (startTime.isBlank()) null else parseClockMinutes(startTime)
+    val endMinutes = if (endTime.isBlank()) null else parseClockMinutes(endTime)
+    if (startTime.isNotBlank() && startMinutes == null) return "开始时间格式应为 HH:mm"
+    if (endTime.isNotBlank() && endMinutes == null) return "结束时间格式应为 HH:mm"
+    if (startMinutes != null && endMinutes != null && startMinutes > endMinutes) return "开始时间不能晚于结束时间"
+    return null
+}
+
+private fun isValidDateKey(value: String): Boolean {
+    val parts = value.split("-")
+    if (parts.size != 3 || parts[0].length != 4 || parts[1].length != 2 || parts[2].length != 2) return false
+    val year = parts[0].toIntOrNull() ?: return false
+    val month = parts[1].toIntOrNull() ?: return false
+    val day = parts[2].toIntOrNull() ?: return false
+    val calendar = Calendar.getInstance(Locale.CHINA)
+    calendar.isLenient = false
+    return runCatching {
+        calendar.set(year, month - 1, day, 0, 0, 0)
+        calendar.set(Calendar.MILLISECOND, 0)
+        calendar.time
+        true
+    }.getOrDefault(false)
+}
+
+private fun parseClockMinutes(value: String): Int? {
+    val parts = value.split(":")
+    if (parts.size != 2 || parts[0].length != 2 || parts[1].length != 2) return null
+    val hour = parts[0].toIntOrNull() ?: return null
+    val minute = parts[1].toIntOrNull() ?: return null
+    if (hour !in 0..23 || minute !in 0..59) return null
+    return hour * 60 + minute
 }
 
 private fun buildVisibleDays(
@@ -2140,6 +2468,16 @@ private fun hourOfDay(timestampMillis: Long): Int {
     return calendar.get(Calendar.HOUR_OF_DAY)
 }
 
+private fun minuteOfDay(timestampMillis: Long): Int {
+    val calendar = Calendar.getInstance(Locale.CHINA)
+    calendar.timeInMillis = timestampMillis
+    return calendar.get(Calendar.HOUR_OF_DAY) * 60 + calendar.get(Calendar.MINUTE)
+}
+
+private fun dateKey(timestampMillis: Long): String {
+    return SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(Date(timestampMillis))
+}
+
 private fun heatColor(count: Int, maxCount: Int): Color {
     if (count <= 0 || maxCount <= 0) return Color(0xFFF1F4F7)
     val t = kotlin.math.sqrt((count.toFloat() / maxCount.toFloat()).coerceIn(0f, 1f))
@@ -2170,6 +2508,46 @@ private fun weekdayLabel(timestampMillis: Long): String {
 
 private fun historyTypeLabel(kind: String): String {
     return historyTypeFilters.firstOrNull { it.kind == kind }?.label ?: kindLabel(kind)
+}
+
+private fun historyCustomDateLabel(startDate: String, endDate: String): String {
+    if (startDate.isBlank() && endDate.isBlank()) return "自定义日期"
+    return "${startDate.ifBlank { "开始" }} - ${endDate.ifBlank { "结束" }}"
+}
+
+private fun historyHourFilterLabel(
+    filter: HistoryHourFilter,
+    customStartTime: String,
+    customEndTime: String
+): String = when (filter) {
+    HistoryHourFilter.All -> "全天"
+    HistoryHourFilter.Morning -> "上午"
+    HistoryHourFilter.Afternoon -> "下午"
+    HistoryHourFilter.Evening -> "晚上"
+    HistoryHourFilter.Night -> "凌晨"
+    HistoryHourFilter.Custom -> if (customStartTime.isBlank() && customEndTime.isBlank()) {
+        "自定义时段"
+    } else {
+        "${customStartTime.ifBlank { "00:00" }} - ${customEndTime.ifBlank { "23:59" }}"
+    }
+}
+
+private fun historyActiveFilterSummary(
+    timeFilter: HistoryTimeFilter,
+    hourFilter: HistoryHourFilter,
+    customStartDate: String,
+    customEndDate: String,
+    customStartTime: String,
+    customEndTime: String
+): String {
+    val labels = mutableListOf<String>()
+    if (timeFilter == HistoryTimeFilter.Custom) {
+        labels += "日期：${historyCustomDateLabel(customStartDate, customEndDate)}"
+    }
+    if (hourFilter != HistoryHourFilter.All) {
+        labels += "时段：${historyHourFilterLabel(hourFilter, customStartTime, customEndTime)}"
+    }
+    return labels.joinToString(" · ")
 }
 
 private fun decodeThumbnailDataUrl(value: String?): ImageBitmap? {
