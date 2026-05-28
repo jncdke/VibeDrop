@@ -10,7 +10,10 @@ if !MacKeyboardInputService.requestAccessibilityTrust(prompt: true) {
 }
 
 let databaseURL = try MacRuntimePaths.defaultDatabaseURL()
-let historyDatabase = try MacHistoryDatabase(url: databaseURL)
+let historyDatabase = try MacHistoryDatabase(
+    url: databaseURL,
+    legacyAppendURL: try MacRuntimePaths.legacyHistoryJSONLURL()
+)
 let runtime = MacRuntimeEffectHandler(
     configuration: configuration,
     historyDatabase: historyDatabase,

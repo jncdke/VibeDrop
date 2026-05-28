@@ -581,7 +581,7 @@ Android：
 
 - 旧 Tauri Android 和新 Kotlin Android 都能连接新 macOS。
 - Mac 状态栏、权限、输入模拟、剪贴板广播行为一致。
-- `~/.vibedrop/history.jsonl` 旧数据可导入，新数据写入 SQLite。
+- `~/.vibedrop/history.jsonl` 旧数据可导入，新数据以 SQLite 为主存储，同时向 `~/.vibedrop/history.jsonl` 追加兼容 JSONL，保证现有 Home Vault/脚本链路继续可读。
 
 ### 阶段 5：macOS 拖拽/分享与历史页面
 

@@ -1,6 +1,6 @@
 # VibeDrop native macOS
 
-这是 macOS 原生重构入口。当前阶段先建立 Swift Package 级别的 core 模型，覆盖 v1 协议 action、设备身份和历史记录结构，并加入 `VibeDropMacStorage` 数据层，用 GRDB/SQLite 导入旧 Tauri 的 `~/.vibedrop/history.jsonl`。`VibeDropMacServer` 已开始接入 SwiftNIO，提供原生 HTTP/WebSocket/UDP 预览服务，覆盖 `/discover`、`/pair/request`、`/pair/status/{id}`、`/ws` 的 v1 认证、ping/pong、文本消息分流，以及 UDP `discover_probe` 应答。
+这是 macOS 原生重构入口。当前阶段先建立 Swift Package 级别的 core 模型，覆盖 v1 协议 action、设备身份和历史记录结构，并加入 `VibeDropMacStorage` 数据层，用 GRDB/SQLite 导入旧 Tauri 的 `~/.vibedrop/history.jsonl`，原生新历史以 SQLite 为主，同时追加兼容 JSONL 供现有 Home Vault 同步脚本读取。`VibeDropMacServer` 已开始接入 SwiftNIO，提供原生 HTTP/WebSocket/UDP 预览服务，覆盖 `/discover`、`/pair/request`、`/pair/status/{id}`、`/ws` 的 v1 认证、ping/pong、文本消息分流，以及 UDP `discover_probe` 应答。
 
 ## 当前构建
 
@@ -23,7 +23,7 @@ cd native/macos
 swift run VibeDropMacApp
 ```
 
-这个预览服务已经是真实网络监听。当前预览已接入文本/回车输入模拟、图片剪贴板、文件收件箱、桌面到 Android 分片发送、文件夹/多文件 ZIP 打包发送、手机保存回执、SQLite 历史写入、SwiftUI/AppKit 基础窗口、macOS 登录项开机启动开关、Finder/Share Extension 共享队列兼容，以及 App 内诊断日志/诊断 JSON 导出；首次运行时 macOS 会弹辅助功能权限，授权后 Android 发来的 `type`、`type_enter`、`enter` 才能真正写到当前焦点应用。图片会保存到 `~/.vibedrop/received-images` 并写入系统剪贴板，文件会保存到 `~/Downloads/VibeDrop 收件箱`，分片接收的临时文件在 `~/.vibedrop/incoming-downloads`。历史页读取原生 SQLite 全量记录并支持导出完整 JSON 到 `~/Downloads`。诊断事件写在 `~/Library/Application Support/VibeDrop/diagnostics/events.jsonl`，导出文件写到 `~/Downloads`，只记录服务状态、配对、连接数量和文件发送数量，不记录正文、剪贴板内容和文件路径。登录项开关使用 `SMAppService.mainApp`，真正注册需要打包签名后的 `.app` bundle，`swift run` 开发态可能显示为不支持。
+这个预览服务已经是真实网络监听。当前预览已接入文本/回车输入模拟、图片剪贴板、文件收件箱、桌面到 Android 分片发送、文件夹/多文件 ZIP 打包发送、手机保存回执、SQLite 历史写入、兼容 JSONL 追加、SwiftUI/AppKit 基础窗口、macOS 登录项开机启动开关、Finder/Share Extension 共享队列兼容，以及 App 内诊断日志/诊断 JSON 导出；首次运行时 macOS 会弹辅助功能权限，授权后 Android 发来的 `type`、`type_enter`、`enter` 才能真正写到当前焦点应用。图片会保存到 `~/.vibedrop/received-images` 并写入系统剪贴板，文件会保存到 `~/Downloads/VibeDrop 收件箱`，分片接收的临时文件在 `~/.vibedrop/incoming-downloads`。历史页读取原生 SQLite 全量记录并支持导出完整 JSON 到 `~/Downloads`。诊断事件写在 `~/Library/Application Support/VibeDrop/diagnostics/events.jsonl`，导出文件写到 `~/Downloads`，只记录服务状态、配对、连接数量和文件发送数量，不记录正文、剪贴板内容和文件路径。登录项开关使用 `SMAppService.mainApp`，真正注册需要打包签名后的 `.app` bundle，`swift run` 开发态可能显示为不支持。
 
 ## 后续模块
 

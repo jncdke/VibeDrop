@@ -445,7 +445,7 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
             saveTarget: metadata?.saveTarget ?? message.saveTarget ?? "desktop_inbox",
             items: items
         )
-        try? historyDatabase.insert(entry)
+        try? historyDatabase.insert(entry, appendLegacyJSONL: entry.status != "pending")
     }
 
     private func recordMediaFailure(

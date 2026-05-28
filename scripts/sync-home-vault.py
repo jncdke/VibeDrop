@@ -148,6 +148,8 @@ def record_entry_id(record: dict[str, Any]) -> str:
     exported_id = entry.get("id")
     if source.startswith("android") and exported_id is not None and str(exported_id).strip():
         return sha256_text(f"android-entry:{exported_id}")
+    if source.startswith("macbook:") and exported_id is not None and str(exported_id).strip():
+        return sha256_text(f"mac-entry:{exported_id}")
     return sha256_text(record["raw_line"])
 
 

@@ -33,6 +33,13 @@ public enum MacRuntimePaths {
         return directory
     }
 
+    public static func legacyHistoryJSONLURL(
+        fileManager: FileManager = .default
+    ) throws -> URL {
+        try legacyVibeDropDirectory(fileManager: fileManager)
+            .appendingPathComponent("history.jsonl")
+    }
+
     public static func receivedImagesDirectory(
         fileManager: FileManager = .default
     ) throws -> URL {

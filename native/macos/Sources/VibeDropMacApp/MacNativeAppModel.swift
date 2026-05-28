@@ -80,7 +80,10 @@ final class MacNativeAppModel: ObservableObject {
         do {
             let configuration = try MacRuntimeConfigurationFactory.load()
             let databaseURL = try MacRuntimePaths.defaultDatabaseURL()
-            let database = try MacHistoryDatabase(url: databaseURL)
+            let database = try MacHistoryDatabase(
+                url: databaseURL,
+                legacyAppendURL: try MacRuntimePaths.legacyHistoryJSONLURL()
+            )
             importLegacyHistoryIfAvailable(database: database, configuration: configuration)
 
             let pairManager = PairRequestManager()

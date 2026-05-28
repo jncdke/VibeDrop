@@ -4,21 +4,31 @@ import VibeDropNativeCore
 
 public final class MacHistoryDatabase: @unchecked Sendable {
     private let queue: DatabaseQueue
+    private let legacyAppendURL: URL?
+    private let legacyAppendLock = NSLock()
 
-    public init(path: String) throws {
+    public init(path: String, legacyAppendURL: URL? = nil) throws {
         var configuration = Configuration()
         configuration.foreignKeysEnabled = true
+        self.legacyAppendURL = legacyAppendURL
         self.queue = try DatabaseQueue(path: path, configuration: configuration)
         try migrate()
     }
 
-    public convenience init(url: URL) throws {
-        try self.init(path: url.path)
+    public convenience init(url: URL, legacyAppendURL: URL? = nil) throws {
+        try self.init(path: url.path, legacyAppendURL: legacyAppendURL)
     }
 
-    public func insert(_ entry: HistoryEntry, rawJSON: String? = nil) throws {
+    public func insert(
+        _ entry: HistoryEntry,
+        rawJSON: String? = nil,
+        appendLegacyJSONL: Bool = true
+    ) throws {
         try queue.write { db in
             try insert(entry, rawJSON: rawJSON, db: db)
+        }
+        if appendLegacyJSONL {
+            try? self.appendLegacyJSONL(entry)
         }
     }
 
@@ -104,7 +114,7 @@ public final class MacHistoryDatabase: @unchecked Sendable {
                     report.skippedDuplicates += 1
                     continue
                 }
-                try insert(entry, rawJSON: jsonLine)
+                try insert(entry, rawJSON: jsonLine, appendLegacyJSONL: false)
                 report.imported += 1
             } catch {
                 report.failed += 1
@@ -289,5 +299,155 @@ public final class MacHistoryDatabase: @unchecked Sendable {
 
     private func milliseconds(_ date: Date) -> Int64 {
         Int64((date.timeIntervalSince1970 * 1000.0).rounded())
+    }
+
+    private func appendLegacyJSONL(_ entry: HistoryEntry) throws {
+        guard let legacyAppendURL else { return }
+        let data = try LegacyMacHistoryJSONLRecord(entry: entry).jsonLineData()
+        legacyAppendLock.lock()
+        defer { legacyAppendLock.unlock() }
+        let parent = legacyAppendURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: legacyAppendURL.path) {
+            FileManager.default.createFile(atPath: legacyAppendURL.path, contents: nil)
+        }
+        let handle = try FileHandle(forWritingTo: legacyAppendURL)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+    }
+}
+
+private struct LegacyMacHistoryJSONLRecord: Encodable {
+    var id: String
+    var timestamp: String
+    var text: String
+    var clientIp: String
+    var clientId: String?
+    var clientName: String?
+    var kind: String?
+    var fileName: String?
+    var imagePath: String?
+    var thumbnailDataUrl: String?
+    var filePath: String?
+    var savedPath: String?
+    var mimeType: String?
+    var sizeBytes: Int64?
+    var direction: String?
+    var status: String?
+    var sessionId: String?
+    var itemCount: Int?
+    var saveTarget: String?
+    var targetDeviceName: String?
+    var targetServerId: String?
+    var hostname: String?
+    var items: [LegacyMacHistoryJSONLItem]?
+
+    init(entry: HistoryEntry) {
+        let mobile = entry.direction == "desktop_to_mobile" ? entry.receiver : entry.sender
+        let desktop = entry.direction == "desktop_to_mobile" ? entry.sender : entry.receiver
+        let firstItem = entry.items.first
+        let firstPath = firstItem?.savedPath ?? firstItem?.localPath
+        id = entry.id
+        timestamp = Self.timestampFormatter.string(from: entry.timestamp)
+        text = entry.text ?? ""
+        clientIp = mobile?.ip ?? ""
+        clientId = mobile?.deviceId
+        clientName = mobile?.displayName
+        kind = entry.kind
+        fileName = firstItem?.fileName
+        imagePath = firstItem?.kind == "image" ? firstPath : nil
+        thumbnailDataUrl = firstItem?.thumbnailDataUrl
+        filePath = firstItem?.kind == "image" ? nil : firstPath
+        savedPath = firstItem?.savedPath
+        mimeType = firstItem?.mimeType
+        sizeBytes = firstItem?.sizeBytes
+        direction = entry.direction
+        status = entry.status
+        sessionId = entry.sessionId
+        itemCount = entry.itemCount
+        saveTarget = entry.saveTarget
+        targetDeviceName = desktop?.displayName
+        targetServerId = desktop?.deviceId
+        hostname = desktop?.host ?? desktop?.displayName
+        items = entry.items.isEmpty ? nil : entry.items.enumerated().map { index, item in
+            LegacyMacHistoryJSONLItem(index: index, item: item)
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case timestamp
+        case text
+        case clientIp = "client_ip"
+        case clientId = "client_id"
+        case clientName = "client_name"
+        case kind
+        case fileName = "file_name"
+        case imagePath = "image_path"
+        case thumbnailDataUrl = "thumbnail_data_url"
+        case filePath = "file_path"
+        case savedPath = "saved_path"
+        case mimeType = "mime_type"
+        case sizeBytes = "size_bytes"
+        case direction
+        case status
+        case sessionId = "session_id"
+        case itemCount = "item_count"
+        case saveTarget = "save_target"
+        case targetDeviceName
+        case targetServerId
+        case hostname
+        case items
+    }
+
+    func jsonLineData() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        var data = try encoder.encode(self)
+        data.append(0x0A)
+        return data
+    }
+
+    private static let timestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+}
+
+private struct LegacyMacHistoryJSONLItem: Encodable {
+    var kind: String
+    var fileName: String?
+    var mimeType: String?
+    var thumbnailDataUrl: String?
+    var filePath: String?
+    var savedPath: String?
+    var sizeBytes: Int64?
+    var status: String?
+    var error: String?
+
+    init(index _: Int, item: HistoryItem) {
+        kind = item.kind
+        fileName = item.fileName
+        mimeType = item.mimeType
+        thumbnailDataUrl = item.thumbnailDataUrl
+        filePath = item.localPath ?? item.savedPath
+        savedPath = item.savedPath
+        sizeBytes = item.sizeBytes
+        status = item.status
+        error = item.error
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case fileName = "file_name"
+        case mimeType = "mime_type"
+        case thumbnailDataUrl = "thumbnail_data_url"
+        case filePath = "file_path"
+        case savedPath = "saved_path"
+        case sizeBytes = "size_bytes"
+        case status
+        case error
     }
 }
