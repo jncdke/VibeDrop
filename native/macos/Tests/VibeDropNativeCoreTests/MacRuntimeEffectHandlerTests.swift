@@ -192,6 +192,65 @@ final class MacRuntimeEffectHandlerTests: XCTestCase {
         XCTAssertEqual(recent.first?.items.first?.sizeBytes, Int64(bytes.count))
     }
 
+    func testIncomingFileErrorCancelsPartialIncomingFile() throws {
+        let fixture = try RuntimeFixture()
+        defer { fixture.cleanup() }
+        let runtime = MacRuntimeEffectHandler(
+            configuration: fixture.configuration,
+            historyDatabase: fixture.database,
+            inputController: RecordingInputController(),
+            imageClipboard: RecordingImageClipboard(),
+            contentStore: fixture.contentStore
+        )
+        let transferId = "transfer-cancel"
+        let bytes = Data("partial data".utf8)
+
+        XCTAssertEqual(
+            runtime.handle(
+                .incomingFileStart(
+                    VibeDropMessage(
+                        action: .incomingFileStart,
+                        fileName: "cancel.txt",
+                        mimeType: "text/plain",
+                        transferId: transferId,
+                        sizeBytes: Int64(bytes.count)
+                    ),
+                    peer: fixture.peer
+                )
+            ),
+            [.status(MacServerStatusEnvelope(status: "ok"))]
+        )
+        XCTAssertEqual(
+            runtime.handle(
+                .incomingFileChunk(
+                    VibeDropMessage(
+                        action: .incomingFileChunk,
+                        transferId: transferId,
+                        chunkBase64: bytes.base64EncodedString()
+                    ),
+                    peer: fixture.peer
+                )
+            ),
+            []
+        )
+        let partURL = fixture.directory
+            .appendingPathComponent("incoming", isDirectory: true)
+            .appendingPathComponent("\(transferId).part")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: partURL.path))
+
+        let outbound = runtime.handle(
+            .incomingFileError(
+                transferId: transferId,
+                error: "Android 发送文件失败",
+                peer: fixture.peer
+            )
+        )
+
+        XCTAssertEqual(outbound, [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partURL.path))
+        XCTAssertEqual(try fixture.database.countEntries(), 0)
+    }
+
     func testIncomingBatchFilesAreAggregatedIntoOneHistoryEntry() throws {
         let fixture = try RuntimeFixture()
         defer { fixture.cleanup() }

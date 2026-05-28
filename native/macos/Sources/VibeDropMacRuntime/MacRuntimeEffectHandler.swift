@@ -80,10 +80,9 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
             outboundTransfers.resolveSaved(transferId: transferId, savedPath: savedPath)
             return []
         case let .incomingFileError(transferId, error, _):
-            guard let outboundTransfers else {
-                return MacServerDefaultEffectHandler.preview(effect)
-            }
-            outboundTransfers.resolveFailed(transferId: transferId, error: error)
+            outboundTransfers?.resolveFailed(transferId: transferId, error: error)
+            contentStore?.cancelIncomingFile(transferId: transferId)
+            removeIncomingFileMetadata(transferId: transferId)
             return []
         }
     }
