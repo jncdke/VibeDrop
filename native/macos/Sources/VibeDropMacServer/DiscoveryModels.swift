@@ -27,7 +27,7 @@ public struct DiscoverResponse: Codable, Equatable, Sendable {
         configuration: MacServerConfiguration,
         advertisedIP: String? = nil
     ) {
-        self.kind = "vibedrop_desktop"
+        self.kind = "desktop"
         self.serverId = configuration.serverId
         self.hostname = configuration.hostname
         self.ip = advertisedIP ?? configuration.ip

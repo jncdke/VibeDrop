@@ -7,9 +7,10 @@
 ## 目标
 
 1. Android 原生端增加本地 unit test，直接读取协议 fixture，验证发送端生成 JSON 与现有 v1 字段兼容。
-2. 验证 `parseAction` 能识别所有带 `action` 的 v1 消息，并且对非 WebSocket action fixture 返回空。
-3. 验证 Android 历史 JSON 导出包含 Home Vault 和旧脚本需要的 sender/receiver camelCase 与 snake_case 字段。
-4. 让 `:app:testDebugUnitTest` 成为原生 Android parity 的自动验证入口之一。
+2. macOS 原生端增加 Swift test，直接读取同一批协议 fixture，验证服务端 v1 解码和 discovery response 字段。
+3. 验证 `parseAction` 能识别所有带 `action` 的 v1 消息，并且对非 WebSocket action fixture 返回空。
+4. 验证 Android 历史 JSON 导出包含 Home Vault 和旧脚本需要的 sender/receiver camelCase 与 snake_case 字段。
+5. 让 `:app:testDebugUnitTest` 和 `swift test` 成为原生 parity 的自动验证入口。
 
 ## 非目标
 
@@ -25,8 +26,14 @@ Android test source set 增加三类验证：
 2. `parseAction` 扫描消息 fixture，覆盖 `auth`、`ping`、`pong`、`clipboard`、`type`、`type_enter`、`enter`、`image_clipboard`、`incoming_history_session_start`、`incoming_file_*`。
 3. `HistoryArchiveJson` 直接构造一条带完整身份元数据和缩略图的历史，断言导出 JSON 同时包含 `senderBaseDeviceId/sender_base_device_id`、`receiverHost/receiver_host`、`targetHost`、`thumbnailDataUrl/thumbnail_data_url`。
 
+macOS Swift tests 增加两类验证：
+
+1. `VibeDropMessage` 解码所有带 `action` 的消息 fixture，覆盖 `type_enter`、`image_clipboard`、`incoming_history_session_start`、`incoming_file_*` 等字段。
+2. `DiscoverResponse` 对照 `discover-response.json`，确保 HTTP 和 UDP discovery 继续输出旧 Tauri 兼容的 `kind:"desktop"`。
+
 ## 验收
 
 1. `:app:testDebugUnitTest` 通过。
-2. Android debug/release 构建继续通过。
-3. `git diff --check` 通过。
+2. `swift test` 通过。
+3. Android debug/release 构建继续通过。
+4. `git diff --check` 通过。

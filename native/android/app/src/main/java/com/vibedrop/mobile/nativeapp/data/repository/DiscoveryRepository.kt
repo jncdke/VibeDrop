@@ -350,7 +350,8 @@ class DiscoveryRepository(
         source: String
     ): DiscoveredDesktop? {
         val json = runCatching { JSONObject(text) }.getOrNull() ?: return null
-        if (json.optString("kind") != "desktop") return null
+        val kind = json.optString("kind")
+        if (kind != "desktop" && kind != "vibedrop_desktop") return null
         val serverId = json.optString("server_id")
         val hostname = json.optString("hostname", fallbackIp)
         val ip = json.optString("ip", fallbackIp).ifBlank { fallbackIp }

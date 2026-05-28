@@ -56,7 +56,7 @@ final class MacServerTransportTests: XCTestCase {
         let (discoverData, discoverResponse) = try await URLSession.shared.data(from: discoverURL)
         XCTAssertEqual((discoverResponse as? HTTPURLResponse)?.statusCode, 200)
         let discover = try JSONDecoder().decode(DiscoverResponse.self, from: discoverData)
-        XCTAssertEqual(discover.kind, "vibedrop_desktop")
+        XCTAssertEqual(discover.kind, "desktop")
         XCTAssertEqual(discover.serverId, "desktop_transport_test")
         XCTAssertEqual(discover.hostname, "transport-test.local")
 
