@@ -95,6 +95,60 @@ class DesktopConnectionController(
         return socket?.send(JSONObject().put("action", VibeDropActions.Enter).toString()) == true
     }
 
+    fun sendImageClipboard(
+        fileName: String,
+        mimeType: String,
+        imageBase64: String
+    ): Boolean {
+        return socket?.send(
+            JSONObject()
+                .put("action", VibeDropActions.ImageClipboard)
+                .put("file_name", fileName)
+                .put("mime_type", mimeType)
+                .put("image_base64", imageBase64)
+                .toString()
+        ) == true
+    }
+
+    fun sendIncomingFileStart(
+        transferId: String,
+        fileName: String,
+        mimeType: String,
+        sizeBytes: Long
+    ): Boolean {
+        return socket?.send(
+            JSONObject()
+                .put("action", VibeDropActions.IncomingFileStart)
+                .put("transfer_id", transferId)
+                .put("file_name", fileName)
+                .put("mime_type", mimeType)
+                .put("size_bytes", sizeBytes)
+                .toString()
+        ) == true
+    }
+
+    fun sendIncomingFileChunk(
+        transferId: String,
+        chunkBase64: String
+    ): Boolean {
+        return socket?.send(
+            JSONObject()
+                .put("action", VibeDropActions.IncomingFileChunk)
+                .put("transfer_id", transferId)
+                .put("chunk_base64", chunkBase64)
+                .toString()
+        ) == true
+    }
+
+    fun sendIncomingFileComplete(transferId: String): Boolean {
+        return socket?.send(
+            JSONObject()
+                .put("action", VibeDropActions.IncomingFileComplete)
+                .put("transfer_id", transferId)
+                .toString()
+        ) == true
+    }
+
     fun close() {
         socket?.close(1000, "dispose")
         socket = null

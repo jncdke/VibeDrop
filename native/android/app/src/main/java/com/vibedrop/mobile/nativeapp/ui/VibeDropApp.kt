@@ -1,6 +1,8 @@
 package com.vibedrop.mobile.nativeapp.ui
 
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -55,6 +57,8 @@ import com.vibedrop.mobile.nativeapp.data.AppContainer
 import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import com.vibedrop.mobile.nativeapp.platform.readClipboardText
+import com.vibedrop.mobile.nativeapp.platform.sendImageUriToMacClipboard
+import com.vibedrop.mobile.nativeapp.platform.sendUriToDesktopInbox
 import com.vibedrop.mobile.nativeapp.platform.startClipboardSyncService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -305,7 +309,50 @@ private fun SendScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val drafts = remember { mutableStateMapOf<String, String>() }
+    var pendingImageDeviceId by remember { mutableStateOf<String?>(null) }
+    var pendingFileDeviceId by remember { mutableStateOf<String?>(null) }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        val deviceId = pendingImageDeviceId
+        pendingImageDeviceId = null
+        if (uri == null || deviceId == null) return@rememberLauncherForActivityResult
+        val controller = controllers[deviceId] ?: return@rememberLauncherForActivityResult
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    sendImageUriToMacClipboard(context, uri, controller)
+                }
+            }
+            result
+                .onSuccess {
+                    Toast.makeText(context, "已发送图片到 Mac 剪贴板：${it.fileName}", Toast.LENGTH_SHORT).show()
+                }
+                .onFailure {
+                    Toast.makeText(context, "图片发送失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                }
+        }
+    }
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val deviceId = pendingFileDeviceId
+        pendingFileDeviceId = null
+        if (uri == null || deviceId == null) return@rememberLauncherForActivityResult
+        val controller = controllers[deviceId] ?: return@rememberLauncherForActivityResult
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    sendUriToDesktopInbox(context, uri, controller)
+                }
+            }
+            result
+                .onSuccess {
+                    Toast.makeText(context, "已发送到 Mac 收件箱：${it.fileName}", Toast.LENGTH_SHORT).show()
+                }
+                .onFailure {
+                    Toast.makeText(context, "文件发送失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                }
+        }
+    }
 
     if (devices.isEmpty()) {
         EmptyDeviceState(
@@ -345,6 +392,14 @@ private fun SendScreen(
                     if (!controller.sendEnter()) {
                         Toast.makeText(context, "回车失败：连接不可用", Toast.LENGTH_SHORT).show()
                     }
+                },
+                onPickImage = {
+                    pendingImageDeviceId = device.id
+                    imagePicker.launch("image/*")
+                },
+                onPickFile = {
+                    pendingFileDeviceId = device.id
+                    filePicker.launch(arrayOf("*/*"))
                 }
             )
         }
@@ -390,7 +445,9 @@ private fun SendDeviceCard(
     draft: String,
     onDraftChange: (String) -> Unit,
     onSend: (pressEnter: Boolean) -> Unit,
-    onEnter: () -> Unit
+    onEnter: () -> Unit,
+    onPickImage: () -> Unit,
+    onPickFile: () -> Unit
 ) {
     val connected = connection.status == ConnectionStatus.Connected
     Card(
@@ -484,14 +541,14 @@ private fun SendDeviceCard(
 
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedButton(
-                    onClick = { },
+                    onClick = onPickImage,
                     enabled = connected,
                     modifier = Modifier.weight(1f)
                 ) {
                     Text("传图到剪贴板", fontWeight = FontWeight.Bold)
                 }
                 OutlinedButton(
-                    onClick = { },
+                    onClick = onPickFile,
                     enabled = connected,
                     modifier = Modifier.weight(1f)
                 ) {
