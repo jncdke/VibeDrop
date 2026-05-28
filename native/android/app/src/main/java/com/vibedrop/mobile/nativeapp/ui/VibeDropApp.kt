@@ -267,6 +267,8 @@ fun VibeDropApp(container: AppContainer) {
                 )
                 1 -> HistoryScreen(
                     entries = history,
+                    identity = container.androidIdentity,
+                    devices = devices,
                     imageOpenMode = imageOpenMode,
                     videoOpenMode = videoOpenMode,
                     modifier = Modifier.weight(1f)
@@ -1146,6 +1148,8 @@ private fun isSharedImageUri(
 @Composable
 private fun HistoryScreen(
     entries: List<HistoryEntryWithItems>,
+    identity: AndroidDeviceIdentity,
+    devices: List<DesktopDevice>,
     imageOpenMode: MediaOpenMode,
     videoOpenMode: MediaOpenMode,
     modifier: Modifier = Modifier
@@ -1173,6 +1177,7 @@ private fun HistoryScreen(
     var previewRecord by remember { mutableStateOf<HistoryEntryWithItems?>(null) }
     var previewIndex by remember { mutableIntStateOf(0) }
     val now = remember(entries.size) { System.currentTimeMillis() }
+    val identityContext = remember(identity, devices) { HistoryIdentityContext(identity, devices) }
 
     fun openHistoryItem(item: HistoryItemEntity) {
         val mode = if (item.kind == "video") videoOpenMode else imageOpenMode
@@ -1240,8 +1245,12 @@ private fun HistoryScreen(
         showCustomFilterDialog = false
         resetHeatmapWindow()
     }
-    val senderFilters = remember(entries) { buildHistoryEndpointFilters(entries, HistoryEndpoint.Sender) }
-    val receiverFilters = remember(entries) { buildHistoryEndpointFilters(entries, HistoryEndpoint.Receiver) }
+    val senderFilters = remember(entries, identityContext) {
+        buildHistoryEndpointFilters(entries, HistoryEndpoint.Sender, identityContext)
+    }
+    val receiverFilters = remember(entries, identityContext) {
+        buildHistoryEndpointFilters(entries, HistoryEndpoint.Receiver, identityContext)
+    }
     val baseFiltered = remember(
         entries,
         query,
@@ -1255,6 +1264,7 @@ private fun HistoryScreen(
         customEndDate,
         customStartTime,
         customEndTime,
+        identityContext,
         now
     ) {
         entries
@@ -1271,10 +1281,10 @@ private fun HistoryScreen(
                     record.items.any { it.status == selectedStatus }
             }
             .filter { record ->
-                selectedSender == "all" || record.matchesSenderFilter(selectedSender)
+                selectedSender == "all" || record.matchesSenderFilter(selectedSender, identityContext)
             }
             .filter { record ->
-                selectedReceiver == "all" || record.matchesReceiverFilter(selectedReceiver)
+                selectedReceiver == "all" || record.matchesReceiverFilter(selectedReceiver, identityContext)
             }
             .filter {
                 it.entry.matchesTimeFilter(
@@ -3203,6 +3213,16 @@ private enum class HistoryEndpoint {
 
 private data class HistoryEndpointFilter(val key: String, val label: String)
 
+private data class HistoryIdentityContext(
+    val android: AndroidDeviceIdentity,
+    val desktops: List<DesktopDevice>
+)
+
+private data class ResolvedHistoryEndpoint(
+    val key: String,
+    val label: String
+)
+
 private data class HeatmapSelection(
     val dayStartMillis: Long,
     val hour: Int
@@ -3229,7 +3249,8 @@ private const val DAY_MILLIS = 24L * 60L * 60L * 1000L
 
 private fun buildHistoryEndpointFilters(
     entries: List<HistoryEntryWithItems>,
-    endpoint: HistoryEndpoint
+    endpoint: HistoryEndpoint,
+    identityContext: HistoryIdentityContext
 ): List<HistoryEndpointFilter> {
     val counts = linkedMapOf<String, Pair<String, Int>>()
     entries.forEach { record ->
@@ -3237,10 +3258,18 @@ private fun buildHistoryEndpointFilters(
             HistoryEndpoint.Sender -> record.entry.senderDeviceId to record.entry.senderName
             HistoryEndpoint.Receiver -> record.entry.receiverDeviceId to record.entry.receiverName
         }
-        val label = name?.takeIf { it.isNotBlank() } ?: id?.takeIf { it.isNotBlank() } ?: return@forEach
-        val key = historyParticipantKey(id, label)
+        val label = name?.takeIf { it.isNotBlank() } ?: id?.takeIf { it.isNotBlank() } ?: ""
+        val resolved = resolveHistoryEndpoint(
+            id = id,
+            name = name,
+            direction = record.entry.direction,
+            endpoint = endpoint,
+            identityContext = identityContext
+        )
+        val key = resolved.key.takeIf { it.isNotBlank() } ?: return@forEach
         val current = counts[key]
-        counts[key] = label to ((current?.second ?: 0) + 1)
+        counts[key] = chooseHistoryEndpointLabel(current?.first, resolved.label.ifBlank { label }) to
+            ((current?.second ?: 0) + 1)
     }
     val allLabel = when (endpoint) {
         HistoryEndpoint.Sender -> "全部发送端"
@@ -3256,18 +3285,161 @@ private fun buildHistoryEndpointFilters(
             .map { (key, value) -> HistoryEndpointFilter(key, "${value.first} (${value.second})") }
 }
 
-private fun HistoryEntryWithItems.matchesSenderFilter(key: String): Boolean {
-    val senderLabel = entry.senderName?.takeIf { it.isNotBlank() } ?: entry.senderDeviceId.orEmpty()
-    return historyParticipantKey(entry.senderDeviceId, senderLabel) == key
+private fun HistoryEntryWithItems.matchesSenderFilter(
+    key: String,
+    identityContext: HistoryIdentityContext
+): Boolean {
+    return resolveHistoryEndpoint(
+        id = entry.senderDeviceId,
+        name = entry.senderName,
+        direction = entry.direction,
+        endpoint = HistoryEndpoint.Sender,
+        identityContext = identityContext
+    ).key == key
 }
 
-private fun HistoryEntryWithItems.matchesReceiverFilter(key: String): Boolean {
-    val receiverLabel = entry.receiverName?.takeIf { it.isNotBlank() } ?: entry.receiverDeviceId.orEmpty()
-    return historyParticipantKey(entry.receiverDeviceId, receiverLabel) == key
+private fun HistoryEntryWithItems.matchesReceiverFilter(
+    key: String,
+    identityContext: HistoryIdentityContext
+): Boolean {
+    return resolveHistoryEndpoint(
+        id = entry.receiverDeviceId,
+        name = entry.receiverName,
+        direction = entry.direction,
+        endpoint = HistoryEndpoint.Receiver,
+        identityContext = identityContext
+    ).key == key
 }
 
-private fun historyParticipantKey(id: String?, fallback: String): String {
+private fun resolveHistoryEndpoint(
+    id: String?,
+    name: String?,
+    direction: String,
+    endpoint: HistoryEndpoint,
+    identityContext: HistoryIdentityContext
+): ResolvedHistoryEndpoint {
+    val labels = listOfNotNull(id?.trim(), name?.trim()).filter { it.isNotBlank() }
+    val fallback = labels.firstOrNull().orEmpty()
+    val androidLabels = listOf(
+        identityContext.android.deviceId,
+        identityContext.android.baseDeviceId,
+        identityContext.android.deviceName
+    )
+    if (
+        labels.any { historyLabelsExactlyMatch(it, androidLabels) } ||
+        shouldTreatAsCurrentAndroidSender(labels, direction, endpoint)
+    ) {
+        return ResolvedHistoryEndpoint(
+            key = "android:${identityContext.android.baseDeviceId}",
+            label = identityContext.android.deviceName
+        )
+    }
+
+    val desktop = identityContext.desktops.firstOrNull { device ->
+        val deviceLabels = device.historyIdentityLabels()
+        labels.any { label ->
+            historyLabelsExactlyMatch(label, deviceLabels) ||
+                deviceLabels.any { deviceLabel -> historyLabelsLookLikeSameMachine(label, deviceLabel) }
+        }
+    }
+    if (desktop != null) {
+        return ResolvedHistoryEndpoint(
+            key = "desktop:${desktop.stableId.ifBlank { desktop.id }}",
+            label = desktop.displayName.ifBlank { desktop.host }
+        )
+    }
+
+    return ResolvedHistoryEndpoint(
+        key = historyParticipantFallbackKey(id, fallback),
+        label = name?.takeIf { it.isNotBlank() } ?: id.orEmpty()
+    )
+}
+
+private fun shouldTreatAsCurrentAndroidSender(
+    labels: List<String>,
+    direction: String,
+    endpoint: HistoryEndpoint
+): Boolean {
+    if (endpoint != HistoryEndpoint.Sender || direction == "desktop_to_mobile") return false
+    if (labels.isEmpty()) return true
+    return labels.any { label ->
+        isUnknownSenderLabel(label) ||
+            (label.startsWith("client_", ignoreCase = true) && labels.any(::isUnknownSenderLabel))
+    }
+}
+
+private fun DesktopDevice.historyIdentityLabels(): List<String> {
+    return listOfNotNull(
+        stableId,
+        id,
+        displayName,
+        host,
+        ip
+    ).filter { it.isNotBlank() }
+}
+
+private fun historyLabelsExactlyMatch(label: String, candidates: List<String>): Boolean {
+    val normalized = normalizeHistoryIdentityLabel(label)
+    if (normalized.isBlank()) return false
+    return candidates.any { normalizeHistoryIdentityLabel(it) == normalized }
+}
+
+private fun historyLabelsLookLikeSameMachine(left: String, right: String): Boolean {
+    val leftLooksStable = looksLikeHistoryHost(left) || looksLikeDesktopHistoryId(left)
+    val rightLooksStable = looksLikeHistoryHost(right) || looksLikeDesktopHistoryId(right)
+    if (!leftLooksStable && !rightLooksStable) return false
+    val normalizedLeft = normalizeMachineHistoryIdentity(left)
+    val normalizedRight = normalizeMachineHistoryIdentity(right)
+    if (normalizedLeft.isBlank() || normalizedRight.isBlank()) return false
+    if (normalizedLeft == normalizedRight) return true
+    val shorter = if (normalizedLeft.length <= normalizedRight.length) normalizedLeft else normalizedRight
+    val longer = if (normalizedLeft.length <= normalizedRight.length) normalizedRight else normalizedLeft
+    return shorter.length >= 6 && longer.contains(shorter)
+}
+
+private fun looksLikeHistoryHost(value: String): Boolean {
+    val text = value.trim().lowercase(Locale.US)
+    return text.endsWith(".local") ||
+        text.endsWith(".lan") ||
+        Regex("""^\d{1,3}(\.\d{1,3}){3}$""").matches(text) ||
+        text.contains(":")
+}
+
+private fun looksLikeDesktopHistoryId(value: String): Boolean {
+    val text = value.trim().lowercase(Locale.US)
+    return text.startsWith("desktop") || text.startsWith("server:")
+}
+
+private fun normalizeHistoryIdentityLabel(value: String): String {
+    return value.trim().lowercase(Locale.US)
+}
+
+private fun normalizeMachineHistoryIdentity(value: String): String {
+    return value
+        .trim()
+        .lowercase(Locale.US)
+        .removeSuffix(".local")
+        .filter { it in 'a'..'z' || it in '0'..'9' }
+}
+
+private fun historyParticipantFallbackKey(id: String?, fallback: String): String {
     return (id?.takeIf { it.isNotBlank() } ?: fallback).trim().lowercase(Locale.US)
+}
+
+private fun isUnknownSenderLabel(value: String): Boolean {
+    return when (value.trim().lowercase(Locale.US)) {
+        "未知发送端", "unknown sender", "unknown", "unknown-sender" -> true
+        else -> false
+    }
+}
+
+private fun chooseHistoryEndpointLabel(existing: String?, candidate: String): String {
+    val cleanCandidate = candidate.trim()
+    if (existing.isNullOrBlank()) return cleanCandidate
+    if (cleanCandidate.isBlank()) return existing
+    if (isUnknownSenderLabel(existing)) return cleanCandidate
+    if (looksLikeHistoryHost(existing) && !looksLikeHistoryHost(cleanCandidate)) return cleanCandidate
+    return existing
 }
 
 private fun HistoryEntryWithItems.matchesQuery(query: String): Boolean {
