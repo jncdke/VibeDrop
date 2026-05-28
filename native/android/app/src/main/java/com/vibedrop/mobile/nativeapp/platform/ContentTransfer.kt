@@ -83,6 +83,7 @@ suspend fun sendUriToDesktopInbox(
                 if (!controller.sendIncomingFileChunk(transferId, base64)) {
                     throw IllegalStateException("发送分片失败")
                 }
+                controller.waitForOutboundQueueBelow()
             }
         } ?: throw IllegalStateException("无法读取文件")
 

@@ -15,6 +15,7 @@ import com.vibedrop.mobile.nativeapp.platform.DiagnosticLogStore
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileReceiver
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileResult
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -239,6 +240,19 @@ class DesktopConnectionController(
 
     fun cancelIncomingFileAck(transferId: String) {
         pendingIncomingFileAcks.remove(transferId)?.cancel()
+    }
+
+    suspend fun waitForOutboundQueueBelow(
+        maxQueuedBytes: Long = 2L * 1024L * 1024L,
+        timeoutMillis: Long = 30_000L
+    ) {
+        val startedAt = System.currentTimeMillis()
+        while ((socket?.queueSize() ?: 0L) > maxQueuedBytes) {
+            if (System.currentTimeMillis() - startedAt > timeoutMillis) {
+                throw IllegalStateException("发送缓冲区长时间未释放")
+            }
+            delay(25)
+        }
     }
 
     fun close() {
