@@ -3,6 +3,8 @@ package com.vibedrop.mobile.nativeapp.data.repository
 import com.vibedrop.mobile.nativeapp.core.model.ConnectionSnapshot
 import com.vibedrop.mobile.nativeapp.core.model.ConnectionStatus
 import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
+import com.vibedrop.mobile.nativeapp.core.model.DiscoveredDesktop
+import com.vibedrop.mobile.nativeapp.core.model.PairStatus
 import com.vibedrop.mobile.nativeapp.data.local.DeviceDao
 import com.vibedrop.mobile.nativeapp.data.local.DeviceEntity
 import kotlinx.coroutines.flow.Flow
@@ -39,6 +41,36 @@ class DeviceRepository(
             aliasesJson = "[]",
             capabilitiesJson = "[]",
             lastSeenAt = null,
+            createdAt = now,
+            updatedAt = now
+        )
+        deviceDao.upsert(entity)
+        return entity.toDesktopDevice()!!
+    }
+
+    suspend fun savePairedDesktop(
+        discovered: DiscoveredDesktop,
+        status: PairStatus
+    ): DesktopDevice {
+        val serverId = status.serverId ?: discovered.serverId
+        val hostname = status.hostname ?: discovered.hostname
+        val ip = status.ip ?: discovered.ip
+        val port = status.port ?: discovered.port
+        val pin = status.pin.orEmpty()
+        val id = "desktop:$serverId"
+        val now = System.currentTimeMillis()
+        val entity = DeviceEntity(
+            id = id,
+            stableId = serverId,
+            displayName = hostname,
+            role = "desktop",
+            host = ip,
+            ip = ip,
+            port = port,
+            pin = pin,
+            aliasesJson = """["$hostname"]""",
+            capabilitiesJson = "[]",
+            lastSeenAt = now,
             createdAt = now,
             updatedAt = now
         )

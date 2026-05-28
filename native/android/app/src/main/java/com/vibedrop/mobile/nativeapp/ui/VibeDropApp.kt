@@ -50,11 +50,13 @@ import androidx.compose.ui.unit.sp
 import com.vibedrop.mobile.nativeapp.core.model.ConnectionSnapshot
 import com.vibedrop.mobile.nativeapp.core.model.ConnectionStatus
 import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
+import com.vibedrop.mobile.nativeapp.core.model.DiscoveredDesktop
 import com.vibedrop.mobile.nativeapp.data.AppContainer
 import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import com.vibedrop.mobile.nativeapp.platform.readClipboardText
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -66,6 +68,10 @@ fun VibeDropApp(container: AppContainer) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var discoveredDesktops by remember { mutableStateOf<List<DiscoveredDesktop>>(emptyList()) }
+    var discoveryStatus by remember { mutableStateOf("还未扫描附近 Mac") }
+    var discoveryBusy by remember { mutableStateOf(false) }
+    var pairingDesktopKey by remember { mutableStateOf<String?>(null) }
     val devices by container.deviceRepository.observeDevices().collectAsState(initial = emptyList())
     val history by container.historyRepository.observeRecent().collectAsState(initial = emptyList())
     val controllers = remember(devices) {
@@ -122,6 +128,88 @@ fun VibeDropApp(container: AppContainer) {
                     modifier = Modifier.weight(1f)
                 )
                 else -> SettingsScreen(
+                    discoveredDesktops = discoveredDesktops,
+                    discoveryStatus = discoveryStatus,
+                    discoveryBusy = discoveryBusy,
+                    pairingDesktopKey = pairingDesktopKey,
+                    onDiscover = {
+                        if (discoveryBusy) return@SettingsScreen
+                        scope.launch {
+                            discoveryBusy = true
+                            discoveryStatus = "正在扫描局域网..."
+                            val result = runCatching {
+                                withContext(Dispatchers.IO) {
+                                    container.discoveryRepository.discoverDesktops(devices)
+                                }
+                            }
+                            result
+                                .onSuccess { desktops ->
+                                    discoveredDesktops = desktops
+                                    discoveryStatus = if (desktops.isEmpty()) {
+                                        "没有发现附近 Mac"
+                                    } else {
+                                        "发现 ${desktops.size} 台 Mac"
+                                    }
+                                }
+                                .onFailure { error ->
+                                    discoveryStatus = "扫描失败：${error.message ?: "未知错误"}"
+                                }
+                            discoveryBusy = false
+                        }
+                    },
+                    onPairDesktop = { desktop ->
+                        if (pairingDesktopKey != null) return@SettingsScreen
+                        scope.launch {
+                            pairingDesktopKey = desktop.key
+                            val accepted = runCatching {
+                                withContext(Dispatchers.IO) {
+                                    container.discoveryRepository.requestPairing(
+                                        desktop = desktop,
+                                        clientId = "native_android_preview",
+                                        clientName = "VibeDrop Native Preview"
+                                    )
+                                }
+                            }.getOrElse { error ->
+                                discoveryStatus = "配对请求失败：${error.message ?: "未知错误"}"
+                                pairingDesktopKey = null
+                                return@launch
+                            }
+
+                            discoveryStatus = "请在 Mac 上确认配对码 ${accepted.code}"
+                            var terminalStatus = runCatching {
+                                withContext(Dispatchers.IO) {
+                                    container.discoveryRepository.pollPairing(desktop, accepted.requestId)
+                                }
+                            }.getOrNull()
+
+                            val maxPolls = accepted.expiresInSecs.coerceIn(1, 180).toInt()
+                            var pollIndex = 0
+                            while (terminalStatus?.terminal != true && pollIndex < maxPolls) {
+                                delay(1000)
+                                terminalStatus = runCatching {
+                                    withContext(Dispatchers.IO) {
+                                        container.discoveryRepository.pollPairing(desktop, accepted.requestId)
+                                    }
+                                }.getOrElse { error ->
+                                    discoveryStatus = "查询配对状态失败：${error.message ?: "未知错误"}"
+                                    null
+                                }
+                                pollIndex += 1
+                            }
+
+                            val status = terminalStatus
+                            if (status?.approved == true) {
+                                withContext(Dispatchers.IO) {
+                                    container.deviceRepository.savePairedDesktop(desktop, status)
+                                }
+                                discoveryStatus = "已配对 ${status.hostname ?: desktop.hostname}"
+                                selectedTab = 0
+                            } else {
+                                discoveryStatus = status?.error ?: "配对未完成，请重新发起"
+                            }
+                            pairingDesktopKey = null
+                        }
+                    },
                     onSaveDevice = { name, host, port, pin ->
                         scope.launch(Dispatchers.IO) {
                             container.deviceRepository.saveManualDesktop(name, host, port, pin)
@@ -474,6 +562,12 @@ private fun HistoryChip(text: String) {
 
 @Composable
 private fun SettingsScreen(
+    discoveredDesktops: List<DiscoveredDesktop>,
+    discoveryStatus: String,
+    discoveryBusy: Boolean,
+    pairingDesktopKey: String?,
+    onDiscover: () -> Unit,
+    onPairDesktop: (DiscoveredDesktop) -> Unit,
     onSaveDevice: (name: String, host: String, port: Int, pin: String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -497,9 +591,50 @@ private fun SettingsScreen(
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "当前阶段先支持手动保存 Mac。后续会接入 UDP/HTTP 发现和配对。",
+                text = "可以先扫描局域网配对 Mac；扫描不到时再手动填写 host、端口和 PIN。",
                 color = Color(0xFF667085),
                 fontSize = 15.sp
+            )
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("附近 Mac", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                            Text(discoveryStatus, color = Color(0xFF667085), fontSize = 14.sp)
+                        }
+                        OutlinedButton(
+                            onClick = onDiscover,
+                            enabled = !discoveryBusy && pairingDesktopKey == null
+                        ) {
+                            Text(if (discoveryBusy) "扫描中" else "扫描")
+                        }
+                    }
+
+                    if (discoveredDesktops.isEmpty()) {
+                        Text(
+                            text = "扫描会使用 UDP 广播和已知设备 HTTP /discover 校验。Mac 端会继续使用现有 Tauri 服务。",
+                            color = Color(0xFF98A2B3),
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+            }
+        }
+        items(discoveredDesktops, key = { it.key }) { desktop ->
+            DiscoveredDesktopCard(
+                desktop = desktop,
+                pairing = pairingDesktopKey == desktop.key,
+                disabled = discoveryBusy || pairingDesktopKey != null,
+                onPair = { onPairDesktop(desktop) }
             )
         }
         item {
@@ -553,6 +688,48 @@ private fun SettingsScreen(
                         Text("保存 Mac", fontWeight = FontWeight.ExtraBold)
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiscoveredDesktopCard(
+    desktop: DiscoveredDesktop,
+    pairing: Boolean,
+    disabled: Boolean,
+    onPair: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White)
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = desktop.hostname,
+                    color = Color(0xFF111827),
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "${desktop.ip}:${desktop.port} · ${desktop.source}",
+                    color = Color(0xFF667085),
+                    fontSize = 13.sp
+                )
+            }
+            Button(
+                onClick = onPair,
+                enabled = !disabled,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF168DF7))
+            ) {
+                Text(if (pairing) "配对中" else "配对")
             }
         }
     }
