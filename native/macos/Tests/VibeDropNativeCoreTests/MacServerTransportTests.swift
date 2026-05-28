@@ -56,7 +56,7 @@ final class MacServerTransportTests: XCTestCase {
             baseDeviceId: "client_transport_test",
             deviceName: "一加 Ace 5",
             canReceiveFiles: true,
-            receivesClipboard: false,
+            receivesClipboard: true,
             deviceRole: "primary"
         )
         try await task.send(.string(String(data: JSONEncoder().encode(auth), encoding: .utf8)!))
@@ -64,6 +64,15 @@ final class MacServerTransportTests: XCTestCase {
         let authObject = try JSONSerialization.jsonObject(with: Data(authReply.utf8)) as? [String: Any]
         XCTAssertEqual(authObject?["status"] as? String, "ok")
         XCTAssertEqual(authObject?["server_id"] as? String, "desktop_transport_test")
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(server.connectedClientSnapshots.count, 1)
+        XCTAssertEqual(server.connectedClientSnapshots.first?.peer.deviceName, "一加 Ace 5")
+        XCTAssertEqual(server.connectedClientSnapshots.first?.peer.canReceiveFiles, true)
+        try server.broadcastClipboardText("hello clipboard")
+        let clipboardReply = try await receiveString(task)
+        let clipboardObject = try JSONSerialization.jsonObject(with: Data(clipboardReply.utf8)) as? [String: Any]
+        XCTAssertEqual(clipboardObject?["action"] as? String, "clipboard")
+        XCTAssertEqual(clipboardObject?["text"] as? String, "hello clipboard")
 
         try await task.send(.string(#"{"action":"ping"}"#))
         let pongReply = try await receiveString(task)

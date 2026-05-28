@@ -10,6 +10,7 @@ public final class VibeDropMacServer: @unchecked Sendable {
 
     private let group: MultiThreadedEventLoopGroup
     private let effectHandler: MacServerEffectHandler
+    private let connectedClients: MacConnectedClientRegistry
     private var channel: Channel?
     private var udpChannel: Channel?
 
@@ -22,11 +23,27 @@ public final class VibeDropMacServer: @unchecked Sendable {
         self.configuration = configuration
         self.pairManager = pairManager
         self.effectHandler = effectHandler
+        self.connectedClients = MacConnectedClientRegistry()
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: max(1, threadCount))
     }
 
     public var boundPort: Int? {
         channel?.localAddress?.port
+    }
+
+    public var connectedClientSnapshots: [MacConnectedClientSnapshot] {
+        connectedClients.snapshots()
+    }
+
+    public func send(data: Data, toSessionId sessionId: UInt64) throws {
+        try connectedClients.send(data: data, toSessionId: sessionId)
+    }
+
+    public func broadcastClipboardText(_ text: String) throws {
+        let data = try JSONEncoder().encode(ClipboardBroadcastMessage(text: text))
+        connectedClients.broadcast(data: data) { peer in
+            peer.receivesClipboard
+        }
     }
 
     public func start(host: String = "0.0.0.0", enableUDPDiscovery: Bool = true) throws {
@@ -35,6 +52,7 @@ public final class VibeDropMacServer: @unchecked Sendable {
         let configuration = self.configuration
         let pairManager = self.pairManager
         let effectHandler = self.effectHandler
+        let connectedClients = self.connectedClients
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
@@ -49,7 +67,8 @@ public final class VibeDropMacServer: @unchecked Sendable {
                     upgradePipelineHandler: { channel, _ in
                         let handler = VibeDropWebSocketHandler(
                             configuration: configuration,
-                            effectHandler: effectHandler
+                            effectHandler: effectHandler,
+                            connectedClients: connectedClients
                         )
                         return channel.pipeline.removeHandler(name: VibeDropHTTPHandler.handlerName)
                             .flatMap {

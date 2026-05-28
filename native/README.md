@@ -5,7 +5,7 @@
 ## 当前阶段
 
 - `android/`：Kotlin + Jetpack Compose 原生 Android 客户端骨架，目标是先连接现有 Mac 端。
-- `macos/`：Swift 原生 macOS core package，先沉淀协议、设备身份和历史模型，后续再接 SwiftUI/AppKit 与 SwiftNIO。
+- `macos/`：Swift 原生 macOS package，已接入 SwiftNIO 服务、Runtime 输入/媒体/文件处理、SQLite 历史和首版 SwiftUI/AppKit App 壳。
 
 ## 实施原则
 

@@ -27,6 +27,10 @@ let package = Package(
         .executable(
             name: "VibeDropMacServerPreview",
             targets: ["VibeDropMacServerPreview"]
+        ),
+        .executable(
+            name: "VibeDropMacApp",
+            targets: ["VibeDropMacApp"]
         )
     ],
     dependencies: [
@@ -65,6 +69,15 @@ let package = Package(
             dependencies: [
                 "VibeDropMacRuntime",
                 "VibeDropMacServer"
+            ]
+        ),
+        .executableTarget(
+            name: "VibeDropMacApp",
+            dependencies: [
+                "VibeDropMacRuntime",
+                "VibeDropMacServer",
+                "VibeDropMacStorage",
+                "VibeDropNativeCore"
             ]
         ),
         .testTarget(

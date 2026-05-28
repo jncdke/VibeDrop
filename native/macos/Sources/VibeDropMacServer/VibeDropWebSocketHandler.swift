@@ -9,16 +9,23 @@ final class VibeDropWebSocketHandler: ChannelInboundHandler {
 
     private let session: MacWebSocketSession
     private let effectHandler: MacServerEffectHandler
+    private let connectedClients: MacConnectedClientRegistry
 
     init(
         configuration: MacServerConfiguration,
-        effectHandler: @escaping MacServerEffectHandler
+        effectHandler: @escaping MacServerEffectHandler,
+        connectedClients: MacConnectedClientRegistry
     ) {
         self.session = MacWebSocketSession(
             sessionId: UInt64(Date().timeIntervalSince1970 * 1000),
             configuration: configuration
         )
         self.effectHandler = effectHandler
+        self.connectedClients = connectedClients
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        connectedClients.unregister(sessionId: session.sessionId)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -44,6 +51,9 @@ final class VibeDropWebSocketHandler: ChannelInboundHandler {
             let result = session.handle(message)
             try send(outbound: result.outbound, context: context)
             for effect in result.effects {
+                if case let .authenticated(peer) = effect {
+                    connectedClients.register(peer: peer, channel: context.channel)
+                }
                 try send(outbound: effectHandler(effect), context: context)
             }
         } catch {
