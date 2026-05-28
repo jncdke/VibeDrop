@@ -59,6 +59,7 @@ import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import com.vibedrop.mobile.nativeapp.platform.readClipboardText
 import com.vibedrop.mobile.nativeapp.platform.sendImageUriToMacClipboard
 import com.vibedrop.mobile.nativeapp.platform.sendUriToDesktopInbox
+import com.vibedrop.mobile.nativeapp.platform.IncomingFileReceiver
 import com.vibedrop.mobile.nativeapp.platform.startClipboardSyncService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -71,6 +72,7 @@ import java.util.Locale
 @Composable
 fun VibeDropApp(container: AppContainer) {
     val context = LocalContext.current
+    val appContext = context.applicationContext
     val scope = rememberCoroutineScope()
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
     var discoveredDesktops by remember { mutableStateOf<List<DiscoveredDesktop>>(emptyList()) }
@@ -82,14 +84,20 @@ fun VibeDropApp(container: AppContainer) {
     var homeVaultBusy by remember { mutableStateOf(false) }
     val devices by container.deviceRepository.observeDevices().collectAsState(initial = emptyList())
     val history by container.historyRepository.observeRecent().collectAsState(initial = emptyList())
-    val controllers = remember(devices) {
+    val controllers = remember(devices, appContext) {
         devices.associateBy(
             keySelector = { it.id },
             valueTransform = {
                 DesktopConnectionController(
                     device = it,
                     clientId = "native_android_preview",
-                    clientName = "VibeDrop Native Preview"
+                    clientName = "VibeDrop Native Preview",
+                    incomingFileReceiver = IncomingFileReceiver(appContext),
+                    onIncomingFileSaved = { result ->
+                        scope.launch(Dispatchers.IO) {
+                            container.historyRepository.recordReceivedFile(it, result)
+                        }
+                    }
                 )
             }
         )

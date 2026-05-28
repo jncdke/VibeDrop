@@ -11,6 +11,8 @@ import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
 import com.vibedrop.mobile.nativeapp.protocol.AuthPayload
 import com.vibedrop.mobile.nativeapp.protocol.TextPayload
 import com.vibedrop.mobile.nativeapp.protocol.VibeDropActions
+import com.vibedrop.mobile.nativeapp.platform.IncomingFileReceiver
+import com.vibedrop.mobile.nativeapp.platform.IncomingFileResult
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -22,7 +24,9 @@ import java.util.concurrent.TimeUnit
 class DesktopConnectionController(
     private val device: DesktopDevice,
     private val clientId: String,
-    private val clientName: String
+    private val clientName: String,
+    private val incomingFileReceiver: IncomingFileReceiver? = null,
+    private val onIncomingFileSaved: (IncomingFileResult) -> Unit = {}
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val client = OkHttpClient.Builder()
@@ -67,7 +71,7 @@ class DesktopConnectionController(
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
-                    handleMessage(text)
+                    handleMessage(webSocket, text)
                 }
 
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -155,7 +159,7 @@ class DesktopConnectionController(
         update(ConnectionSnapshot(ConnectionStatus.Disconnected))
     }
 
-    private fun handleMessage(text: String) {
+    private fun handleMessage(webSocket: WebSocket, text: String) {
         val objectValue = runCatching { JSONObject(text) }.getOrNull() ?: return
         val status = objectValue.optString("status")
         val action = objectValue.optString("action")
@@ -168,6 +172,43 @@ class DesktopConnectionController(
                 )
             )
             action == VibeDropActions.Pong -> Unit
+            action == VibeDropActions.IncomingHistorySessionStart -> Unit
+            action == VibeDropActions.IncomingFileStart -> handleIncomingFileMessage(webSocket, objectValue)
+            action == VibeDropActions.IncomingFileChunk -> handleIncomingFileMessage(webSocket, objectValue)
+            action == VibeDropActions.IncomingFileComplete -> handleIncomingFileMessage(webSocket, objectValue)
+        }
+    }
+
+    private fun handleIncomingFileMessage(webSocket: WebSocket, payload: JSONObject) {
+        val receiver = incomingFileReceiver ?: return
+        val transferId = payload.optString("transfer_id")
+        try {
+            when (payload.optString("action")) {
+                VibeDropActions.IncomingFileStart -> receiver.begin(payload)
+                VibeDropActions.IncomingFileChunk -> receiver.append(payload)
+                VibeDropActions.IncomingFileComplete -> {
+                    val result = receiver.complete(payload)
+                    webSocket.send(
+                        JSONObject()
+                            .put("action", VibeDropActions.IncomingFileSaved)
+                            .put("transfer_id", result.transferId)
+                            .put("saved_path", result.savedPath)
+                            .toString()
+                    )
+                    onIncomingFileSaved(result)
+                }
+            }
+        } catch (error: Exception) {
+            receiver.cancel(transferId)
+            if (transferId.isNotBlank()) {
+                webSocket.send(
+                    JSONObject()
+                        .put("action", VibeDropActions.IncomingFileError)
+                        .put("transfer_id", transferId)
+                        .put("error", error.message ?: "接收失败")
+                        .toString()
+                )
+            }
         }
     }
 

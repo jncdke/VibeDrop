@@ -13,6 +13,7 @@
 7. 当前已接入前台服务版后台剪贴板同步，使用 v1 `clipboard_sync` 角色接收 Mac 剪贴板。
 8. 当前已接入 Home Vault 直同步，从 Room 历史导出 payload 并 POST 到 `/api/android-history`。
 9. 当前已接入 Android -> Mac 的图片剪贴板发送和文件收件箱分片发送。
+10. 当前已接入 Mac -> Android 的分片文件接收，图片/视频保存到系统媒体库，其他文件保存到下载集合，并回传 `incoming_file_saved`。
 
 ## 当前可用闭环
 
@@ -25,6 +26,7 @@
 7. App 运行后会启动 `ClipboardSyncService`，从 Room 读取已保存 Mac，建立后台 WebSocket，收到 `clipboard` 消息后写入 Android 剪贴板。透明 Activity 兜底和详细诊断仍属于后续补齐项。
 8. 设置页可以配置 Home Vault 地址，点击“同步到 Mac mini”会上传原生 Room 历史；当前同步范围是历史主表，媒体 item/缩略图后续随文件传输和媒体历史一起补齐。
 9. 发送页“传图到剪贴板”使用 Android 图片选择器读取图片并发送 `image_clipboard`；“传到收件箱”使用系统文件选择器读取 URI 并按 192KiB 分片发送 `incoming_file_start/chunk/complete`。
+10. Mac 拖拽/分享发送到原生 Android 时，`DesktopConnectionController` 会接收 `incoming_file_start/chunk/complete`，`IncomingFileReceiver` 写入临时文件、校验大小、保存到 MediaStore，并写入 Room 历史。
 
 ## 构建
 
