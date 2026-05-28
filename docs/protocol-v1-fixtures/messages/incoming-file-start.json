@@ -1,0 +1,7 @@
+{
+  "action": "incoming_file_start",
+  "transfer_id": "transfer_demo_001",
+  "file_name": "demo.txt",
+  "mime_type": "text/plain",
+  "size_bytes": 24
+}

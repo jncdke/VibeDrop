@@ -1,0 +1,125 @@
+package com.vibedrop.mobile.nativeapp.network
+
+import android.os.Handler
+import android.os.Looper
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import com.vibedrop.mobile.nativeapp.core.model.ConnectionSnapshot
+import com.vibedrop.mobile.nativeapp.core.model.ConnectionStatus
+import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
+import com.vibedrop.mobile.nativeapp.protocol.AuthPayload
+import com.vibedrop.mobile.nativeapp.protocol.TextPayload
+import com.vibedrop.mobile.nativeapp.protocol.VibeDropActions
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
+
+class DesktopConnectionController(
+    private val device: DesktopDevice,
+    private val clientId: String,
+    private val clientName: String
+) {
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val client = OkHttpClient.Builder()
+        .pingInterval(15, TimeUnit.SECONDS)
+        .build()
+
+    private var socket: WebSocket? = null
+
+    var connection by mutableStateOf(device.connection)
+        private set
+
+    fun connect() {
+        if (connection.status == ConnectionStatus.Connected || connection.status == ConnectionStatus.Connecting) {
+            return
+        }
+        val pin = device.pin
+        if (pin.isNullOrBlank()) {
+            update(ConnectionSnapshot(ConnectionStatus.Error, "缺少 PIN"))
+            return
+        }
+
+        update(ConnectionSnapshot(ConnectionStatus.Connecting))
+        val request = Request.Builder()
+            .url("ws://${device.host}:${device.port}/ws")
+            .build()
+
+        socket = client.newWebSocket(
+            request,
+            object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    webSocket.send(
+                        AuthPayload(
+                            pin = pin,
+                            deviceId = clientId,
+                            baseDeviceId = clientId,
+                            deviceName = clientName,
+                            canReceiveFiles = true,
+                            receivesClipboard = false,
+                            deviceRole = "primary"
+                        ).toJson().toString()
+                    )
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    handleMessage(text)
+                }
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    webSocket.close(code, reason)
+                    update(ConnectionSnapshot(ConnectionStatus.Disconnected, reason.ifBlank { null }))
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    update(ConnectionSnapshot(ConnectionStatus.Disconnected, reason.ifBlank { null }))
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    update(ConnectionSnapshot(ConnectionStatus.Error, t.message ?: "连接失败"))
+                }
+            }
+        )
+    }
+
+    fun sendText(text: String, pressEnter: Boolean): Boolean {
+        val action = if (pressEnter) VibeDropActions.TypeEnter else VibeDropActions.Type
+        return socket?.send(TextPayload(action, text).toJson().toString()) == true
+    }
+
+    fun sendEnter(): Boolean {
+        return socket?.send(JSONObject().put("action", VibeDropActions.Enter).toString()) == true
+    }
+
+    fun close() {
+        socket?.close(1000, "dispose")
+        socket = null
+        update(ConnectionSnapshot(ConnectionStatus.Disconnected))
+    }
+
+    private fun handleMessage(text: String) {
+        val objectValue = runCatching { JSONObject(text) }.getOrNull() ?: return
+        val status = objectValue.optString("status")
+        val action = objectValue.optString("action")
+        when {
+            status == "ok" -> update(ConnectionSnapshot(ConnectionStatus.Connected))
+            status == "error" -> update(
+                ConnectionSnapshot(
+                    ConnectionStatus.Error,
+                    objectValue.optString("error", "认证或发送失败")
+                )
+            )
+            action == VibeDropActions.Pong -> Unit
+        }
+    }
+
+    private fun update(snapshot: ConnectionSnapshot) {
+        mainHandler.post {
+            connection = snapshot
+        }
+    }
+}

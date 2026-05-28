@@ -8,8 +8,12 @@ Thumbs.db
 # Android build artifacts
 .gradle/
 .gradle-cache/
+.kotlin/
 build/
 local.properties
+
+# SwiftPM build artifacts
+.build/
 
 # Local caches and research worktrees
 __pycache__/

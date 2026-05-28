@@ -1,0 +1,5 @@
+{
+  "action": "incoming_file_error",
+  "transfer_id": "transfer_demo_001",
+  "error": "size mismatch"
+}

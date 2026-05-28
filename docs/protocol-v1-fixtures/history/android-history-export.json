@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "app": "VibeDrop",
+  "deviceId": "client_android_demo",
+  "deviceName": "一加 Ace 5",
+  "exportedAt": "2026-05-28T12:00:00.000Z",
+  "history": [
+    {
+      "id": "android_entry_demo_001",
+      "timestamp": "2026-05-28T11:58:00.000Z",
+      "text": "这是一条脱敏的手机发送历史。",
+      "kind": "text",
+      "direction": "mobile_to_desktop",
+      "status": "success",
+      "targetDeviceId": "desktop_demo_macbook",
+      "targetDeviceName": "overlorddeMacBook-Air-4.local"
+    },
+    {
+      "id": "android_entry_demo_002",
+      "timestamp": "2026-05-28T11:59:00.000Z",
+      "text": "[图片] demo.png",
+      "kind": "image",
+      "direction": "mobile_to_desktop",
+      "status": "success",
+      "fileName": "demo.png",
+      "thumbnailDataUrl": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+      "targetDeviceId": "desktop_demo_macbook",
+      "targetDeviceName": "overlorddeMacBook-Air-4.local"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "action": "incoming_file_chunk",
+  "transfer_id": "transfer_demo_001",
+  "chunk_base64": "5rWL6K+V5YiG54mH5pWw5o2u"
+}
