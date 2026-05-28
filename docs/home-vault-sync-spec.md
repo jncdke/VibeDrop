@@ -33,6 +33,7 @@ Vault 根目录：
 
 ```text
 VibeDropVault/
+  open-home-vault-viewer.html     # Mac mini 本机双击入口，跳转到 localhost viewer
   objects/00..ff/                 # 内容寻址对象库，固定 256 个桶
   db/vibedrop.sqlite              # 规范化索引、快照和校验记录
   viewer/index.html               # 静态查看器
@@ -48,6 +49,12 @@ VibeDropVault/
 媒体对象路径由文件内容决定：`objects/<sha256 前两位>/<sha256><原扩展名>`。这和 Apple Photos 用固定分桶降低单目录压力的思路类似，但这里用完整内容哈希做去重和校验，比按 UUID 首字符更适合备份与同步。
 
 SQLite 保存四类核心索引：`history_entries` 保存历史记录，`media_objects` 保存去重文件对象，`history_media` 保存历史和媒体对象的关联，`snapshots/snapshot_entries/source_files` 保存每次同步的可追溯状态。
+
+## 查看器入口
+
+Vault 根目录必须生成 `open-home-vault-viewer.html`，用于在 Mac mini Finder 中双击打开历史查看器。入口页默认跳转到 `http://localhost:8787/viewer/`，并提供 `minideMac-mini.local` 和局域网 IP 备用链接。项目根目录也保留同名入口页，默认跳转到 `http://minideMac-mini.local:8787/viewer/`，用于在 MacBook 上一键查看 Mac mini Vault。
+
+入口页只负责跳转到 HTTP viewer，不直接用 `file://` 加载 `viewer/index.html`。原因是查看器需要读取 `viewer/data/history.json` 和 `report.json`，浏览器直接打开本地 HTML 时可能拦截本地 JSON 读取；HTTP 服务路径更稳定，也和手机同步后刷新的静态 viewer 形态一致。
 
 ## 同步流程
 

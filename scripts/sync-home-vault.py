@@ -22,6 +22,8 @@ DEFAULT_REMOTE = "mini@minideMac-mini.local"
 DEFAULT_REMOTE_ROOT = "/Volumes/SN850X/VibeDropVault"
 DEFAULT_ANDROID_PACKAGE = "com.vibedrop.mobile"
 DEFAULT_VIEWER_URL = "http://minideMac-mini.local:8787/viewer/"
+DEFAULT_VIEWER_IP_URL = "http://192.168.3.2:8787/viewer/"
+LOCAL_VIEWER_URL = "http://localhost:8787/viewer/"
 OBJECT_BUCKETS = [f"{i:02x}" for i in range(256)]
 
 
@@ -59,6 +61,130 @@ def sha256_file(path: pathlib.Path) -> tuple[str, int]:
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def build_viewer_launcher_html(
+    primary_url: str,
+    alternate_urls: list[tuple[str, str]],
+    note: str,
+    *,
+    prefer_http_origin: bool = False,
+) -> str:
+    links = "\n".join(
+        f'      <a href="{url}">{label}</a>'
+        for label, url in alternate_urls
+        if url and url != primary_url
+    )
+    dynamic_target = """
+    <script>
+      const configuredPrimary = document.getElementById('primaryLink').href;
+      const target = window.location.protocol.startsWith('http')
+        ? `${window.location.origin}/viewer/`
+        : configuredPrimary;
+      document.getElementById('primaryLink').href = target;
+      window.setTimeout(() => {
+        window.location.href = target;
+      }, 1000);
+    </script>""" if prefer_http_origin else ""
+    refresh = "" if prefer_http_origin else f'  <meta http-equiv="refresh" content="1; url={primary_url}">\n'
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+{refresh.rstrip()}
+  <title>打开 VibeDrop Home Vault</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #111827;
+      --muted: #667085;
+      --border: #dbe3ef;
+      --primary: #1677ff;
+    }}
+
+    * {{
+      box-sizing: border-box;
+    }}
+
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 32px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+    }}
+
+    main {{
+      width: min(560px, 100%);
+      padding: 28px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel);
+      box-shadow: 0 18px 48px rgba(15, 23, 42, 0.08);
+    }}
+
+    h1 {{
+      margin: 0 0 10px;
+      font-size: 28px;
+      line-height: 1.2;
+    }}
+
+    p {{
+      margin: 0 0 20px;
+      color: var(--muted);
+      line-height: 1.7;
+    }}
+
+    .actions {{
+      display: grid;
+      gap: 12px;
+    }}
+
+    a {{
+      display: block;
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-weight: 700;
+      text-decoration: none;
+      text-align: center;
+    }}
+
+    a.primary {{
+      border-color: var(--primary);
+      background: var(--primary);
+      color: #ffffff;
+    }}
+
+    small {{
+      display: block;
+      margin-top: 16px;
+      color: var(--muted);
+      line-height: 1.6;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>VibeDrop 历史查看器</h1>
+    <p>正在打开 Home Vault。如果浏览器没有自动跳转，点下面的入口。</p>
+    <div class="actions">
+      <a class="primary" id="primaryLink" href="{primary_url}">打开历史查看器</a>
+{links}
+    </div>
+    <small>{note}</small>
+  </main>
+{dynamic_target}
+</body>
+</html>
+"""
 
 
 def record_entry_id(record: dict[str, Any]) -> str:
@@ -762,6 +888,18 @@ def generate_viewer(root: pathlib.Path, conn: sqlite3.Connection, report: dict[s
     (viewer_root / "index.html").write_text(VIEWER_HTML, encoding="utf-8")
     (viewer_root / "style.css").write_text(VIEWER_CSS, encoding="utf-8")
     (viewer_root / "app.js").write_text(VIEWER_JS, encoding="utf-8")
+    (root / "open-home-vault-viewer.html").write_text(
+        build_viewer_launcher_html(
+            LOCAL_VIEWER_URL,
+            [
+                ("局域网入口", report.get("viewerUrl") or DEFAULT_VIEWER_URL),
+                ("IP 备用入口", DEFAULT_VIEWER_IP_URL),
+            ],
+            "这个文件适合放在 Mac mini 的 Vault 根目录里，从 Finder 双击打开本机 viewer。",
+            prefer_http_origin=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 def prepare_remote(remote: str, remote_root: str) -> None:
