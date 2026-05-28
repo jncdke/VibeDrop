@@ -415,6 +415,8 @@ private struct HistoryView: View {
     @State private var customEndDate = ""
     @State private var customStartTime = ""
     @State private var customEndTime = ""
+    @State private var heatmapWindowOffset = 0
+    @State private var heatmapSelection: MacHeatmapSelection?
 
     private var senderFilters: [HistoryEndpointFilter] {
         buildHistoryEndpointFilters(entries: model.recentHistory, endpoint: .sender)
@@ -424,7 +426,7 @@ private struct HistoryView: View {
         buildHistoryEndpointFilters(entries: model.recentHistory, endpoint: .receiver)
     }
 
-    private var filteredEntries: [HistoryEntry] {
+    private var baseFilteredEntries: [HistoryEntry] {
         let now = Date()
         return model.recentHistory.filter { entry in
             guard matchesHistoryDateFilter(entry.timestamp, filter: timeFilter, now: now, startDate: customStartDate, endDate: customEndDate),
@@ -467,6 +469,15 @@ private struct HistoryView: View {
                 }.joined(separator: " ")
             ].compactMap { $0 }.joined(separator: " ").lowercased()
             return haystack.contains(trimmed.lowercased())
+        }
+    }
+
+    private var filteredEntries: [HistoryEntry] {
+        guard let heatmapSelection else { return baseFilteredEntries }
+        let calendar = Calendar.current
+        return baseFilteredEntries.filter { entry in
+            calendar.startOfDay(for: entry.timestamp) == heatmapSelection.dayStart &&
+                calendar.component(.hour, from: entry.timestamp) == heatmapSelection.hour
         }
     }
 
@@ -571,14 +582,22 @@ private struct HistoryView: View {
                             customEndDate = ""
                             customStartTime = ""
                             customEndTime = ""
+                            heatmapSelection = nil
+                            heatmapWindowOffset = 0
                         }
                         .buttonStyle(.bordered)
                     }
                     Spacer()
                 }
-                MacHistoryHeatmap(entries: filteredEntries)
+                MacHistoryHeatmap(
+                    entries: baseFilteredEntries,
+                    windowOffset: heatmapWindowOffset,
+                    selection: heatmapSelection,
+                    onWindowOffsetChange: { heatmapWindowOffset = $0 },
+                    onSelect: { heatmapSelection = $0 }
+                )
                 if filteredEntries.isEmpty {
-                    EmptyHint("等待接收或发送内容。")
+                    EmptyHint(heatmapSelection == nil ? "等待接收或发送内容。" : "这个小时没有匹配记录。")
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
                     LazyVStack(alignment: .leading, spacing: 14) {
@@ -595,21 +614,39 @@ private struct HistoryView: View {
     }
 }
 
+private struct MacHeatmapSelection: Equatable {
+    var dayStart: Date
+    var hour: Int
+}
+
 private struct MacHistoryHeatmap: View {
     let entries: [HistoryEntry]
+    let windowOffset: Int
+    let selection: MacHeatmapSelection?
+    let onWindowOffsetChange: (Int) -> Void
+    let onSelect: (MacHeatmapSelection?) -> Void
+
+    private let visibleDayCount = 7
 
     private var days: [Date] {
         let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        return (0..<7).compactMap { offset in
-            calendar.date(byAdding: .day, value: offset - 6, to: today)
+        let anchor = entries.map(\.timestamp).max() ?? Date()
+        let end = calendar.date(
+            byAdding: .day,
+            value: -max(0, windowOffset),
+            to: calendar.startOfDay(for: anchor)
+        ) ?? calendar.startOfDay(for: Date())
+        return (0..<visibleDayCount).compactMap { offset in
+            calendar.date(byAdding: .day, value: offset - (visibleDayCount - 1), to: end)
         }
     }
 
     private var counts: [String: Int] {
         let calendar = Calendar.current
+        let visibleDays = Set(days.map { Int($0.timeIntervalSince1970) })
         return entries.reduce(into: [String: Int]()) { result, entry in
             let day = calendar.startOfDay(for: entry.timestamp)
+            guard visibleDays.contains(Int(day.timeIntervalSince1970)) else { return }
             let hour = calendar.component(.hour, from: entry.timestamp)
             result[key(day: day, hour: hour), default: 0] += 1
         }
@@ -619,15 +656,44 @@ private struct MacHistoryHeatmap: View {
         max(1, counts.values.max() ?? 1)
     }
 
+    private var peak: (key: String, value: Int)? {
+        counts.max { lhs, rhs in lhs.value < rhs.value }
+    }
+
     var body: some View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Text("接收热力图").font(.system(size: 18, weight: .bold))
                     Spacer()
+                    Button("更早") {
+                        onWindowOffsetChange(windowOffset + visibleDayCount)
+                        onSelect(nil)
+                    }
+                    .buttonStyle(.bordered)
+                    Button("更近") {
+                        onWindowOffsetChange(max(0, windowOffset - visibleDayCount))
+                        onSelect(nil)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(windowOffset <= 0)
+                    if windowOffset > 0 || selection != nil {
+                        Button("回到最近") {
+                            onWindowOffsetChange(0)
+                            onSelect(nil)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
                     Text("当前筛选 \(entries.count) 条")
                         .font(.system(size: 12, weight: .bold))
                         .foregroundStyle(.secondary)
+                }
+                HStack(spacing: 10) {
+                    Tag("\(days.first?.formatted(.dateTime.month().day()) ?? "") - \(days.last?.formatted(.dateTime.month().day()) ?? "")")
+                    Tag("峰值 \(peak.map { "\($0.value) 条" } ?? "无")")
+                    if let selection {
+                        Tag("\(selection.dayStart.formatted(.dateTime.month().day())) \(selection.hour):00")
+                    }
                 }
                 HStack(alignment: .bottom, spacing: 9) {
                     ForEach(days, id: \.timeIntervalSince1970) { day in
@@ -639,13 +705,37 @@ private struct MacHistoryHeatmap: View {
                                 .font(.system(size: 11, weight: .bold))
                             VStack(spacing: 3) {
                                 ForEach(0..<24, id: \.self) { hour in
-                                    RoundedRectangle(cornerRadius: 3)
-                                        .fill(color(count: counts[key(day: day, hour: hour), default: 0]))
-                                        .frame(width: 46, height: 7)
+                                    let count = counts[key(day: day, hour: hour), default: 0]
+                                    let isSelected = selection?.dayStart == day && selection?.hour == hour
+                                    Button {
+                                        let next = MacHeatmapSelection(dayStart: day, hour: hour)
+                                        onSelect(selection == next ? nil : next)
+                                    } label: {
+                                        RoundedRectangle(cornerRadius: 3)
+                                            .fill(color(count: count))
+                                            .frame(width: 46, height: 7)
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 3)
+                                                    .stroke(isSelected ? Color.blue : Color.clear, lineWidth: 2)
+                                            )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("\(day.formatted(.dateTime.month().day())) \(hour):00 · \(count) 条")
                                 }
                             }
                         }
                     }
+                }
+                HStack {
+                    Text("少").font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary)
+                    LinearGradient(
+                        colors: [Color.white, Color(red: 0.36, green: 0.86, blue: 0.54), Color(red: 0.03, green: 0.07, blue: 0.05)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(height: 9)
+                    .clipShape(Capsule())
+                    Text("多").font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary)
                 }
             }
         }
@@ -656,16 +746,33 @@ private struct MacHistoryHeatmap: View {
     }
 
     private func color(count: Int) -> Color {
-        guard count > 0 else { return Color(red: 0.92, green: 0.95, blue: 0.97) }
-        let ratio = min(1.0, Double(count) / Double(maxCount))
-        if ratio < 0.45 {
-            return Color(red: 0.86 - 0.18 * ratio, green: 0.98, blue: 0.9 - 0.2 * ratio)
+        guard count > 0 else { return Color(red: 0.95, green: 0.96, blue: 0.98) }
+        let ratio = sqrt(min(1.0, Double(count) / Double(maxCount)))
+        if ratio < 0.58 {
+            return interpolateColor(
+                from: (1.0, 1.0, 1.0),
+                to: (0.36, 0.86, 0.54),
+                t: ratio / 0.58
+            )
         }
-        if ratio < 0.82 {
-            return Color(red: 0.42 - 0.28 * ratio, green: 0.86 - 0.34 * ratio, blue: 0.5 - 0.28 * ratio)
-        }
-        let dark = 0.14 * (1.0 - ratio)
-        return Color(red: dark, green: 0.18 + dark, blue: dark)
+        return interpolateColor(
+            from: (0.36, 0.86, 0.54),
+            to: (0.03, 0.07, 0.05),
+            t: (ratio - 0.58) / 0.42
+        )
+    }
+
+    private func interpolateColor(
+        from: (Double, Double, Double),
+        to: (Double, Double, Double),
+        t: Double
+    ) -> Color {
+        let clamped = min(1.0, max(0.0, t))
+        return Color(
+            red: from.0 + (to.0 - from.0) * clamped,
+            green: from.1 + (to.1 - from.1) * clamped,
+            blue: from.2 + (to.2 - from.2) * clamped
+        )
     }
 }
 

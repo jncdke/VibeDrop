@@ -13,7 +13,7 @@ struct VibeDropMacApp: App {
         }
         .windowStyle(.titleBar)
 
-        MenuBarExtra("VibeDrop", systemImage: "drop.fill") {
+        MenuBarExtra {
             Text("VibeDrop")
             Text("地址 \(model.addressText)")
             Text("PIN \(model.pinText)")
@@ -43,6 +43,24 @@ struct VibeDropMacApp: App {
             Button("退出 VibeDrop") {
                 NSApplication.shared.terminate(nil)
             }
+        } label: {
+            if let image = VibeDropTrayImage.load() {
+                Image(nsImage: image)
+            } else {
+                Image(systemName: "drop.fill")
+            }
         }
+    }
+}
+
+private enum VibeDropTrayImage {
+    static func load() -> NSImage? {
+        guard let url = Bundle.module.url(forResource: "VibeDropTrayIcon", withExtension: "png"),
+              let image = NSImage(contentsOf: url) else {
+            return nil
+        }
+        image.isTemplate = true
+        image.size = NSSize(width: 18, height: 18)
+        return image
     }
 }
