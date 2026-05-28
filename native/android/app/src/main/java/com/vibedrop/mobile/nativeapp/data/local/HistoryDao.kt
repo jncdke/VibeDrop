@@ -19,6 +19,9 @@ interface HistoryDao {
     @Query("SELECT * FROM history_entries WHERE id = :id LIMIT 1")
     suspend fun findEntry(id: String): HistoryEntryEntity?
 
+    @Query("SELECT * FROM history_items WHERE entryId = :entryId ORDER BY itemIndex ASC")
+    suspend fun getItemsForEntry(entryId: String): List<HistoryItemEntity>
+
     @Query("SELECT COUNT(*) FROM history_entries")
     suspend fun countEntries(): Int
 
@@ -30,6 +33,9 @@ interface HistoryDao {
 
     @Query("DELETE FROM history_items")
     suspend fun deleteAllItems()
+
+    @Query("DELETE FROM history_items WHERE entryId = :entryId")
+    suspend fun deleteItemsForEntry(entryId: String)
 
     @Query("DELETE FROM history_entries")
     suspend fun deleteAllEntries()

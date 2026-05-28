@@ -140,15 +140,20 @@ fun VibeDropApp(container: AppContainer) {
     val controllers = remember(devices, appContext) {
         devices.associateBy(
             keySelector = { it.id },
-            valueTransform = {
+            valueTransform = { device ->
                 DesktopConnectionController(
-                    device = it,
+                    device = device,
                     clientId = "native_android_preview",
                     clientName = "VibeDrop Native Preview",
                     incomingFileReceiver = IncomingFileReceiver(appContext),
+                    onIncomingHistorySession = { rawJson ->
+                        scope.launch(Dispatchers.IO) {
+                            container.historyRepository.recordIncomingHistorySession(device, rawJson)
+                        }
+                    },
                     onIncomingFileSaved = { result ->
                         scope.launch(Dispatchers.IO) {
-                            container.historyRepository.recordReceivedFile(it, result)
+                            container.historyRepository.recordReceivedFile(device, result)
                         }
                     }
                 )

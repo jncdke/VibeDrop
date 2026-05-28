@@ -17,7 +17,11 @@ data class IncomingFileResult(
     val mimeType: String,
     val sizeBytes: Long,
     val savedPath: String,
-    val saveTarget: String
+    val saveTarget: String,
+    val isArchive: Boolean,
+    val historySessionId: String?,
+    val historyItemIndex: Int,
+    val historyItemCount: Int
 )
 
 class IncomingFileReceiver(
@@ -32,6 +36,7 @@ class IncomingFileReceiver(
         val fileName = sanitizeFileName(payload.optString("file_name").ifBlank { "file.bin" })
         val mimeType = payload.optString("mime_type").ifBlank { "application/octet-stream" }
         val sizeBytes = payload.optLong("size_bytes", 0L)
+        val isArchive = payload.optBoolean("is_archive", false)
         val partFile = File(incomingDir(), "${sanitizeTransferId(transferId)}.part")
         partFile.parentFile?.mkdirs()
         partFile.writeBytes(ByteArray(0))
@@ -40,7 +45,11 @@ class IncomingFileReceiver(
             fileName = fileName,
             mimeType = mimeType,
             sizeBytes = sizeBytes,
-            partFile = partFile
+            partFile = partFile,
+            isArchive = isArchive,
+            historySessionId = payload.optString("history_session_id").takeIf { it.isNotBlank() },
+            historyItemIndex = payload.optInt("history_item_index", 0).coerceAtLeast(0),
+            historyItemCount = payload.optInt("history_item_count", 1).coerceAtLeast(1)
         )
     }
 
@@ -75,7 +84,11 @@ class IncomingFileReceiver(
             mimeType = transfer.mimeType,
             sizeBytes = actualSize,
             savedPath = savedPath,
-            saveTarget = saveTarget
+            saveTarget = saveTarget,
+            isArchive = transfer.isArchive,
+            historySessionId = transfer.historySessionId,
+            historyItemIndex = transfer.historyItemIndex,
+            historyItemCount = transfer.historyItemCount
         )
     }
 
@@ -192,6 +205,10 @@ class IncomingFileReceiver(
         val mimeType: String,
         val sizeBytes: Long,
         val partFile: File,
+        val isArchive: Boolean,
+        val historySessionId: String?,
+        val historyItemIndex: Int,
+        val historyItemCount: Int,
         var receivedBytes: Long = 0L
     )
 

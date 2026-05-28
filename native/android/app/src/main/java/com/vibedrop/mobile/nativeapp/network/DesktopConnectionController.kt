@@ -27,6 +27,7 @@ class DesktopConnectionController(
     private val clientId: String,
     private val clientName: String,
     private val incomingFileReceiver: IncomingFileReceiver? = null,
+    private val onIncomingHistorySession: (String) -> Unit = {},
     private val onIncomingFileSaved: (IncomingFileResult) -> Unit = {}
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -207,7 +208,7 @@ class DesktopConnectionController(
                 )
             )
             action == VibeDropActions.Pong -> Unit
-            action == VibeDropActions.IncomingHistorySessionStart -> Unit
+            action == VibeDropActions.IncomingHistorySessionStart -> onIncomingHistorySession(objectValue.toString())
             action == VibeDropActions.IncomingFileStart -> handleIncomingFileMessage(webSocket, objectValue)
             action == VibeDropActions.IncomingFileChunk -> handleIncomingFileMessage(webSocket, objectValue)
             action == VibeDropActions.IncomingFileComplete -> handleIncomingFileMessage(webSocket, objectValue)

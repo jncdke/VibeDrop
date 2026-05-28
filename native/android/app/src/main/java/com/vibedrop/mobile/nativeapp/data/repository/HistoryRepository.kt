@@ -54,46 +54,71 @@ class HistoryRepository(
         source: DesktopDevice,
         result: IncomingFileResult
     ) {
-        val entryId = "native-inbound:${result.transferId}"
-        val kind = kindFromMime(result.mimeType)
-        val label = when (kind) {
-            "image" -> "图片"
-            "video" -> "视频"
-            else -> "文件"
+        if (!result.historySessionId.isNullOrBlank()) {
+            recordReceivedSessionFile(source, result)
+            return
+        }
+
+        recordReceivedFileWithoutSession(source, result)
+    }
+
+    suspend fun recordIncomingHistorySession(
+        source: DesktopDevice,
+        rawJson: String
+    ) {
+        val payload = runCatching { JSONObject(rawJson) }.getOrNull() ?: return
+        val sessionId = payload.firstString("session_id", "sessionId")
+        if (sessionId.isBlank()) return
+
+        val entryId = desktopInboundEntryId(sessionId)
+        val existing = historyDao.findEntry(entryId)
+        val existingItems = historyDao.getItemsForEntry(entryId).associateBy { it.itemIndex }
+        val payloadItems = payload.optJSONArray("items") ?: JSONArray()
+        val parsedItems = mutableListOf<HistoryItemEntity>()
+        for (index in 0 until payloadItems.length()) {
+            val item = payloadItems.optJSONObject(index) ?: continue
+            val existingItem = existingItems[index]
+            parsedItems += HistoryItemEntity(
+                id = "$entryId:item:$index",
+                entryId = entryId,
+                itemIndex = index,
+                kind = item.firstString("kind").ifBlank { kindFromMime(item.firstString("mime_type", "mimeType")) },
+                fileName = item.firstString("file_name", "fileName").ifBlank { "文件" },
+                mimeType = item.firstString("mime_type", "mimeType").ifBlank { "application/octet-stream" },
+                sizeBytes = item.optLongOrNull("size_bytes") ?: item.optLongOrNull("sizeBytes"),
+                localPath = item.firstString("file_path", "filePath").takeIf { it.isNotBlank() },
+                savedPath = existingItem?.savedPath ?: item.firstString("saved_path", "savedPath").takeIf { it.isNotBlank() },
+                thumbnailPath = existingItem?.thumbnailPath,
+                thumbnailDataUrl = existingItem?.thumbnailDataUrl ?: item.firstString("thumbnail_data_url", "thumbnailDataUrl").takeIf { it.isNotBlank() },
+                status = existingItem?.status ?: item.firstString("status").ifBlank { "pending" },
+                error = existingItem?.error ?: item.firstString("error").takeIf { it.isNotBlank() }
+            )
+        }
+        val mergedItems = if (parsedItems.isEmpty()) existingItems.values.sortedBy { it.itemIndex } else parsedItems
+        val summary = historyItemsSummary(mergedItems)
+        val timestamp = payload.firstString("timestamp").let { value ->
+            if (value.isBlank()) existing?.timestampMillis ?: System.currentTimeMillis() else parseTimestampMillis(value)
         }
         val entry = HistoryEntryEntity(
             id = entryId,
-            timestampMillis = System.currentTimeMillis(),
+            timestampMillis = timestamp,
             direction = "desktop_to_mobile",
-            kind = kind,
-            status = "success",
-            text = "[$label] ${result.fileName}",
+            kind = payload.firstString("kind").ifBlank { existing?.kind ?: summary.first },
+            status = computeSessionStatus(mergedItems).ifBlank { existing?.status ?: "pending" },
+            text = payload.firstString("text").ifBlank { existing?.text ?: summary.second },
             senderDeviceId = source.stableId,
             senderName = source.displayName,
             receiverDeviceId = "native_android_preview",
             receiverName = "VibeDrop Native Preview",
-            sessionId = null,
-            itemCount = 1,
-            saveTarget = result.saveTarget,
-            rawJson = null
-        )
-        val item = HistoryItemEntity(
-            id = "$entryId:item:0",
-            entryId = entryId,
-            itemIndex = 0,
-            kind = kind,
-            fileName = result.fileName,
-            mimeType = result.mimeType,
-            sizeBytes = result.sizeBytes,
-            localPath = result.savedPath,
-            savedPath = result.savedPath,
-            thumbnailPath = null,
-            thumbnailDataUrl = null,
-            status = "success",
-            error = null
+            sessionId = sessionId,
+            itemCount = payload.optIntOrNull("item_count") ?: payload.optIntOrNull("itemCount") ?: mergedItems.size.coerceAtLeast(1),
+            saveTarget = payload.firstString("save_target", "saveTarget").ifBlank { existing?.saveTarget ?: "download" },
+            rawJson = rawJson
         )
         historyDao.upsertEntry(entry)
-        historyDao.upsertItems(listOf(item))
+        if (mergedItems.isNotEmpty()) {
+            historyDao.upsertItems(mergedItems)
+        }
     }
 
     suspend fun importEntry(entry: HistoryEntryEntity) {
@@ -162,6 +187,144 @@ class HistoryRepository(
         mimeType.startsWith("image/") -> "image"
         mimeType.startsWith("video/") -> "video"
         else -> "file"
+    }
+
+    private suspend fun recordReceivedSessionFile(
+        source: DesktopDevice,
+        result: IncomingFileResult
+    ) {
+        val sessionId = result.historySessionId ?: return
+        val entryId = desktopInboundEntryId(sessionId)
+        val existing = historyDao.findEntry(entryId)
+        if (existing == null) {
+            recordReceivedFileWithoutSession(source, result)
+            return
+        }
+
+        val existingItems = historyDao.getItemsForEntry(entryId).toMutableList()
+        val itemIndex = result.historyItemIndex.coerceAtLeast(0)
+        val itemKind = kindFromMime(result.mimeType)
+        val item = HistoryItemEntity(
+            id = "$entryId:item:$itemIndex",
+            entryId = entryId,
+            itemIndex = itemIndex,
+            kind = itemKind,
+            fileName = result.fileName,
+            mimeType = result.mimeType,
+            sizeBytes = result.sizeBytes,
+            localPath = result.savedPath,
+            savedPath = result.savedPath,
+            thumbnailPath = null,
+            thumbnailDataUrl = null,
+            status = "success",
+            error = null
+        )
+
+        if (result.isArchive && result.historyItemCount > 1) {
+            val itemsByIndex = existingItems.associateBy { it.itemIndex }.toMutableMap()
+            for (index in 0 until result.historyItemCount) {
+                val current = itemsByIndex[index]
+                itemsByIndex[index] = if (index == itemIndex) {
+                    item
+                } else {
+                    (current ?: item.copy(id = "$entryId:item:$index", itemIndex = index))
+                        .copy(status = "success", savedPath = result.savedPath)
+                }
+            }
+            existingItems.clear()
+            existingItems.addAll(itemsByIndex.values.sortedBy { it.itemIndex })
+        } else {
+            val index = existingItems.indexOfFirst { it.itemIndex == itemIndex }
+            if (index >= 0) existingItems[index] = item else existingItems.add(item)
+        }
+
+        val sortedItems = existingItems.sortedBy { it.itemIndex }
+        val updated = existing.copy(
+            status = computeSessionStatus(sortedItems),
+            itemCount = existing.itemCount ?: result.historyItemCount,
+            saveTarget = existing.saveTarget ?: result.saveTarget
+        )
+        historyDao.upsertEntry(updated)
+        historyDao.upsertItems(sortedItems)
+    }
+
+    private suspend fun recordReceivedFileWithoutSession(
+        source: DesktopDevice,
+        result: IncomingFileResult
+    ) {
+        val entryId = "native-inbound:${result.transferId}"
+        val kind = kindFromMime(result.mimeType)
+        val label = kindLabel(kind)
+        val entry = HistoryEntryEntity(
+            id = entryId,
+            timestampMillis = System.currentTimeMillis(),
+            direction = "desktop_to_mobile",
+            kind = kind,
+            status = "success",
+            text = "[$label] ${result.fileName}",
+            senderDeviceId = source.stableId,
+            senderName = source.displayName,
+            receiverDeviceId = "native_android_preview",
+            receiverName = "VibeDrop Native Preview",
+            sessionId = null,
+            itemCount = 1,
+            saveTarget = result.saveTarget,
+            rawJson = null
+        )
+        val item = HistoryItemEntity(
+            id = "$entryId:item:0",
+            entryId = entryId,
+            itemIndex = 0,
+            kind = kind,
+            fileName = result.fileName,
+            mimeType = result.mimeType,
+            sizeBytes = result.sizeBytes,
+            localPath = result.savedPath,
+            savedPath = result.savedPath,
+            thumbnailPath = null,
+            thumbnailDataUrl = null,
+            status = "success",
+            error = null
+        )
+        historyDao.upsertEntry(entry)
+        historyDao.upsertItems(listOf(item))
+    }
+
+    private fun desktopInboundEntryId(sessionId: String): String = "desktop-inbound:$sessionId"
+
+    private fun computeSessionStatus(items: List<HistoryItemEntity>): String {
+        if (items.isEmpty()) return "pending"
+        if (items.any { it.status == "pending" || it.status.isNullOrBlank() }) return "pending"
+        val successCount = items.count { it.status == "success" }
+        val failedCount = items.count { it.status == "failed" }
+        return when {
+            failedCount == 0 -> "success"
+            successCount == 0 -> "failed"
+            else -> "partial"
+        }
+    }
+
+    private fun historyItemsSummary(items: List<HistoryItemEntity>): Pair<String, String> {
+        if (items.size == 1) {
+            val item = items[0]
+            val kind = item.kind
+            return kind to "[${kindLabel(kind)}] ${item.fileName ?: "文件"}"
+        }
+        val imageCount = items.count { it.kind == "image" }
+        val videoCount = items.count { it.kind == "video" }
+        return when {
+            imageCount == items.size -> "image" to "[图片] ${items.size} 张"
+            videoCount == items.size -> "video" to "[视频] ${items.size} 个"
+            imageCount + videoCount == items.size -> "media" to "[媒体] ${items.size} 项"
+            else -> "file" to "[文件] ${items.size} 项"
+        }
+    }
+
+    private fun kindLabel(kind: String): String = when (kind) {
+        "image" -> "图片"
+        "video" -> "视频"
+        "media" -> "媒体"
+        else -> "文件"
     }
 
     private fun JSONObject.toHistoryEntry(index: Int): HistoryEntryEntity? {
