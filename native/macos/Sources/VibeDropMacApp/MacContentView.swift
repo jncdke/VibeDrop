@@ -284,6 +284,7 @@ private struct HistoryView: View {
     @EnvironmentObject private var model: MacNativeAppModel
     @State private var query = ""
     @State private var timeFilter = "all"
+    @State private var kindFilter = "all"
 
     private var filteredEntries: [HistoryEntry] {
         let now = Date()
@@ -298,6 +299,11 @@ private struct HistoryView: View {
             default:
                 break
             }
+            if kindFilter != "all" &&
+                entry.kind != kindFilter &&
+                !entry.items.contains(where: { $0.kind == kindFilter }) {
+                return false
+            }
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return true }
             let haystack = [
@@ -306,7 +312,16 @@ private struct HistoryView: View {
                 entry.status,
                 entry.sender?.displayName,
                 entry.receiver?.displayName,
-                entry.items.map { $0.fileName ?? "" }.joined(separator: " ")
+                entry.items.map {
+                    [
+                        $0.fileName,
+                        $0.mimeType,
+                        $0.status,
+                        $0.localPath,
+                        $0.savedPath,
+                        kindLabel($0.kind)
+                    ].compactMap { $0 }.joined(separator: " ")
+                }.joined(separator: " ")
             ].compactMap { $0 }.joined(separator: " ").lowercased()
             return haystack.contains(trimmed.lowercased())
         }
@@ -324,6 +339,16 @@ private struct HistoryView: View {
                 HStack(spacing: 12) {
                     TextField("搜索内容、设备或文件名", text: $query)
                         .textFieldStyle(.roundedBorder)
+                    Picker("", selection: $kindFilter) {
+                        Text("全部类型").tag("all")
+                        Text("文本").tag("text")
+                        Text("媒体").tag("media")
+                        Text("图片").tag("image")
+                        Text("视频").tag("video")
+                        Text("文件").tag("file")
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 150)
                     Picker("", selection: $timeFilter) {
                         Text("全部时间").tag("all")
                         Text("今天").tag("today")
@@ -427,26 +452,187 @@ private struct HistoryRow: View {
     let entry: HistoryEntry
 
     var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            VStack(alignment: .leading, spacing: 7) {
-                Text(entry.timestamp.formatted(date: .numeric, time: .standard))
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(.secondary)
-                Text(entry.text ?? entry.items.first?.fileName ?? entry.kind)
-                    .font(.system(size: 15, weight: .bold))
-                HStack(spacing: 8) {
-                    Tag(entry.kind)
-                    Tag(entry.status)
-                    if let sender = entry.sender?.displayName { Tag(sender) }
-                    if let receiver = entry.receiver?.displayName { Tag(receiver) }
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 14) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(entry.timestamp.formatted(date: .numeric, time: .standard))
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.secondary)
+                    Text(entry.text ?? entry.items.first?.fileName ?? entry.kind)
+                        .font(.system(size: 15, weight: .bold))
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            Tag(kindLabel(entry.kind))
+                            Tag(statusLabel(entry.status))
+                            if let itemCount = entry.itemCount, itemCount > 1 { Tag("\(itemCount) 项") }
+                            if let saveTarget = entry.saveTarget { Tag(saveTargetLabel(saveTarget)) }
+                            if let sender = entry.sender?.displayName { Tag(sender) }
+                            if let receiver = entry.receiver?.displayName { Tag(receiver) }
+                        }
+                    }
+                }
+                Spacer()
+            }
+            if !entry.items.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(entry.items.prefix(16), id: \.id) { item in
+                            MacHistoryItemPreview(item: item)
+                        }
+                        if entry.items.count > 16 {
+                            ExtraItemsTile(count: entry.items.count - 16)
+                        }
+                    }
                 }
             }
-            Spacer()
         }
         .padding(16)
         .background(.white.opacity(0.92), in: RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.black.opacity(0.06)))
     }
+}
+
+private struct MacHistoryItemPreview: View {
+    let item: HistoryItem
+
+    private var image: NSImage? {
+        if let thumbnail = item.thumbnailDataUrl.flatMap(decodeDataURLImage) {
+            return thumbnail
+        }
+        guard item.kind == "image",
+              let path = item.savedPath ?? item.localPath,
+              FileManager.default.fileExists(atPath: path) else {
+            return nil
+        }
+        return NSImage(contentsOf: URL(fileURLWithPath: path))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(itemKindColor(item.kind))
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 92, height: 58)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                } else {
+                    Text(itemShortLabel(item))
+                        .font(.system(size: 13, weight: .black))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .padding(.horizontal, 6)
+                }
+            }
+            .frame(width: 92, height: 58)
+            Text(item.fileName ?? kindLabel(item.kind))
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            Text(statusLabel(item.status ?? ""))
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(item.status == "failed" ? .red : .secondary)
+                .lineLimit(1)
+        }
+        .padding(7)
+        .frame(width: 108, alignment: .leading)
+        .background(Color(red: 0.95, green: 0.97, blue: 1.0), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(statusBorderColor(item.status)))
+    }
+}
+
+private struct ExtraItemsTile: View {
+    let count: Int
+
+    var body: some View {
+        Text("+\(count)")
+            .font(.system(size: 16, weight: .black))
+            .foregroundStyle(.secondary)
+            .frame(width: 78, height: 96)
+            .background(Color(red: 0.9, green: 0.94, blue: 1.0), in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
+private func kindLabel(_ kind: String) -> String {
+    switch kind {
+    case "text": return "文本"
+    case "image": return "图片"
+    case "video": return "视频"
+    case "media": return "媒体"
+    case "file": return "文件"
+    default: return kind
+    }
+}
+
+private func statusLabel(_ status: String) -> String {
+    switch status {
+    case "success": return "成功"
+    case "failed": return "失败"
+    case "partial": return "部分完成"
+    case "pending": return "进行中"
+    default: return status.isEmpty ? "未知" : status
+    }
+}
+
+private func saveTargetLabel(_ target: String) -> String {
+    switch target {
+    case "type": return "输入"
+    case "type_enter": return "输入并回车"
+    case "clipboard": return "剪贴板"
+    case "inbox", "download": return "收件箱"
+    case "gallery-image": return "相册"
+    case "gallery-video": return "视频库"
+    default: return target
+    }
+}
+
+private func itemShortLabel(_ item: HistoryItem) -> String {
+    if let fileName = item.fileName {
+        let ext = (fileName as NSString).pathExtension.uppercased()
+        if !ext.isEmpty && ext.count <= 5 {
+            return ext
+        }
+    }
+    switch item.kind {
+    case "image": return "IMG"
+    case "video": return "VID"
+    case "media": return "MEDIA"
+    case "file": return "FILE"
+    default: return kindLabel(item.kind)
+    }
+}
+
+private func itemKindColor(_ kind: String) -> Color {
+    switch kind {
+    case "image": return Color(red: 0.09, green: 0.55, blue: 0.97)
+    case "video": return Color(red: 0.55, green: 0.36, blue: 0.96)
+    case "media": return Color(red: 0.06, green: 0.47, blue: 0.43)
+    case "file": return Color(red: 0.28, green: 0.32, blue: 0.40)
+    default: return Color.secondary
+    }
+}
+
+private func statusBorderColor(_ status: String?) -> Color {
+    switch status {
+    case "success": return Color.green.opacity(0.28)
+    case "failed": return Color.red.opacity(0.32)
+    case "partial": return Color.orange.opacity(0.32)
+    default: return Color.black.opacity(0.06)
+    }
+}
+
+private func decodeDataURLImage(_ value: String) -> NSImage? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    let base64: String
+    if let range = trimmed.range(of: "base64,") {
+        base64 = String(trimmed[range.upperBound...])
+    } else {
+        base64 = trimmed
+    }
+    guard let data = Data(base64Encoded: base64) else { return nil }
+    return NSImage(data: data)
 }
 
 private struct Card<Content: View>: View {
