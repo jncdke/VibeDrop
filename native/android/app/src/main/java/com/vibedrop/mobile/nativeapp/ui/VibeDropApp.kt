@@ -709,7 +709,9 @@ private fun SendScreen(
         val firstDevice = devices.firstOrNull() ?: return@LaunchedEffect
         drafts[firstDevice.id] = text
         Toast.makeText(context, "已把分享文本填入 ${firstDevice.displayName}", Toast.LENGTH_SHORT).show()
-        onConsumeSharedPayload(payload.id)
+        if (payload.uris.isEmpty()) {
+            onConsumeSharedPayload(payload.id)
+        }
     }
 
     if (devices.isEmpty()) {
