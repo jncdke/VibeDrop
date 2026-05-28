@@ -65,6 +65,7 @@ import com.vibedrop.mobile.nativeapp.platform.readClipboardText
 import com.vibedrop.mobile.nativeapp.platform.sendImageUriToMacClipboard
 import com.vibedrop.mobile.nativeapp.platform.sendUriToDesktopInbox
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileReceiver
+import com.vibedrop.mobile.nativeapp.platform.shareHistoryJson
 import com.vibedrop.mobile.nativeapp.platform.startClipboardSyncService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -88,8 +89,49 @@ fun VibeDropApp(container: AppContainer) {
     var homeVaultUrl by rememberSaveable { mutableStateOf(container.homeVaultRepository.loadEndpoint()) }
     var homeVaultStatus by remember { mutableStateOf("还未同步") }
     var homeVaultBusy by remember { mutableStateOf(false) }
+    var pendingExportJson by remember { mutableStateOf<String?>(null) }
     val devices by container.deviceRepository.observeDevices().collectAsState(initial = emptyList())
     val history by container.historyRepository.observeRecent(limit = 1000).collectAsState(initial = emptyList())
+    val importHistoryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val raw = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                        ?: throw IllegalStateException("无法读取历史文件")
+                    container.historyRepository.importArchive(raw)
+                }
+            }
+            result
+                .onSuccess { imported ->
+                    Toast.makeText(context, "已导入 $imported 条新历史", Toast.LENGTH_SHORT).show()
+                }
+                .onFailure { error ->
+                    Toast.makeText(context, "导入失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                }
+        }
+    }
+    val exportHistoryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        val json = pendingExportJson
+        pendingExportJson = null
+        if (uri == null || json == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    context.contentResolver.openOutputStream(uri)?.use { output ->
+                        output.write(json.toByteArray(Charsets.UTF_8))
+                    } ?: throw IllegalStateException("无法写入导出文件")
+                }
+            }
+            result
+                .onSuccess {
+                    Toast.makeText(context, "历史已导出", Toast.LENGTH_SHORT).show()
+                }
+                .onFailure { error ->
+                    Toast.makeText(context, "导出失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                }
+        }
+    }
     val controllers = remember(devices, appContext) {
         devices.associateBy(
             keySelector = { it.id },
@@ -260,6 +302,44 @@ fun VibeDropApp(container: AppContainer) {
                                     homeVaultStatus = "同步失败：${error.message ?: "未知错误"}"
                                 }
                             homeVaultBusy = false
+                        }
+                    },
+                    onImportHistory = {
+                        importHistoryLauncher.launch(arrayOf("application/json", "text/*", "*/*"))
+                    },
+                    onExportHistory = {
+                        scope.launch {
+                            val json = withContext(Dispatchers.IO) {
+                                container.historyRepository.exportArchive(
+                                    container.historyRepository.loadAllEntries()
+                                )
+                            }
+                            pendingExportJson = json
+                            exportHistoryLauncher.launch(historyArchiveFileName())
+                        }
+                    },
+                    onShareHistory = {
+                        scope.launch {
+                            val result = runCatching {
+                                val fileName = historyArchiveFileName()
+                                val json = withContext(Dispatchers.IO) {
+                                    container.historyRepository.exportArchive(
+                                        container.historyRepository.loadAllEntries()
+                                    )
+                                }
+                                shareHistoryJson(context, fileName, json)
+                            }
+                            result.onFailure { error ->
+                                Toast.makeText(context, "分享失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    },
+                    onClearHistory = {
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                container.historyRepository.clearHistory()
+                            }
+                            Toast.makeText(context, "历史已清空", Toast.LENGTH_SHORT).show()
                         }
                     },
                     onSaveDevice = { name, host, port, pin ->
@@ -947,6 +1027,10 @@ private fun SettingsScreen(
     onDiscover: () -> Unit,
     onPairDesktop: (DiscoveredDesktop) -> Unit,
     onSyncHomeVault: () -> Unit,
+    onImportHistory: () -> Unit,
+    onExportHistory: () -> Unit,
+    onShareHistory: () -> Unit,
+    onClearHistory: () -> Unit,
     onSaveDevice: (name: String, host: String, port: Int, pin: String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -954,6 +1038,7 @@ private fun SettingsScreen(
     var host by rememberSaveable { mutableStateOf("overlorddeMacBook-Air-4.local") }
     var portText by rememberSaveable { mutableStateOf("9001") }
     var pin by rememberSaveable { mutableStateOf("1234") }
+    var clearArmed by rememberSaveable { mutableStateOf(false) }
     val context = LocalContext.current
 
     LazyColumn(
@@ -1046,6 +1131,65 @@ private fun SettingsScreen(
                             .height(54.dp)
                     ) {
                         Text(if (homeVaultBusy) "同步中" else "同步到 Mac mini", fontWeight = FontWeight.ExtraBold)
+                    }
+                }
+            }
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text("数据管理", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        text = "导入和导出都走系统文件选择器，清空只删除原生 Room 历史，不会删除旧 Tauri 的 history.json 源文件。",
+                        color = Color(0xFF667085),
+                        fontSize = 14.sp
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        OutlinedButton(
+                            onClick = onImportHistory,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("导入历史", fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick = onExportHistory,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("导出历史", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        OutlinedButton(
+                            onClick = onShareHistory,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("分享历史", fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                if (clearArmed) {
+                                    clearArmed = false
+                                    onClearHistory()
+                                } else {
+                                    clearArmed = true
+                                    Toast.makeText(context, "再次点击确认清空历史", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                text = if (clearArmed) "确认清空" else "清空历史",
+                                color = Color(0xFFE5484D),
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
                     }
                 }
             }
@@ -1210,6 +1354,11 @@ private fun kindLabel(kind: String): String = when (kind) {
 
 private fun formatTime(timestampMillis: Long): String {
     return SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.CHINA).format(Date(timestampMillis))
+}
+
+private fun historyArchiveFileName(): String {
+    val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+    return "vibedrop_history_$stamp.json"
 }
 
 private enum class HistoryTimeFilter {

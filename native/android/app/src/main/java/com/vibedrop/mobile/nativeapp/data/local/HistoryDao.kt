@@ -27,4 +27,10 @@ interface HistoryDao {
 
     @Upsert
     suspend fun upsertItems(items: List<HistoryItemEntity>)
+
+    @Query("DELETE FROM history_items")
+    suspend fun deleteAllItems()
+
+    @Query("DELETE FROM history_entries")
+    suspend fun deleteAllEntries()
 }

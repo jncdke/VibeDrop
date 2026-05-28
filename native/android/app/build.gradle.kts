@@ -55,6 +55,7 @@ dependencies {
     implementation(libs.compose.material3)
     implementation(libs.compose.ui)
     implementation(libs.compose.ui.tooling.preview)
+    implementation(libs.core.ktx)
     implementation(libs.okhttp)
     implementation(libs.room.ktx)
     implementation(libs.room.runtime)
