@@ -997,9 +997,12 @@ body.nearby-reorder-active {
 }
 
 .input-group textarea {
+    height: 116px;
     min-height: 116px;
+    max-height: 116px;
     padding: 15px 16px;
-    resize: vertical;
+    resize: none;
+    overflow-y: auto;
     font-size: 16px;
     line-height: 1.55;
 }
