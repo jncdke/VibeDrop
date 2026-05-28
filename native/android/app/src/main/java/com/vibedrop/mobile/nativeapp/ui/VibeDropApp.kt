@@ -1,6 +1,8 @@
 package com.vibedrop.mobile.nativeapp.ui
 
+import android.Manifest
 import android.graphics.BitmapFactory
+import android.os.Build
 import android.util.Base64
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -74,9 +76,14 @@ import com.vibedrop.mobile.nativeapp.data.repository.HistoryEntryWithItems
 import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import com.vibedrop.mobile.nativeapp.platform.AndroidDeviceIdentity
 import com.vibedrop.mobile.nativeapp.platform.AndroidNetworkDiagnosticsSnapshot
+import com.vibedrop.mobile.nativeapp.platform.BackgroundRunDiagnosticsSnapshot
 import com.vibedrop.mobile.nativeapp.platform.ContentTransferResult
 import com.vibedrop.mobile.nativeapp.platform.MediaOpenMode
 import com.vibedrop.mobile.nativeapp.platform.loadAndroidNetworkDiagnostics
+import com.vibedrop.mobile.nativeapp.platform.loadBackgroundRunDiagnostics
+import com.vibedrop.mobile.nativeapp.platform.openAppNotificationSettings
+import com.vibedrop.mobile.nativeapp.platform.openAutoRevokeSettings
+import com.vibedrop.mobile.nativeapp.platform.openBatteryOptimizationSettings
 import com.vibedrop.mobile.nativeapp.platform.openHistoryMediaItem
 import com.vibedrop.mobile.nativeapp.platform.readClipboardText
 import com.vibedrop.mobile.nativeapp.platform.sendImageUriToMacClipboard
@@ -1658,12 +1665,25 @@ private fun SettingsScreen(
     var pin by rememberSaveable { mutableStateOf("1234") }
     var clearArmed by rememberSaveable { mutableStateOf(false) }
     var networkDiagnostics by remember { mutableStateOf<AndroidNetworkDiagnosticsSnapshot?>(null) }
+    var backgroundDiagnostics by remember { mutableStateOf<BackgroundRunDiagnosticsSnapshot?>(null) }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        scope.launch {
+            backgroundDiagnostics = withContext(Dispatchers.IO) {
+                loadBackgroundRunDiagnostics(context)
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         networkDiagnostics = withContext(Dispatchers.IO) {
             loadAndroidNetworkDiagnostics(context)
+        }
+        backgroundDiagnostics = withContext(Dispatchers.IO) {
+            loadBackgroundRunDiagnostics(context)
         }
     }
 
@@ -1699,6 +1719,27 @@ private fun SettingsScreen(
                         }
                     }
                 }
+            )
+        }
+        item {
+            BackgroundRunCard(
+                diagnostics = backgroundDiagnostics,
+                onRefresh = {
+                    scope.launch {
+                        backgroundDiagnostics = withContext(Dispatchers.IO) {
+                            loadBackgroundRunDiagnostics(context)
+                        }
+                    }
+                },
+                onOpenNotificationSettings = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    } else {
+                        openAppNotificationSettings(context)
+                    }
+                },
+                onOpenBatterySettings = { openBatteryOptimizationSettings(context) },
+                onOpenAutoRevokeSettings = { openAutoRevokeSettings(context) }
             )
         }
         item {
@@ -1916,6 +1957,120 @@ private fun SettingsScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun BackgroundRunCard(
+    diagnostics: BackgroundRunDiagnosticsSnapshot?,
+    onRefresh: () -> Unit,
+    onOpenNotificationSettings: () -> Unit,
+    onOpenBatterySettings: () -> Unit,
+    onOpenAutoRevokeSettings: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White)
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("后台稳定性", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        text = diagnostics?.let {
+                            if (it.issueCount == 0) "后台剪贴板和重连所需系统开关看起来正常。" else "发现 ${it.issueCount} 个可能影响后台连接的系统开关。"
+                        } ?: "正在读取通知、电池和闲置应用状态...",
+                        color = if ((diagnostics?.issueCount ?: 0) == 0) Color(0xFF667085) else Color(0xFFE5484D),
+                        fontSize = 13.sp
+                    )
+                }
+                OutlinedButton(onClick = onRefresh) {
+                    Text("刷新")
+                }
+            }
+
+            if (diagnostics == null) {
+                Text("正在读取系统状态...", color = Color(0xFF98A2B3), fontSize = 13.sp)
+            } else {
+                BackgroundRunIssueRow(
+                    title = "通知权限",
+                    detail = if (diagnostics.notificationsEnabled) {
+                        "已开启，前台服务通知可以正常显示。"
+                    } else {
+                        "未开启，系统可能限制前台服务提示，影响后台同步稳定性。"
+                    },
+                    ok = diagnostics.notificationsEnabled,
+                    actionText = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) "请求权限" else "通知设置",
+                    onAction = onOpenNotificationSettings
+                )
+                BackgroundRunIssueRow(
+                    title = "电池优化",
+                    detail = if (!diagnostics.batteryCheckAvailable) {
+                        "当前系统没有返回电池优化状态，可从系统设置里手动确认。"
+                    } else if (diagnostics.ignoresBatteryOptimizations) {
+                        "已允许忽略电池优化，后台连接更不容易被系统杀掉。"
+                    } else {
+                        "仍受电池优化限制，建议把 VibeDrop 设为不限制。"
+                    },
+                    ok = diagnostics.batteryCheckAvailable && diagnostics.ignoresBatteryOptimizations,
+                    actionText = "电池设置",
+                    onAction = onOpenBatterySettings
+                )
+                diagnostics.autoRevokeWhitelisted?.let { whitelisted ->
+                    BackgroundRunIssueRow(
+                        title = "闲置应用管理",
+                        detail = if (whitelisted) {
+                            "系统不会因为长期闲置自动撤销权限。"
+                        } else {
+                            "系统可能在闲置后撤销权限或休眠应用，建议在应用详情里关闭相关开关。"
+                        },
+                        ok = whitelisted,
+                        actionText = "应用设置",
+                        onAction = onOpenAutoRevokeSettings
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BackgroundRunIssueRow(
+    title: String,
+    detail: String,
+    ok: Boolean,
+    actionText: String,
+    onAction: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color(0xFFF8FAFC))
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(12.dp)
+                .clip(CircleShape)
+                .background(if (ok) Color(0xFF34C759) else Color(0xFFFFC45C))
+        )
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            Text(title, color = Color(0xFF111827), fontSize = 14.sp, fontWeight = FontWeight.ExtraBold)
+            Text(detail, color = Color(0xFF667085), fontSize = 12.sp)
+        }
+        OutlinedButton(onClick = onAction) {
+            Text(actionText, fontWeight = FontWeight.Bold)
         }
     }
 }
