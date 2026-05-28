@@ -476,6 +476,8 @@ private struct HistoryView: View {
                 HStack {
                     Text("传输历史").font(.system(size: 24, weight: .bold))
                     Spacer()
+                    Button("导出历史") { model.exportHistory() }
+                        .buttonStyle(.bordered)
                     Button("刷新") { model.refresh() }
                         .buttonStyle(.bordered)
                 }
@@ -579,8 +581,11 @@ private struct HistoryView: View {
                     EmptyHint("等待接收或发送内容。")
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    ForEach(filteredEntries, id: \.id) { entry in
-                        HistoryRow(entry: entry)
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(filteredEntries, id: \.id) { entry in
+                            HistoryRow(entry: entry)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
                 }
             }

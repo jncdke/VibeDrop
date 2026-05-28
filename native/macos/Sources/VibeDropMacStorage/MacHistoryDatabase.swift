@@ -50,21 +50,21 @@ public final class MacHistoryDatabase: @unchecked Sendable {
                 """,
                 arguments: [limit]
             )
-            return try rows.map { row in
-                let entryId: String = row["id"]
-                let itemRows = try Row.fetchAll(
-                    db,
-                    sql: """
-                    SELECT *
-                    FROM history_items
-                    WHERE entry_id = ?
-                    ORDER BY item_index ASC
-                    """,
-                    arguments: [entryId]
-                )
-                let items = itemRows.map(mapHistoryItem(row:))
-                return mapHistoryEntry(row: row, items: items)
-            }
+            return try mapHistoryEntries(rows: rows, db: db)
+        }
+    }
+
+    public func fetchAll() throws -> [HistoryEntry] {
+        try queue.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT *
+                FROM history_entries
+                ORDER BY timestamp_ms DESC, created_at_ms DESC
+                """
+            )
+            return try mapHistoryEntries(rows: rows, db: db)
         }
     }
 
@@ -224,6 +224,31 @@ public final class MacHistoryDatabase: @unchecked Sendable {
             saveTarget: row["save_target"],
             items: items
         )
+    }
+
+    private func mapHistoryEntries(rows: [Row], db: Database) throws -> [HistoryEntry] {
+        let entryIds: [String] = rows.map { row in row["id"] }
+        guard !entryIds.isEmpty else { return [] }
+        let placeholders = Array(repeating: "?", count: entryIds.count).joined(separator: ", ")
+        let itemRows = try Row.fetchAll(
+            db,
+            sql: """
+            SELECT *
+            FROM history_items
+            WHERE entry_id IN (\(placeholders))
+            ORDER BY item_index ASC
+            """,
+            arguments: StatementArguments(entryIds)
+        )
+        var itemsByEntryId: [String: [HistoryItem]] = [:]
+        for itemRow in itemRows {
+            let entryId: String = itemRow["entry_id"]
+            itemsByEntryId[entryId, default: []].append(mapHistoryItem(row: itemRow))
+        }
+        return rows.map { row in
+            let entryId: String = row["id"]
+            return mapHistoryEntry(row: row, items: itemsByEntryId[entryId] ?? [])
+        }
     }
 
     private func mapHistoryItem(row: Row) -> HistoryItem {

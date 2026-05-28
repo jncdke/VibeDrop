@@ -29,6 +29,7 @@ final class MacNativeAppModel: ObservableObject {
     @Published var launchAtLoginStatus = MacLaunchAtLoginController.statusText
     @Published var diagnosticEvents: [MacDiagnosticLogEvent] = []
     @Published var diagnosticExportPath: String?
+    @Published var historyExportPath: String?
 
     private var started = false
     private var server: VibeDropMacServer?
@@ -128,7 +129,7 @@ final class MacNativeAppModel: ObservableObject {
             selectedSessionId = connectedClients.first(where: { $0.peer.canReceiveFiles })?.peer.sessionId
                 ?? connectedClients.first?.peer.sessionId
         }
-        recentHistory = (try? database?.fetchRecent(limit: 80)) ?? []
+        recentHistory = (try? database?.fetchAll()) ?? []
         diagnosticEvents = diagnosticLogStore?.recent(limit: 60) ?? []
     }
 
@@ -304,6 +305,48 @@ final class MacNativeAppModel: ObservableObject {
         }
     }
 
+    func exportHistory() {
+        guard let database else {
+            serviceError = "历史数据库尚未初始化"
+            return
+        }
+        do {
+            let entries = try database.fetchAll()
+            guard !entries.isEmpty else {
+                serviceError = "没有历史可导出"
+                return
+            }
+            let archive = MacHistoryExportArchive(
+                exportedAt: Date(),
+                sourceDevice: configuration.map {
+                    DeviceIdentity(
+                        deviceId: $0.serverId,
+                        displayName: $0.hostname,
+                        role: "desktop",
+                        ip: $0.ip,
+                        port: $0.port
+                    )
+                },
+                history: entries
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(archive)
+            let fileName = "vibedrop_macos_history_\(Self.fileStamp()).json"
+            let url = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent(fileName)
+            try data.write(to: url, options: .atomic)
+            historyExportPath = url.path
+            log("history", "exported", ["count": "\(entries.count)", "path": url.lastPathComponent])
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+            refresh()
+        } catch {
+            serviceError = "导出历史失败：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+            log("history", "export_failed", ["error": serviceError ?? "unknown"])
+        }
+    }
+
     private func updateTransfer(id: String, status: String, detail: String) {
         guard let index = transferItems.firstIndex(where: { $0.id == id }) else { return }
         transferItems[index].status = status
@@ -344,6 +387,12 @@ final class MacNativeAppModel: ObservableObject {
         lastConnectedClientKeys = keys
     }
 
+    private static func fileStamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        return formatter.string(from: Date())
+    }
+
     private func importLegacyHistoryIfAvailable(
         database: MacHistoryDatabase,
         configuration: MacServerConfiguration
@@ -364,4 +413,12 @@ final class MacNativeAppModel: ObservableObject {
             _ = try? database.importLegacyJsonl(at: url, receiver: receiver)
         }
     }
+}
+
+private struct MacHistoryExportArchive: Codable {
+    var schemaVersion = 1
+    var app = "VibeDrop Native macOS"
+    var exportedAt: Date
+    var sourceDevice: DeviceIdentity?
+    var history: [HistoryEntry]
 }

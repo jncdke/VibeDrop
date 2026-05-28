@@ -43,5 +43,9 @@ final class MacHistoryDatabaseTests: XCTestCase {
         XCTAssertEqual(recent.first?.receiver?.deviceId, "desktop_demo")
         XCTAssertEqual(recent.first?.items.first?.fileName, "demo.png")
         XCTAssertEqual(recent.first?.items.first?.thumbnailDataUrl, "data:image/png;base64,abc")
+
+        let all = try database.fetchAll()
+        XCTAssertEqual(all.map(\.kind), ["image", "text"])
+        XCTAssertEqual(all.first?.items.count, 1)
     }
 }
