@@ -109,6 +109,15 @@
 
             <div class="settings-card data-card">
                 <h3>数据管理</h3>
+                <div class="home-vault-sync">
+                    <div class="home-vault-sync-copy">
+                        <div class="home-vault-sync-label">家庭服务器</div>
+                        <div class="home-vault-sync-hint">把当前手机历史直接同步到 Mac mini Home Vault。</div>
+                    </div>
+                    <input id="home-vault-url-input" class="home-vault-url-input" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="http://minideMac-mini.local:8788">
+                    <button id="sync-home-vault-btn" class="primary-btn" type="button">同步到 Mac mini</button>
+                    <div id="home-vault-sync-status" class="home-vault-sync-status">未同步</div>
+                </div>
                 <div class="history-actions">
                     <button id="import-history-btn" class="secondary-btn">导入历史</button>
                     <button id="export-history-btn" class="secondary-btn">导出历史</button>

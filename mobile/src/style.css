@@ -314,6 +314,63 @@ img {
     margin-top: 18px;
 }
 
+.home-vault-sync {
+    display: grid;
+    gap: 12px;
+    margin: 14px 0 16px;
+    padding: 14px;
+    border-radius: 20px;
+    background: rgba(248, 250, 252, 0.88);
+    border: 1px solid rgba(15, 23, 42, 0.06);
+}
+
+.home-vault-sync-copy {
+    display: grid;
+    gap: 4px;
+}
+
+.home-vault-sync-label {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.home-vault-sync-hint,
+.home-vault-sync-status {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+}
+
+.home-vault-url-input {
+    width: 100%;
+    min-height: 46px;
+    padding: 0 14px;
+    border-radius: 16px;
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.86);
+    color: var(--text-primary);
+    font-size: 14px;
+}
+
+.home-vault-url-input:focus {
+    outline: none;
+    border-color: rgba(10, 132, 255, 0.42);
+    box-shadow: 0 0 0 4px rgba(10, 132, 255, 0.1);
+}
+
+.home-vault-sync .primary-btn {
+    margin-top: 0;
+}
+
+.home-vault-sync-status.success {
+    color: var(--success);
+}
+
+.home-vault-sync-status.error {
+    color: var(--danger);
+}
+
 .media-opener-settings-list {
     display: grid;
     gap: 12px;

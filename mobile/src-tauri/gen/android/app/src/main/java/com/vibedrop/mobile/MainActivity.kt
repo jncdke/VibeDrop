@@ -10,6 +10,9 @@ import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.database.Cursor
 import android.media.MediaScannerConnection
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -36,6 +39,9 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.SocketException
+import java.net.URL
 import java.net.URLConnection
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -187,6 +193,7 @@ class MainActivity : TauriActivity() {
     webView.addJavascriptInterface(DeviceBridge(), "NativeDevice")
     webView.addJavascriptInterface(BackgroundClipboardBridge(this), "NativeBackgroundClipboard")
     webView.addJavascriptInterface(MediaLibraryBridge(this), "NativeMediaLibrary")
+    webView.addJavascriptInterface(HomeVaultBridge(), "NativeHomeVault")
     Log.d(TAG, "JS Bridge NativeClipboard 已注入")
     Log.d(TAG, "Tauri init scripts: ${(webView as? RustWebView)?.initScripts?.size ?: 0}")
     webView.post { installPreviewAssetLoaderIfNeeded(webView) }
@@ -790,6 +797,138 @@ class MainActivity : TauriActivity() {
 
       pendingSharedContents.clear()
       pendingSharedContents.addAll(nextContents)
+    }
+  }
+
+  inner class HomeVaultBridge {
+    @JavascriptInterface
+    fun syncHistory(endpoint: String, data: String) {
+      Thread {
+        val result = JSONObject()
+        var connection: HttpURLConnection? = null
+        try {
+          val targetUrl = buildHomeVaultSyncUrl(endpoint)
+          val bytes = data.toByteArray(Charsets.UTF_8)
+          val url = URL(targetUrl)
+          val wifiNetwork = if (isLocalHomeVaultTarget(url)) findWifiNetwork() else null
+          val rawConnection = openHomeVaultConnection(url, wifiNetwork)
+          connection = (rawConnection as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 10_000
+            readTimeout = 120_000
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("X-VibeDrop-Client", "android")
+            setFixedLengthStreamingMode(bytes.size)
+          }
+
+          connection.outputStream.use { output ->
+            output.write(bytes)
+          }
+
+          val statusCode = connection.responseCode
+          val body = readHttpResponseBody(connection, statusCode)
+          result.put("ok", statusCode in 200..299)
+          result.put("status", statusCode)
+          result.put("body", body)
+          result.put("url", targetUrl)
+          result.put("network", if (wifiNetwork != null) "wifi" else "default")
+          if (statusCode !in 200..299) {
+            result.put("error", extractErrorMessage(body) ?: "HTTP $statusCode")
+          }
+        } catch (e: Exception) {
+          Log.e(TAG, "同步 Home Vault 失败", e)
+          result.put("ok", false)
+          result.put("error", e.message ?: "同步失败")
+        } finally {
+          connection?.disconnect()
+          emitBridgeEvent("native-home-vault-sync-result", result)
+        }
+      }.start()
+    }
+
+    private fun buildHomeVaultSyncUrl(endpoint: String): String {
+      val trimmed = endpoint.trim().trimEnd('/')
+      val base = when {
+        trimmed.startsWith("http://") || trimmed.startsWith("https://") -> trimmed
+        trimmed.isNotBlank() -> "http://$trimmed"
+        else -> "http://minideMac-mini.local:8788"
+      }.trimEnd('/')
+
+      return if (base.endsWith("/api/android-history")) {
+        base
+      } else {
+        "$base/api/android-history"
+      }
+    }
+
+    private fun isLocalHomeVaultTarget(url: URL): Boolean {
+      val host = url.host?.lowercase().orEmpty()
+      return host.endsWith(".local")
+        || host.startsWith("192.168.")
+        || host.startsWith("10.")
+        || Regex("""^172\.(1[6-9]|2\d|3[0-1])\.""").containsMatchIn(host)
+    }
+
+    private fun findWifiNetwork(): Network? {
+      return try {
+        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+          ?: return null
+        connectivityManager.allNetworks.firstOrNull { network ->
+          val caps = connectivityManager.getNetworkCapabilities(network) ?: return@firstOrNull false
+          caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+            && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        }
+      } catch (e: SecurityException) {
+        Log.w(TAG, "缺少网络状态权限，Home Vault 同步将使用默认网络", e)
+        null
+      }
+    }
+
+    private fun openHomeVaultConnection(url: URL, wifiNetwork: Network?): URLConnection {
+      if (wifiNetwork == null) {
+        return url.openConnection()
+      }
+
+      return try {
+        wifiNetwork.openConnection(url)
+      } catch (e: SocketException) {
+        if (isVpnBypassDenied(e)) {
+          throw IllegalStateException(
+            "当前 VPN 禁止 VibeDrop 绕过 VPN 访问局域网。请临时关闭 VPN，或在 VPN 里允许 VibeDrop / 192.168.3.0/24 直连。",
+            e
+          )
+        }
+        throw e
+      } catch (e: SecurityException) {
+        throw IllegalStateException(
+          "系统不允许 VibeDrop 绑定 Wi-Fi 网络。请临时关闭 VPN，或在 VPN 里允许 VibeDrop 直连局域网。",
+          e
+        )
+      }
+    }
+
+    private fun isVpnBypassDenied(error: Exception): Boolean {
+      val message = error.message.orEmpty()
+      return message.contains("EPERM", ignoreCase = true)
+        || message.contains("Operation not permitted", ignoreCase = true)
+    }
+
+    private fun readHttpResponseBody(connection: HttpURLConnection, statusCode: Int): String {
+      val stream = if (statusCode in 200..299) {
+        connection.inputStream
+      } else {
+        connection.errorStream ?: connection.inputStream
+      }
+      return stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+    }
+
+    private fun extractErrorMessage(body: String): String? {
+      return runCatching {
+        val json = JSONObject(body)
+        json.optString("error").takeIf { it.isNotBlank() }
+      }.getOrNull()
     }
   }
 

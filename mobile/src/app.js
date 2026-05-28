@@ -26,6 +26,7 @@ const MEDIA_OPENER_KINDS = ['image', 'video'];
 const NEARBY_REORDER_LONG_PRESS_MS = 260;
 const NEARBY_REORDER_CANCEL_DISTANCE = 10;
 const NEARBY_REORDER_HINT_KEY = 'vibedrop_nearby_reorder_hint_seen';
+const HOME_VAULT_DEFAULT_URL = 'http://192.168.3.2:8788';
 const SMART_DISCOVERY_REFRESH_COOLDOWN_MS = 15000;
 const DIAGNOSTICS_REFRESH_INTERVAL_MS = 1000;
 const DEFAULT_HISTORY_FILTERS = {
@@ -176,6 +177,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     initNearbyDesktopDiscovery();
     initConnectionDiagnostics();
     initHistoryActions();
+    initHomeVaultSync();
     initHistoryFilterControls();
     initHistoryHeatmapInteractions();
     initHistoryMediaPreview();
@@ -6161,7 +6163,7 @@ function resolveHistoryImportTargetId(targetAlias, targetDeviceName, targetServe
     return '';
 }
 
-function waitForNativeBridgeEvent(eventName, invokeNative) {
+function waitForNativeBridgeEvent(eventName, invokeNative, timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
         let settled = false;
 
@@ -6178,7 +6180,7 @@ function waitForNativeBridgeEvent(eventName, invokeNative) {
             settled = true;
             window.removeEventListener(eventName, handler);
             reject(new Error('原生操作超时'));
-        }, 15000);
+        }, timeoutMs);
 
         window.addEventListener(eventName, handler);
 
@@ -6191,6 +6193,236 @@ function waitForNativeBridgeEvent(eventName, invokeNative) {
             reject(error);
         }
     });
+}
+
+function normalizeHomeVaultUrl(rawUrl = '') {
+    const trimmed = String(rawUrl || '').trim() || HOME_VAULT_DEFAULT_URL;
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
+        ? trimmed
+        : `http://${trimmed}`;
+    return withScheme.replace(/\/+$/, '');
+}
+
+function normalizeHomeVaultHostToken(value = '') {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/\.local$/, '')
+        .replace(/[^a-z0-9]/g, '');
+}
+
+function resolveHomeVaultUrlForNetwork(rawUrl = '') {
+    const normalized = normalizeHomeVaultUrl(rawUrl);
+    let url;
+    try {
+        url = new URL(normalized);
+    } catch (error) {
+        return normalized;
+    }
+
+    const host = url.hostname || '';
+    if (!host.toLowerCase().endsWith('.local')) {
+        return normalized;
+    }
+
+    const targetToken = normalizeHomeVaultHostToken(host);
+    const devices = getDevices();
+    const matched = devices.find((device) => {
+        if (!device?.ip) return false;
+        const labels = [device.name, device.hostName, device.hostname].filter(Boolean);
+        return labels.some((label) => {
+            const labelToken = normalizeHomeVaultHostToken(label);
+            return labelToken && (
+                labelToken === targetToken
+                || labelToken.includes(targetToken)
+                || targetToken.includes(labelToken)
+            );
+        });
+    });
+
+    if (!matched?.ip) {
+        try {
+            const fallback = new URL(HOME_VAULT_DEFAULT_URL);
+            url.hostname = fallback.hostname;
+            if (!url.port && fallback.port) {
+                url.port = fallback.port;
+            }
+            return url.toString().replace(/\/+$/, '');
+        } catch (error) {
+            return normalized;
+        }
+    }
+
+    url.hostname = matched.ip;
+    return url.toString().replace(/\/+$/, '');
+}
+
+function getHomeVaultSettings() {
+    const settings = getStoredSettingsObject();
+    const homeVault = settings.homeVault && typeof settings.homeVault === 'object'
+        ? settings.homeVault
+        : {};
+    return {
+        url: resolveHomeVaultUrlForNetwork(homeVault.url || HOME_VAULT_DEFAULT_URL),
+        lastSyncedAt: homeVault.lastSyncedAt || '',
+        lastEntryCount: Number(homeVault.lastEntryCount || 0),
+    };
+}
+
+function saveHomeVaultSettings(patch = {}) {
+    const settings = getStoredSettingsObject();
+    const current = getHomeVaultSettings();
+    saveStoredSettingsObject({
+        ...settings,
+        homeVault: {
+            ...current,
+            ...patch,
+            url: resolveHomeVaultUrlForNetwork(patch.url || current.url),
+        },
+    });
+}
+
+function setHomeVaultStatus(message, tone = '') {
+    const status = $('home-vault-sync-status');
+    if (!status) return;
+    status.textContent = message;
+    status.classList.toggle('success', tone === 'success');
+    status.classList.toggle('error', tone === 'error');
+}
+
+function buildHomeVaultPayload(history) {
+    return {
+        schemaVersion: 1,
+        app: 'VibeDrop',
+        deviceId: clientIdentity.id,
+        deviceName: clientIdentity.name,
+        exportedAt: new Date().toISOString(),
+        history: buildHistoryExportData(history),
+    };
+}
+
+async function syncHomeVaultWithFetch(endpoint, payload) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90000);
+    try {
+        const response = await fetch(`${endpoint}/api/android-history`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: controller.signal,
+        });
+        const resultText = await response.text();
+        let result = {};
+        try {
+            result = resultText ? JSON.parse(resultText) : {};
+        } catch (error) {
+            result = { error: resultText || error.message };
+        }
+        if (!response.ok || result.ok === false) {
+            throw new Error(result.error || `HTTP ${response.status}`);
+        }
+        return result;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function syncHomeVaultHistory() {
+    const history = getHistory();
+    if (history.length === 0) {
+        showToast('暂无历史可同步');
+        return;
+    }
+
+    const input = $('home-vault-url-input');
+    const endpoint = resolveHomeVaultUrlForNetwork(input?.value || HOME_VAULT_DEFAULT_URL);
+    if (input) {
+        input.value = endpoint;
+    }
+    saveHomeVaultSettings({ url: endpoint });
+
+    const button = $('sync-home-vault-btn');
+    if (button) {
+        button.disabled = true;
+        button.textContent = '同步中...';
+    }
+    setHomeVaultStatus(`正在同步 ${history.length} 条历史到 ${endpoint}...`);
+
+    const payload = buildHomeVaultPayload(history);
+    try {
+        let result;
+        if (window.NativeHomeVault && window.NativeHomeVault.syncHistory) {
+            result = await waitForNativeBridgeEvent('native-home-vault-sync-result', () => {
+                window.NativeHomeVault.syncHistory(endpoint, JSON.stringify(payload));
+            }, 120000);
+            if (!result.ok) {
+                throw new Error(result.error || '同步失败');
+            }
+            if (result.body) {
+                try {
+                    result = {
+                        ...JSON.parse(result.body),
+                        status: result.status,
+                    };
+                } catch (error) {
+                    result = {
+                        ok: true,
+                        status: result.status,
+                    };
+                }
+            }
+        } else {
+            result = await syncHomeVaultWithFetch(endpoint, payload);
+        }
+
+        const syncedCount = result.historyCount || history.length;
+        const totalCount = result.syncReport?.totalEntryCountInDb
+            || result.syncReport?.uniqueEntryCount
+            || syncedCount;
+        const syncedAt = new Date().toISOString();
+        saveHomeVaultSettings({
+            url: endpoint,
+            lastSyncedAt: syncedAt,
+            lastEntryCount: syncedCount,
+        });
+        setHomeVaultStatus(`已同步 ${syncedCount} 条，Vault 当前 ${totalCount} 条。`, 'success');
+        showToast('已同步到 Mac mini Vault');
+    } catch (error) {
+        const message = error?.name === 'AbortError' ? '同步超时' : (error?.message || '同步失败');
+        setHomeVaultStatus(`同步失败：${message}`, 'error');
+        showToast(`同步失败：${message}`);
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '同步到 Mac mini';
+        }
+    }
+}
+
+function initHomeVaultSync() {
+    const input = $('home-vault-url-input');
+    const button = $('sync-home-vault-btn');
+    if (!input || !button) {
+        return;
+    }
+
+    const settings = getHomeVaultSettings();
+    input.value = settings.url;
+    if (settings.lastSyncedAt) {
+        const date = new Date(settings.lastSyncedAt);
+        const label = Number.isNaN(date.getTime())
+            ? settings.lastSyncedAt
+            : date.toLocaleString('zh-CN');
+        setHomeVaultStatus(`上次同步：${label} · ${settings.lastEntryCount || 0} 条`, 'success');
+    }
+
+    input.addEventListener('change', () => {
+        const url = resolveHomeVaultUrlForNetwork(input.value);
+        input.value = url;
+        saveHomeVaultSettings({ url });
+        setHomeVaultStatus('服务器地址已保存');
+    });
+    button.addEventListener('click', () => syncHomeVaultHistory());
 }
 
 async function exportHistory() {
