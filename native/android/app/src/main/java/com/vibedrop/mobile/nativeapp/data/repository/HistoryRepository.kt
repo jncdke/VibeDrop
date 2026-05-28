@@ -433,32 +433,60 @@ class HistoryRepository(
     }
 
     private fun JSONObject.toHistoryItems(entryId: String): List<HistoryItemEntity> {
-        val array = optJSONArray("items") ?: optJSONArray("Items") ?: return emptyList()
+        val array = optJSONArray("items") ?: optJSONArray("Items")
         val items = mutableListOf<HistoryItemEntity>()
-        for (index in 0 until array.length()) {
-            val item = array.optJSONObject(index) ?: continue
-            val itemIndex = item.optIntOrNull("itemIndex")
-                ?: item.optIntOrNull("item_index")
-                ?: index
-            val mimeType = item.firstString("mimeType", "mime_type")
-            val kind = item.firstString("kind").ifBlank { kindFromMime(mimeType) }
-            items += HistoryItemEntity(
-                id = "$entryId:item:$itemIndex",
-                entryId = entryId,
-                itemIndex = itemIndex,
-                kind = kind,
-                fileName = item.firstString("fileName", "file_name").takeIf { it.isNotBlank() },
-                mimeType = mimeType.takeIf { it.isNotBlank() },
-                sizeBytes = item.optLongOrNull("sizeBytes") ?: item.optLongOrNull("size_bytes"),
-                localPath = item.firstString("localPath", "local_path", "filePath", "file_path")
-                    .takeIf { it.isNotBlank() },
-                savedPath = item.firstString("savedPath", "saved_path").takeIf { it.isNotBlank() },
-                thumbnailPath = item.firstString("thumbnailPath", "thumbnail_path").takeIf { it.isNotBlank() },
-                thumbnailDataUrl = item.firstString("thumbnailDataUrl", "thumbnail_data_url")
-                    .takeIf { it.isNotBlank() },
-                status = item.firstString("status").ifBlank { "success" },
-                error = item.firstString("error").takeIf { it.isNotBlank() }
-            )
+        if (array != null) {
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+                val itemIndex = item.optIntOrNull("itemIndex")
+                    ?: item.optIntOrNull("item_index")
+                    ?: index
+                val mimeType = item.firstString("mimeType", "mime_type")
+                val kind = item.firstString("kind").ifBlank { kindFromMime(mimeType) }
+                items += HistoryItemEntity(
+                    id = "$entryId:item:$itemIndex",
+                    entryId = entryId,
+                    itemIndex = itemIndex,
+                    kind = kind,
+                    fileName = item.firstString("fileName", "file_name").takeIf { it.isNotBlank() },
+                    mimeType = mimeType.takeIf { it.isNotBlank() },
+                    sizeBytes = item.optLongOrNull("sizeBytes") ?: item.optLongOrNull("size_bytes"),
+                    localPath = item.firstString("localPath", "local_path", "filePath", "file_path")
+                        .takeIf { it.isNotBlank() },
+                    savedPath = item.firstString("savedPath", "saved_path").takeIf { it.isNotBlank() },
+                    thumbnailPath = item.firstString("thumbnailPath", "thumbnail_path").takeIf { it.isNotBlank() },
+                    thumbnailDataUrl = item.firstString("thumbnailDataUrl", "thumbnail_data_url")
+                        .takeIf { it.isNotBlank() },
+                    status = item.firstString("status").ifBlank { "success" },
+                    error = item.firstString("error").takeIf { it.isNotBlank() }
+                )
+            }
+        }
+        if (items.isEmpty()) {
+            val mimeType = firstString("mimeType", "mime_type")
+            val kind = firstString("kind").ifBlank { kindFromMime(mimeType) }
+            val fileName = firstString("fileName", "file_name")
+            val localPath = firstString("localPath", "local_path", "filePath", "file_path")
+            val savedPath = firstString("savedPath", "saved_path")
+            val thumbnailDataUrl = firstString("thumbnailDataUrl", "thumbnail_data_url")
+            val hasTopLevelMedia = fileName.isNotBlank() || localPath.isNotBlank() || savedPath.isNotBlank() || thumbnailDataUrl.isNotBlank()
+            if (hasTopLevelMedia && kind != "text") {
+                items += HistoryItemEntity(
+                    id = "$entryId:item:0",
+                    entryId = entryId,
+                    itemIndex = 0,
+                    kind = kind,
+                    fileName = fileName.takeIf { it.isNotBlank() },
+                    mimeType = mimeType.takeIf { it.isNotBlank() },
+                    sizeBytes = optLongOrNull("sizeBytes") ?: optLongOrNull("size_bytes"),
+                    localPath = localPath.takeIf { it.isNotBlank() },
+                    savedPath = savedPath.takeIf { it.isNotBlank() },
+                    thumbnailPath = firstString("thumbnailPath", "thumbnail_path").takeIf { it.isNotBlank() },
+                    thumbnailDataUrl = thumbnailDataUrl.takeIf { it.isNotBlank() },
+                    status = firstString("status").ifBlank { "success" },
+                    error = firstString("error").takeIf { it.isNotBlank() }
+                )
+            }
         }
         return items.sortedBy { it.itemIndex }
     }
