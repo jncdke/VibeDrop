@@ -6,6 +6,8 @@ import android.provider.OpenableColumns
 import android.util.Base64
 import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.InputStream
 import java.util.UUID
 
 private const val FILE_CHUNK_BYTES = 192 * 1024
@@ -78,8 +80,10 @@ suspend fun sendUriToDesktopInbox(
     historyItemCount: Int? = null,
     onProgress: (ContentTransferProgress) -> Unit = {}
 ): ContentTransferResult {
-    val meta = queryContentTransferMeta(context, uri)
+    val prepared = prepareContentTransfer(context, uri)
+    val meta = prepared.meta
     if (meta.sizeBytes <= 0L) {
+        prepared.cleanup()
         throw IllegalStateException("无法识别文件大小")
     }
 
@@ -97,6 +101,7 @@ suspend fun sendUriToDesktopInbox(
         )
     ) {
         controller.cancelIncomingFileAck(transferId)
+        prepared.cleanup()
         throw IllegalStateException("连接不可用")
     }
 
@@ -110,7 +115,7 @@ suspend fun sendUriToDesktopInbox(
                 progressPercent = 0
             )
         )
-        context.contentResolver.openInputStream(uri)?.use { input ->
+        prepared.openInputStream(context, uri)?.use { input ->
             val buffer = ByteArray(FILE_CHUNK_BYTES)
             var sentBytes = 0L
             while (true) {
@@ -172,6 +177,8 @@ suspend fun sendUriToDesktopInbox(
         }
         controller.cancelIncomingFileAck(transferId)
         throw error
+    } finally {
+        prepared.cleanup()
     }
 }
 
@@ -180,6 +187,65 @@ fun queryContentTransferMeta(
     uri: Uri,
     fallbackName: String = "file.bin"
 ): ContentTransferResult = context.queryContentMeta(uri, fallbackName)
+
+private data class PreparedContentTransfer(
+    val meta: ContentTransferResult,
+    val tempFile: File?
+) {
+    fun openInputStream(context: Context, originalUri: Uri): InputStream? {
+        return tempFile?.inputStream() ?: context.contentResolver.openInputStream(originalUri)
+    }
+
+    fun cleanup() {
+        tempFile?.delete()
+    }
+}
+
+private fun prepareContentTransfer(
+    context: Context,
+    uri: Uri
+): PreparedContentTransfer {
+    val meta = queryContentTransferMeta(context, uri)
+    if (meta.sizeBytes > 0L) {
+        return PreparedContentTransfer(meta.copy(sourceUri = uri.toString()), tempFile = null)
+    }
+
+    val tempFile = copyUnknownSizeUriToCache(context, uri)
+    val sizeBytes = tempFile.length()
+    if (sizeBytes <= 0L) {
+        tempFile.delete()
+        throw IllegalStateException("无法识别文件大小")
+    }
+    return PreparedContentTransfer(
+        meta = meta.copy(
+            sizeBytes = sizeBytes,
+            sourceUri = uri.toString()
+        ),
+        tempFile = tempFile
+    )
+}
+
+private fun copyUnknownSizeUriToCache(
+    context: Context,
+    uri: Uri
+): File {
+    val directory = File(context.cacheDir, "outgoing-transfer")
+    if (!directory.exists()) {
+        directory.mkdirs()
+    }
+    val tempFile = File.createTempFile("vibedrop-send-", ".tmp", directory)
+    try {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            tempFile.outputStream().use { output ->
+                input.copyTo(output, bufferSize = 256 * 1024)
+            }
+        } ?: throw IllegalStateException("无法读取文件")
+    } catch (error: Exception) {
+        tempFile.delete()
+        throw error
+    }
+    return tempFile
+}
 
 fun failedContentTransferResult(
     context: Context,
@@ -218,6 +284,15 @@ private fun Context.queryContentMeta(
             }
             if (sizeIndex >= 0) {
                 sizeBytes = cursor.getLong(sizeIndex)
+            }
+        }
+    }
+    if (sizeBytes <= 0L) {
+        runCatching {
+            contentResolver.openAssetFileDescriptor(uri, "r")?.use { descriptor ->
+                if (descriptor.length > 0L) {
+                    sizeBytes = descriptor.length
+                }
             }
         }
     }
