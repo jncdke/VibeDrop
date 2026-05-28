@@ -1702,23 +1702,31 @@ function deviceFilterValue(name, id) {
   return deviceDisplayName(name, id);
 }
 
+function incrementCount(map, key) {
+  map.set(key, (map.get(key) || 0) + 1);
+}
+
+function optionLabel(label, count) {
+  return `${label} (${count})`;
+}
+
 function populateDeviceFilter(selectId, entries, role) {
   const select = document.getElementById(selectId);
-  const values = new Set();
+  const counts = new Map();
   entries.forEach((entry) => {
     const label = role === 'sender'
       ? deviceFilterValue(entry.senderName, entry.senderId)
       : deviceFilterValue(entry.receiverName, entry.receiverId);
-    if (label && label !== '未知设备') {
-      values.add(label);
+    if (label) {
+      incrementCount(counts, label);
     }
   });
   const selected = select.value || 'all';
-  const options = ['all', ...Array.from(values).sort((a, b) => a.localeCompare(b, 'zh-CN'))];
+  const options = ['all', ...Array.from(counts.keys()).sort((a, b) => a.localeCompare(b, 'zh-CN'))];
   select.innerHTML = options.map((value) => {
     const label = value === 'all'
-      ? role === 'sender' ? '全部发送端' : '全部接收端'
-      : value;
+      ? optionLabel(role === 'sender' ? '全部发送端' : '全部接收端', entries.length)
+      : optionLabel(value, counts.get(value) || 0);
     return `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`;
   }).join('');
   select.value = options.includes(selected) ? selected : 'all';
@@ -1727,6 +1735,38 @@ function populateDeviceFilter(selectId, entries, role) {
 function populateDeviceFilters() {
   populateDeviceFilter('senderFilter', state.entries, 'sender');
   populateDeviceFilter('receiverFilter', state.entries, 'receiver');
+}
+
+function entryMatchesKind(entry, kind) {
+  if (kind === 'all') return true;
+  if (kind === 'missing') return entry.media.some((item) => !item.objectUrl && !item.thumbnailDataUrl);
+  if (kind === 'text') return (entry.kind || 'text') === 'text' && entry.media.length === 0;
+  return (entry.kind || '').includes(kind) || entry.media.some((item) => (item.kind || '').includes(kind));
+}
+
+function populateKindFilter(entries) {
+  const select = document.getElementById('kindFilter');
+  const selected = select.value || 'all';
+  const definitions = [
+    ['all', '全部类型'],
+    ['text', '文本'],
+    ['image', '图片'],
+    ['video', '视频'],
+    ['file', '文件'],
+    ['missing', '无预览媒体'],
+  ];
+  select.innerHTML = definitions.map(([value, label]) => {
+    const count = value === 'all'
+      ? entries.length
+      : entries.filter((entry) => entryMatchesKind(entry, value)).length;
+    return `<option value="${escapeHtml(value)}">${escapeHtml(optionLabel(label, count))}</option>`;
+  }).join('');
+  select.value = definitions.some(([value]) => value === selected) ? selected : 'all';
+}
+
+function populateFilters() {
+  populateDeviceFilters();
+  populateKindFilter(state.entries);
 }
 
 function renderSummary(report) {
@@ -1774,10 +1814,7 @@ function entryMatches(entry, query, kind, senderFilter, receiverFilter) {
   if (!senderOk) return false;
   const receiverOk = receiverFilter === 'all' || deviceFilterValue(entry.receiverName, entry.receiverId) === receiverFilter;
   if (!receiverOk) return false;
-  if (kind === 'all') return true;
-  if (kind === 'missing') return entry.media.some((item) => !item.objectUrl && !item.thumbnailDataUrl);
-  if (kind === 'text') return (entry.kind || 'text') === 'text' && entry.media.length === 0;
-  return (entry.kind || '').includes(kind) || entry.media.some((item) => (item.kind || '').includes(kind));
+  return entryMatchesKind(entry, kind);
 }
 
 function renderMedia(item) {
@@ -1857,7 +1894,7 @@ async function main() {
   state.report = payload.stats || {};
   state.entries = payload.entries || [];
   state.filtered = state.entries;
-  populateDeviceFilters();
+  populateFilters();
   renderSummary(state.report);
   renderEntries();
   document.getElementById('searchInput').addEventListener('input', applyFilters);
