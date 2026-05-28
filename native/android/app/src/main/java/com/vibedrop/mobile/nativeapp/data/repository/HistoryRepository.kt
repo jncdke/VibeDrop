@@ -478,8 +478,8 @@ class HistoryRepository(
         val timestampMillis = optLongOrNull("timestampMillis")
             ?: parseTimestampMillis(firstString("timestamp", "timestamp_iso", "createdAt"))
         val id = firstString("id").ifBlank { "imported:$timestampMillis:$index" }
-        val receiverName = firstString("receiverName", "targetDeviceName", "targetName", "target")
-        val receiverId = firstString("receiverDeviceId", "targetServerId", "targetId", "serverId")
+        val receiverName = firstString("receiverName", "targetAlias", "targetName", "targetDeviceName", "target")
+        val receiverId = firstString("receiverDeviceId", "targetServerId", "targetId", "serverId", "target")
             .ifBlank { receiverName }
         return HistoryEntryEntity(
             id = id,
@@ -488,8 +488,8 @@ class HistoryRepository(
             kind = firstString("kind").ifBlank { "text" },
             status = firstString("status").ifBlank { "success" },
             text = firstString("text"),
-            senderDeviceId = firstString("senderDeviceId", "sourceDeviceId").ifBlank { "imported_android" },
-            senderName = firstString("senderName", "sourceDeviceName").ifBlank { "导入历史" },
+            senderDeviceId = firstString("senderDeviceId", "sourceDeviceId").ifBlank { identity.deviceId },
+            senderName = firstString("senderName", "sourceDeviceName").ifBlank { identity.deviceName },
             receiverDeviceId = receiverId.takeIf { it.isNotBlank() },
             receiverName = receiverName.takeIf { it.isNotBlank() },
             sessionId = firstString("sessionId", "session_id").takeIf { it.isNotBlank() },

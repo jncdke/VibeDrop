@@ -24,7 +24,7 @@
 2. 发送页自动建立 OkHttp WebSocket 到旧 Mac `/ws`。
 3. 点击“发送”或“发送并回车”时，输入框为空会读取 Android 系统剪贴板。
 4. 文本、回车和图片剪贴板会等待 Mac 返回执行 `status ok` 后再写成功历史；如果 Mac 返回 `status error`、断线或超时，草稿保留并提示错误。
-5. release 包首次覆盖安装时会尝试读取旧 Tauri 私有目录里的 `history.json` 并导入 Room；debug 预览包因为 applicationId suffix 不会读到旧正式包私有目录。
+5. release 包首次覆盖安装时会尝试读取旧 Tauri 私有目录里的 `history.json` 并导入 Room；缺少发送端字段的旧记录会归到当前手机身份，接收端优先使用旧记录里的 `targetAlias/targetName`；debug 预览包因为 applicationId suffix 不会读到旧正式包私有目录。
 6. 设置页点击“扫描”会寻找当前局域网里的 Mac 服务：先 UDP 广播和已保存设备直连，广播不可用时会并发扫描 LAN /24 的 `/discover`；点击“配对”后 Mac 会弹出确认码，批准后原生 Android 自动保存 PIN 和连接信息。
 7. App 运行后会启动 `ClipboardSyncService`，从 Room 读取已保存 Mac，建立后台 WebSocket，收到 `clipboard` 消息后写入 Android 剪贴板；后台直接写入失败时会启动 1x1 透明 Activity 兜底。设置页会显示本机身份、网络能力、VPN 状态、局域网地址、通知权限、电池优化、闲置应用管理、已保存 Mac 状态和最近连接错误。
 8. 设置页可以配置 Home Vault 地址，点击“同步到 Mac mini”会上传原生 Room 历史；payload 会带真实 Android 设备身份、历史主记录和媒体 item/缩略图字段。
