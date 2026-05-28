@@ -316,11 +316,7 @@ class HistoryRepository(
     }
 
     suspend fun importArchive(rawJson: String): Int {
-        val root = rawJson.trim()
-        val array = when {
-            root.startsWith("[") -> JSONArray(root)
-            else -> JSONObject(root).optJSONArray("history") ?: JSONArray()
-        }
+        val array = extractHistoryArchiveEntries(rawJson)
         var imported = 0
         for (index in 0 until array.length()) {
             val item = array.optJSONObject(index) ?: continue

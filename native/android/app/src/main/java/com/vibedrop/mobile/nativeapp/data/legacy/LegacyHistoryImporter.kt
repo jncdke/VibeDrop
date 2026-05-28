@@ -3,6 +3,7 @@ package com.vibedrop.mobile.nativeapp.data.legacy
 import android.content.Context
 import com.vibedrop.mobile.nativeapp.data.repository.DeviceRepository
 import com.vibedrop.mobile.nativeapp.data.repository.HistoryRepository
+import com.vibedrop.mobile.nativeapp.data.repository.extractHistoryArchiveEntries
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -26,7 +27,7 @@ class LegacyHistoryImporter(
         }
 
         val rawText = file.readText()
-        val array = runCatching { JSONArray(rawText) }.getOrElse {
+        val array = runCatching { extractLegacyHistoryEntries(rawText) }.getOrElse {
             return ImportResult(imported = 0, skipped = false, sourceExists = true, error = it.message)
         }
 
@@ -63,6 +64,10 @@ class LegacyHistoryImporter(
         }
         return ""
     }
+}
+
+internal fun extractLegacyHistoryEntries(rawText: String): JSONArray {
+    return extractHistoryArchiveEntries(rawText)
 }
 
 data class ImportResult(

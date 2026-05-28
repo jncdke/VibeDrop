@@ -129,6 +129,25 @@ internal fun historyIsoTimestamp(timestampMillis: Long): String {
     return formatter.format(Date(timestampMillis))
 }
 
+internal fun extractHistoryArchiveEntries(rawJson: String): JSONArray {
+    val root = rawJson.trim()
+    if (root.isBlank()) {
+        return JSONArray()
+    }
+    if (root.startsWith("[")) {
+        return JSONArray(root)
+    }
+    val payload = JSONObject(root)
+    val historyKeys = listOf("history", "entries", "items", "data")
+    for (key in historyKeys) {
+        val array = payload.optJSONArray(key)
+        if (array != null) {
+            return array
+        }
+    }
+    throw IllegalArgumentException("history archive must be a JSON array or contain a history/entries/items/data array")
+}
+
 private fun JSONObject.putNullable(key: String, value: Any?): JSONObject {
     return put(key, value ?: JSONObject.NULL)
 }
