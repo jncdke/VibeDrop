@@ -110,9 +110,14 @@ final class MacHistoryDatabaseTests: XCTestCase {
         XCTAssertEqual(object["id"] as? String, "native-mac:compat-test")
         XCTAssertEqual(object["kind"] as? String, "image")
         XCTAssertEqual(object["client_id"] as? String, "client_android_demo")
+        XCTAssertEqual(object["client_base_device_id"] as? String, "android_base_demo")
         XCTAssertEqual(object["client_name"] as? String, "一加 Ace 5")
+        XCTAssertEqual(object["client_role"] as? String, "mobile")
         XCTAssertEqual(object["targetServerId"] as? String, "desktop_demo")
         XCTAssertEqual(object["targetDeviceName"] as? String, "overlorddeMacBook-Air-4.local")
+        XCTAssertEqual(object["targetRole"] as? String, "desktop")
+        XCTAssertEqual(object["targetIp"] as? String, "192.168.3.66")
+        XCTAssertEqual(object["targetPort"] as? Int, 8765)
         XCTAssertEqual(object["image_path"] as? String, "/Users/overlord/Downloads/VibeDrop 收件箱/demo.png")
         XCTAssertEqual(object["thumbnail_data_url"] as? String, "data:image/png;base64,abc")
 
@@ -120,6 +125,58 @@ final class MacHistoryDatabaseTests: XCTestCase {
         XCTAssertEqual(items.count, 1)
         XCTAssertEqual(items.first?["file_name"] as? String, "demo.png")
         XCTAssertEqual(items.first?["saved_path"] as? String, "/Users/overlord/Downloads/VibeDrop 收件箱/demo.png")
+    }
+
+    func testInsertFetchPreservesDeviceIdentityMetadata() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vibedrop-mac-db-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let database = try MacHistoryDatabase(url: directory.appendingPathComponent("vibedrop.sqlite"))
+        let entry = HistoryEntry(
+            id: "native-mac:identity-metadata",
+            timestamp: Date(timeIntervalSince1970: 1_779_970_496),
+            direction: "desktop_to_mobile",
+            kind: "file",
+            status: "success",
+            text: "[文件] demo.zip",
+            sender: DeviceIdentity(
+                deviceId: "desktop_demo",
+                baseDeviceId: "desktop_base_demo",
+                displayName: "overlorddeMacBook-Air-4.local",
+                role: "desktop",
+                host: "overlorddeMacBook-Air-4.local",
+                ip: "192.168.3.66",
+                port: 9001
+            ),
+            receiver: DeviceIdentity(
+                deviceId: "native-android:abc",
+                baseDeviceId: "native-android:abc",
+                displayName: "一加 Ace 5",
+                role: "primary",
+                host: "oneplus.local",
+                ip: "192.168.3.88",
+                port: 0
+            )
+        )
+
+        try database.insert(entry, appendLegacyJSONL: false)
+        let fetched = try XCTUnwrap(database.fetchEntry(id: entry.id))
+        XCTAssertEqual(fetched.sender?.deviceId, "desktop_demo")
+        XCTAssertEqual(fetched.sender?.baseDeviceId, "desktop_base_demo")
+        XCTAssertEqual(fetched.sender?.displayName, "overlorddeMacBook-Air-4.local")
+        XCTAssertEqual(fetched.sender?.role, "desktop")
+        XCTAssertEqual(fetched.sender?.host, "overlorddeMacBook-Air-4.local")
+        XCTAssertEqual(fetched.sender?.ip, "192.168.3.66")
+        XCTAssertEqual(fetched.sender?.port, 9001)
+        XCTAssertEqual(fetched.receiver?.deviceId, "native-android:abc")
+        XCTAssertEqual(fetched.receiver?.baseDeviceId, "native-android:abc")
+        XCTAssertEqual(fetched.receiver?.displayName, "一加 Ace 5")
+        XCTAssertEqual(fetched.receiver?.role, "primary")
+        XCTAssertEqual(fetched.receiver?.host, "oneplus.local")
+        XCTAssertEqual(fetched.receiver?.ip, "192.168.3.88")
+        XCTAssertEqual(fetched.receiver?.port, 0)
     }
 
     func testInsertCanSkipLegacyJsonlAppendForIncompleteAggregateRows() throws {

@@ -167,6 +167,22 @@ public final class MacHistoryDatabase: @unchecked Sendable {
             try db.create(index: "idx_history_entries_sender_time", on: "history_entries", columns: ["sender_device_id", "timestamp_ms"], ifNotExists: true)
             try db.create(index: "idx_history_entries_receiver_time", on: "history_entries", columns: ["receiver_device_id", "timestamp_ms"], ifNotExists: true)
         }
+        migrator.registerMigration("add device identity metadata") { db in
+            try db.alter(table: "history_entries") { table in
+                table.add(column: "sender_base_device_id", .text)
+                table.add(column: "sender_role", .text)
+                table.add(column: "sender_host", .text)
+                table.add(column: "sender_ip", .text)
+                table.add(column: "sender_port", .integer)
+                table.add(column: "receiver_base_device_id", .text)
+                table.add(column: "receiver_role", .text)
+                table.add(column: "receiver_host", .text)
+                table.add(column: "receiver_ip", .text)
+                table.add(column: "receiver_port", .integer)
+            }
+            try db.create(index: "idx_history_entries_sender_base_time", on: "history_entries", columns: ["sender_base_device_id", "timestamp_ms"], ifNotExists: true)
+            try db.create(index: "idx_history_entries_receiver_base_time", on: "history_entries", columns: ["receiver_base_device_id", "timestamp_ms"], ifNotExists: true)
+        }
         try migrator.migrate(queue)
     }
 
@@ -178,8 +194,10 @@ public final class MacHistoryDatabase: @unchecked Sendable {
             INSERT OR REPLACE INTO history_entries (
               id, timestamp_ms, direction, kind, status, text,
               sender_device_id, sender_name, receiver_device_id, receiver_name,
+              sender_base_device_id, sender_role, sender_host, sender_ip, sender_port,
+              receiver_base_device_id, receiver_role, receiver_host, receiver_ip, receiver_port,
               session_id, item_count, save_target, raw_json, created_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             arguments: [
                 entry.id,
@@ -192,6 +210,16 @@ public final class MacHistoryDatabase: @unchecked Sendable {
                 entry.sender?.displayName,
                 entry.receiver?.deviceId,
                 entry.receiver?.displayName,
+                entry.sender?.baseDeviceId,
+                entry.sender?.role,
+                entry.sender?.host,
+                entry.sender?.ip,
+                entry.sender?.port,
+                entry.receiver?.baseDeviceId,
+                entry.receiver?.role,
+                entry.receiver?.host,
+                entry.receiver?.ip,
+                entry.receiver?.port,
                 entry.sessionId,
                 entry.itemCount,
                 entry.saveTarget,
@@ -240,8 +268,24 @@ public final class MacHistoryDatabase: @unchecked Sendable {
             kind: row["kind"],
             status: row["status"],
             text: row["text"],
-            sender: device(id: senderId, name: senderName),
-            receiver: device(id: receiverId, name: receiverName),
+            sender: device(
+                id: senderId,
+                name: senderName,
+                baseDeviceId: row["sender_base_device_id"],
+                role: row["sender_role"],
+                host: row["sender_host"],
+                ip: row["sender_ip"],
+                port: row["sender_port"]
+            ),
+            receiver: device(
+                id: receiverId,
+                name: receiverName,
+                baseDeviceId: row["receiver_base_device_id"],
+                role: row["receiver_role"],
+                host: row["receiver_host"],
+                ip: row["receiver_ip"],
+                port: row["receiver_port"]
+            ),
             sessionId: row["session_id"],
             itemCount: row["item_count"],
             saveTarget: row["save_target"],
@@ -289,11 +333,24 @@ public final class MacHistoryDatabase: @unchecked Sendable {
         )
     }
 
-    private func device(id: String?, name: String?) -> DeviceIdentity? {
+    private func device(
+        id: String?,
+        name: String?,
+        baseDeviceId: String?,
+        role: String?,
+        host: String?,
+        ip: String?,
+        port: Int?
+    ) -> DeviceIdentity? {
         guard let id, !id.isEmpty else { return nil }
         return DeviceIdentity(
             deviceId: id,
-            displayName: name?.isEmpty == false ? name! : id
+            baseDeviceId: baseDeviceId?.isEmpty == false ? baseDeviceId : nil,
+            displayName: name?.isEmpty == false ? name! : id,
+            role: role?.isEmpty == false ? role : nil,
+            host: host?.isEmpty == false ? host : nil,
+            ip: ip?.isEmpty == false ? ip : nil,
+            port: port
         )
     }
 
@@ -324,7 +381,11 @@ private struct LegacyMacHistoryJSONLRecord: Encodable {
     var text: String
     var clientIp: String
     var clientId: String?
+    var clientBaseDeviceId: String?
     var clientName: String?
+    var clientRole: String?
+    var clientHost: String?
+    var clientPort: Int?
     var kind: String?
     var fileName: String?
     var imagePath: String?
@@ -339,7 +400,11 @@ private struct LegacyMacHistoryJSONLRecord: Encodable {
     var itemCount: Int?
     var saveTarget: String?
     var targetDeviceName: String?
+    var targetBaseDeviceId: String?
+    var targetRole: String?
     var targetServerId: String?
+    var targetIp: String?
+    var targetPort: Int?
     var hostname: String?
     var items: [LegacyMacHistoryJSONLItem]?
 
@@ -353,7 +418,11 @@ private struct LegacyMacHistoryJSONLRecord: Encodable {
         text = entry.text ?? ""
         clientIp = mobile?.ip ?? ""
         clientId = mobile?.deviceId
+        clientBaseDeviceId = mobile?.baseDeviceId
         clientName = mobile?.displayName
+        clientRole = mobile?.role
+        clientHost = mobile?.host
+        clientPort = mobile?.port
         kind = entry.kind
         fileName = firstItem?.fileName
         imagePath = firstItem?.kind == "image" ? firstPath : nil
@@ -368,7 +437,11 @@ private struct LegacyMacHistoryJSONLRecord: Encodable {
         itemCount = entry.itemCount
         saveTarget = entry.saveTarget
         targetDeviceName = desktop?.displayName
+        targetBaseDeviceId = desktop?.baseDeviceId
+        targetRole = desktop?.role
         targetServerId = desktop?.deviceId
+        targetIp = desktop?.ip
+        targetPort = desktop?.port
         hostname = desktop?.host ?? desktop?.displayName
         items = entry.items.isEmpty ? nil : entry.items.enumerated().map { index, item in
             LegacyMacHistoryJSONLItem(index: index, item: item)
@@ -381,7 +454,11 @@ private struct LegacyMacHistoryJSONLRecord: Encodable {
         case text
         case clientIp = "client_ip"
         case clientId = "client_id"
+        case clientBaseDeviceId = "client_base_device_id"
         case clientName = "client_name"
+        case clientRole = "client_role"
+        case clientHost = "client_host"
+        case clientPort = "client_port"
         case kind
         case fileName = "file_name"
         case imagePath = "image_path"
@@ -396,7 +473,11 @@ private struct LegacyMacHistoryJSONLRecord: Encodable {
         case itemCount = "item_count"
         case saveTarget = "save_target"
         case targetDeviceName
+        case targetBaseDeviceId
+        case targetRole
         case targetServerId
+        case targetIp
+        case targetPort
         case hostname
         case items
     }
