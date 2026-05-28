@@ -264,7 +264,7 @@ private struct DropSendCard: View {
                                 .foregroundStyle(.blue)
                             Text("拖入文件发送到手机")
                                 .font(.system(size: 18, weight: .bold))
-                            Text("首版原生壳已支持普通文件分片发送和手机保存回执；文件夹打包会继续补齐。")
+                            Text("支持普通文件、文件夹和多文件发送；图片/视频在手机端进入相册，其它内容进入下载目录。")
                                 .font(.system(size: 13))
                                 .foregroundStyle(.secondary)
                         }
@@ -417,6 +417,7 @@ private struct HistoryView: View {
     @State private var customEndTime = ""
     @State private var heatmapWindowOffset = 0
     @State private var heatmapSelection: MacHeatmapSelection?
+    @State private var previewItem: HistoryItem?
 
     private var senderFilters: [HistoryEndpointFilter] {
         buildHistoryEndpointFilters(entries: model.recentHistory, endpoint: .sender)
@@ -602,7 +603,7 @@ private struct HistoryView: View {
                 } else {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(filteredEntries, id: \.id) { entry in
-                            HistoryRow(entry: entry)
+                            HistoryRow(entry: entry, onPreviewItem: { previewItem = $0 })
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
@@ -610,6 +611,9 @@ private struct HistoryView: View {
             }
             .padding(.horizontal, 24)
             .padding(.bottom, 24)
+        }
+        .sheet(item: $previewItem) { item in
+            MacHistoryMediaPreview(item: item)
         }
     }
 }
@@ -778,6 +782,7 @@ private struct MacHistoryHeatmap: View {
 
 private struct HistoryRow: View {
     let entry: HistoryEntry
+    var onPreviewItem: (HistoryItem) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -805,7 +810,7 @@ private struct HistoryRow: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 10) {
                         ForEach(entry.items.prefix(16), id: \.id) { item in
-                            MacHistoryItemPreview(item: item)
+                            MacHistoryItemPreview(item: item, onPreview: { onPreviewItem(item) })
                         }
                         if entry.items.count > 16 {
                             ExtraItemsTile(count: entry.items.count - 16)
@@ -822,6 +827,7 @@ private struct HistoryRow: View {
 
 private struct MacHistoryItemPreview: View {
     let item: HistoryItem
+    let onPreview: () -> Void
 
     private var image: NSImage? {
         if let thumbnail = item.thumbnailDataUrl.flatMap(decodeDataURLImage) {
@@ -868,6 +874,80 @@ private struct MacHistoryItemPreview: View {
         .frame(width: 108, alignment: .leading)
         .background(Color(red: 0.95, green: 0.97, blue: 1.0), in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(statusBorderColor(item.status)))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onPreview)
+    }
+}
+
+private struct MacHistoryMediaPreview: View {
+    @Environment(\.dismiss) private var dismiss
+    let item: HistoryItem
+
+    private var image: NSImage? {
+        if let image = item.thumbnailDataUrl.flatMap(decodeDataURLImage) {
+            return image
+        }
+        guard item.kind == "image",
+              let path = historyItemOpenPath(item),
+              FileManager.default.fileExists(atPath: path) else {
+            return nil
+        }
+        return NSImage(contentsOf: URL(fileURLWithPath: path))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.fileName ?? kindLabel(item.kind))
+                        .font(.system(size: 20, weight: .bold))
+                    Text(kindLabel(item.kind))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("关闭") { dismiss() }
+                    .buttonStyle(.bordered)
+            }
+            ZStack {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color(red: 0.94, green: 0.97, blue: 1.0))
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .padding(12)
+                } else {
+                    VStack(spacing: 10) {
+                        Image(systemName: item.kind == "video" ? "play.rectangle.fill" : "doc.fill")
+                            .font(.system(size: 44))
+                            .foregroundStyle(.secondary)
+                        Text("这个项目没有可内嵌预览，仍可用系统默认应用打开。")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .frame(minWidth: 560, minHeight: 360)
+            HStack {
+                if let path = historyItemOpenPath(item), FileManager.default.fileExists(atPath: path) {
+                    Button("系统打开") {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Text((path as NSString).lastPathComponent)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text("没有保留可打开的本地路径。")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+        }
+        .padding(22)
     }
 }
 
@@ -1101,6 +1181,12 @@ private func statusBorderColor(_ status: String?) -> Color {
     case "partial": return Color.orange.opacity(0.32)
     default: return Color.black.opacity(0.06)
     }
+}
+
+private func historyItemOpenPath(_ item: HistoryItem) -> String? {
+    [item.localPath, item.savedPath]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .first { !$0.isEmpty }
 }
 
 private func decodeDataURLImage(_ value: String) -> NSImage? {
