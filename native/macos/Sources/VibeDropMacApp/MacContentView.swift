@@ -58,12 +58,7 @@ struct MacContentView: View {
 }
 
 private struct VibeDropBrandMark: View {
-    private let image: NSImage? = {
-        guard let url = Bundle.module.url(forResource: "VibeDropMark", withExtension: "png") else {
-            return nil
-        }
-        return NSImage(contentsOf: url)
-    }()
+    private let image: NSImage? = loadMacAppImageResource("VibeDropMark")
 
     var body: some View {
         ZStack {

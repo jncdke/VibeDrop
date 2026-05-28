@@ -23,6 +23,14 @@ cd native/macos
 swift run VibeDropMacApp
 ```
 
+构建并安装真实 `.app` 预览包：
+
+```sh
+./scripts/deploy-native-macos.sh
+```
+
+默认会生成 `VibeDrop Native.app`，bundle id 为 `com.vibedrop.nativepreview`，安装到 `~/Applications` 并打开。它可以和当前 Tauri 正式包并排存在，用于验证状态栏、辅助功能授权、登录项等真实 macOS 行为；如果只想产出 bundle 不安装，可运行 `./scripts/deploy-native-macos.sh --skip-install`。确认原生端完全等价后，再单独切到正式 bundle id 和 `/Applications` 覆盖升级路径。
+
 这个预览服务已经是真实网络监听。当前预览已接入文本/回车输入模拟、图片剪贴板、文件收件箱、桌面到 Android 分片发送、文件夹/多文件 ZIP 打包发送、手机保存回执、SQLite 历史写入、兼容 JSONL 追加、SwiftUI/AppKit 基础窗口、macOS 登录项开机启动开关、Finder/Share Extension 共享队列兼容，以及 App 内诊断日志/诊断 JSON 导出；首次运行时 macOS 会弹辅助功能权限，授权后 Android 发来的 `type`、`type_enter`、`enter` 才能真正写到当前焦点应用。图片会保存到 `~/.vibedrop/received-images` 并写入系统剪贴板，文件会保存到 `~/Downloads/VibeDrop 收件箱`，分片接收的临时文件在 `~/.vibedrop/incoming-downloads`。历史页读取原生 SQLite 全量记录并支持导出完整 JSON 到 `~/Downloads`。诊断事件写在 `~/Library/Application Support/VibeDrop/diagnostics/events.jsonl`，导出文件写到 `~/Downloads`，只记录服务状态、配对、连接数量和文件发送数量，不记录正文、剪贴板内容和文件路径。登录项开关使用 `SMAppService.mainApp`，真正注册需要打包签名后的 `.app` bundle，`swift run` 开发态可能显示为不支持。
 
 ## 后续模块

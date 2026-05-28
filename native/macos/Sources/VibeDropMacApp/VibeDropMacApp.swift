@@ -55,8 +55,7 @@ struct VibeDropMacApp: App {
 
 private enum VibeDropTrayImage {
     static func load() -> NSImage? {
-        guard let url = Bundle.module.url(forResource: "VibeDropTrayIcon", withExtension: "png"),
-              let image = NSImage(contentsOf: url) else {
+        guard let image = loadMacAppImageResource("VibeDropTrayIcon") else {
             return nil
         }
         image.isTemplate = true
