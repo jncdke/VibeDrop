@@ -47,6 +47,7 @@ class VibeDropProtocolFixtureTest {
             "auth-clipboard-sync.json" to VibeDropActions.Auth,
             "clipboard.json" to VibeDropActions.Clipboard,
             "enter.json" to VibeDropActions.Enter,
+            "file-download.json" to VibeDropActions.FileDownload,
             "image-clipboard.json" to VibeDropActions.ImageClipboard,
             "incoming-history-session-start.json" to VibeDropActions.IncomingHistorySessionStart,
             "incoming-file-start.json" to VibeDropActions.IncomingFileStart,

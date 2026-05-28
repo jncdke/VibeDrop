@@ -11,6 +11,7 @@ object VibeDropActions {
     const val TypeEnter = "type_enter"
     const val Enter = "enter"
     const val ImageClipboard = "image_clipboard"
+    const val FileDownload = "file_download"
     const val IncomingHistorySessionStart = "incoming_history_session_start"
     const val IncomingFileStart = "incoming_file_start"
     const val IncomingFileChunk = "incoming_file_chunk"

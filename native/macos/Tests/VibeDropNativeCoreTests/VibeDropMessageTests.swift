@@ -8,6 +8,7 @@ final class VibeDropMessageTests: XCTestCase {
             ("auth-clipboard-sync.json", .auth),
             ("clipboard.json", .clipboard),
             ("enter.json", .enter),
+            ("file-download.json", .fileDownload),
             ("image-clipboard.json", .imageClipboard),
             ("incoming-history-session-start.json", .incomingHistorySessionStart),
             ("incoming-file-start.json", .incomingFileStart),
@@ -39,6 +40,14 @@ final class VibeDropMessageTests: XCTestCase {
         XCTAssertEqual(start.fileName, "demo.txt")
         XCTAssertEqual(start.mimeType, "text/plain")
         XCTAssertEqual(start.sizeBytes, 24)
+
+        let legacyDownload = try JSONDecoder().decode(
+            VibeDropMessage.self,
+            from: protocolFixtureData("messages/file-download.json")
+        )
+        XCTAssertEqual(legacyDownload.fileName, "legacy-demo.txt")
+        XCTAssertEqual(legacyDownload.mimeType, "text/plain")
+        XCTAssertEqual(legacyDownload.fileBase64, "bGVnYWN5IGZpbGU=")
 
         let historySession = try JSONDecoder().decode(
             VibeDropMessage.self,
