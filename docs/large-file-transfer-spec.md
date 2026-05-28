@@ -116,6 +116,7 @@
    - 已发送字节数、总字节数和百分比
    - 当前目标手机名称
 5. 进度事件由传输运行层产生，UI 层只订阅和渲染状态。这样测试可以直接验证分片发送进度，不需要启动 SwiftUI 界面。
+6. macOS 拖拽入口不能只接受 `public.file-url`。Photos、预览、Quick Look 或其它 App 可能只提供 `NSItemProvider` 文件表示或 Photos object reference；原生端应先尝试 `loadFileRepresentation` 复制到临时目录，必要时再用 Photos 选择导出兜底，传输结束后清理临时目录。
 
 ## 5. 协议设计
 

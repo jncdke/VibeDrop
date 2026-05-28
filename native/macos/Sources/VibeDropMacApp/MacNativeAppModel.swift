@@ -6,6 +6,12 @@ import VibeDropMacServer
 import VibeDropMacStorage
 import VibeDropNativeCore
 
+private func cleanupDropDirectories(_ urls: [URL]) {
+    for url in urls {
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 struct MacTransferListItem: Identifiable, Equatable {
     var id: String
     var fileName: String
@@ -166,13 +172,21 @@ final class MacNativeAppModel: ObservableObject {
         }
     }
 
-    func sendFiles(_ urls: [URL]) {
+    func sendFiles(_ urls: [URL], cleanupDirectories: [URL] = []) {
+        guard !urls.isEmpty else {
+            cleanupDropDirectories(cleanupDirectories)
+            serviceError = "拖入的内容没有生成可发送文件"
+            log("transfer", "send_blocked", ["reason": "empty_drop"])
+            return
+        }
         guard let outboundService else {
+            cleanupDropDirectories(cleanupDirectories)
             serviceError = "发送服务还没有启动"
             log("transfer", "send_blocked", ["reason": "service_not_ready", "itemCount": "\(urls.count)"])
             return
         }
         guard let peer = selectedFilePeer else {
+            cleanupDropDirectories(cleanupDirectories)
             serviceError = "当前没有可接收文件的手机"
             log("transfer", "send_blocked", ["reason": "no_peer", "itemCount": "\(urls.count)"])
             return
@@ -201,6 +215,9 @@ final class MacNativeAppModel: ObservableObject {
             at: 0
         )
         Task.detached {
+            defer {
+                cleanupDropDirectories(cleanupDirectories)
+            }
             do {
                 let reports = try outboundService.sendURLs(
                     urls,
@@ -260,6 +277,11 @@ final class MacNativeAppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func reportFileDropError(_ message: String) {
+        serviceError = message
+        log("transfer", "drop_load_failed", ["error": message])
     }
 
     func requestAccessibilityPermission() {

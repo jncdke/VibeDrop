@@ -1,6 +1,6 @@
 import AppKit
+import Foundation
 import SwiftUI
-import UniformTypeIdentifiers
 import VibeDropMacServer
 import VibeDropNativeCore
 
@@ -269,9 +269,14 @@ private struct DropSendCard: View {
                                 .foregroundStyle(.secondary)
                         }
                     )
-                    .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isTargeted) { providers in
-                        loadFileURLs(from: providers) { urls in
-                            model.sendFiles(urls)
+                    .onDrop(of: MacDropFileLoader.typeIdentifiers, isTargeted: $isTargeted) { providers in
+                        MacDropFileLoader.load(from: providers) { result in
+                            switch result {
+                            case let .success(payload):
+                                model.sendFiles(payload.urls, cleanupDirectories: payload.cleanupDirectories)
+                            case let .failure(error):
+                                model.reportFileDropError(error.localizedDescription)
+                            }
                         }
                         return true
                     }
@@ -302,26 +307,6 @@ private struct DropSendCard: View {
                     .background(Color.white.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
                 }
             }
-        }
-    }
-
-    private func loadFileURLs(from providers: [NSItemProvider], completion: @escaping ([URL]) -> Void) {
-        var urls: [URL] = []
-        let group = DispatchGroup()
-        for provider in providers {
-            group.enter()
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                defer { group.leave() }
-                if let data = item as? Data,
-                   let url = URL(dataRepresentation: data, relativeTo: nil) {
-                    urls.append(url)
-                } else if let url = item as? URL {
-                    urls.append(url)
-                }
-            }
-        }
-        group.notify(queue: .main) {
-            completion(urls)
         }
     }
 
