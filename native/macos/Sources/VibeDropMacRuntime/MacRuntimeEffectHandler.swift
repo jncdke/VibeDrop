@@ -79,10 +79,18 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
             }
             outboundTransfers.resolveSaved(transferId: transferId, savedPath: savedPath)
             return []
-        case let .incomingFileError(transferId, error, _):
+        case let .incomingFileError(transferId, error, peer):
             outboundTransfers?.resolveFailed(transferId: transferId, error: error)
+            let metadata = takeIncomingFileMetadata(transferId: transferId)
             contentStore?.cancelIncomingFile(transferId: transferId)
-            removeIncomingFileMetadata(transferId: transferId)
+            if let metadata {
+                recordIncomingFileFailure(
+                    transferId: transferId,
+                    error: error,
+                    metadata: metadata,
+                    peer: peer
+                )
+            }
             return []
         }
     }
@@ -447,6 +455,100 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
         try? historyDatabase.insert(entry, appendLegacyJSONL: entry.status != "pending")
     }
 
+    private func recordIncomingFileFailure(
+        transferId: String,
+        error: String?,
+        metadata: IncomingFileHistoryMetadata,
+        peer: ConnectedPeer
+    ) {
+        let message = error?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            ?? "Android 发送文件失败"
+        if let sessionId = metadata.sessionId {
+            recordIncomingSessionFailure(
+                transferId: transferId,
+                error: message,
+                metadata: metadata,
+                sessionId: sessionId,
+                peer: peer
+            )
+            return
+        }
+        let mimeType = metadata.mimeType ?? "application/octet-stream"
+        let label = labelFromMime(mimeType)
+        recordMediaFailure(
+            kind: kindFromMime(mimeType),
+            text: metadata.fileName.map { "[\(label)] \($0)" },
+            peer: peer,
+            error: MacRuntimeMessageError(message),
+            saveTarget: metadata.saveTarget ?? "desktop_inbox"
+        )
+    }
+
+    private func recordIncomingSessionFailure(
+        transferId: String,
+        error: String,
+        metadata: IncomingFileHistoryMetadata,
+        sessionId: String,
+        peer: ConnectedPeer
+    ) {
+        guard let historyDatabase else { return }
+        let entryId = "native-mac-inbound:\(sessionId)"
+        let existing = try? historyDatabase.fetchEntry(id: entryId)
+        let itemIndex = max(0, metadata.itemIndex ?? 0)
+        let itemCount = max(metadata.itemCount ?? 1, itemIndex + 1, existing?.itemCount ?? 0)
+        var items = existing?.items ?? []
+        while items.count < itemCount {
+            let index = items.count
+            items.append(
+                HistoryItem(
+                    id: "\(entryId):item:\(index)",
+                    kind: "file",
+                    status: "pending"
+                )
+            )
+        }
+
+        let mimeType = metadata.mimeType ?? "application/octet-stream"
+        let kind = kindFromMime(mimeType)
+        items[itemIndex] = HistoryItem(
+            id: "\(entryId):item:\(itemIndex)",
+            kind: kind,
+            fileName: metadata.fileName,
+            mimeType: mimeType,
+            sizeBytes: metadata.sizeBytes,
+            status: "failed",
+            error: error
+        )
+
+        let summary = historyItemsSummary(items)
+        let entry = HistoryEntry(
+            id: entryId,
+            timestamp: existing?.timestamp ?? now(),
+            direction: "mobile_to_desktop",
+            kind: summary.kind,
+            status: computeSessionStatus(items),
+            text: summary.text,
+            sender: DeviceIdentity(
+                deviceId: peer.deviceId,
+                baseDeviceId: peer.baseDeviceId,
+                displayName: peer.deviceName,
+                role: peer.deviceRole
+            ),
+            receiver: DeviceIdentity(
+                deviceId: configuration.serverId,
+                displayName: configuration.hostname,
+                role: "desktop",
+                ip: configuration.ip,
+                port: configuration.port
+            ),
+            sessionId: sessionId,
+            itemCount: itemCount,
+            saveTarget: metadata.saveTarget ?? "desktop_inbox",
+            items: items
+        )
+        try? historyDatabase.insert(entry, appendLegacyJSONL: entry.status != "pending")
+    }
+
     private func recordMediaFailure(
         kind: String,
         text: String?,
@@ -489,16 +591,16 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
         guard let transferId = message.transferId?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty else {
             return
         }
-        guard let sessionId = normalizedHistorySessionId(message) else {
-            removeIncomingFileMetadata(transferId: transferId)
-            return
-        }
+        let sessionId = normalizedHistorySessionId(message)
         incomingFileMetadataLock.lock()
         incomingFileMetadataByTransferId[transferId] = IncomingFileHistoryMetadata(
             sessionId: sessionId,
             itemIndex: message.historyItemIndex,
             itemCount: message.historyItemCount,
-            saveTarget: message.saveTarget
+            saveTarget: message.saveTarget,
+            fileName: message.fileName,
+            mimeType: message.mimeType,
+            sizeBytes: message.sizeBytes
         )
         incomingFileMetadataLock.unlock()
     }
@@ -585,14 +687,27 @@ private extension MacServerStatusEnvelope {
 }
 
 private struct IncomingFileHistoryMetadata: Sendable {
-    var sessionId: String
+    var sessionId: String?
     var itemIndex: Int?
     var itemCount: Int?
     var saveTarget: String?
+    var fileName: String?
+    var mimeType: String?
+    var sizeBytes: Int64?
 }
 
 private extension String {
     var nilIfEmpty: String? {
         isEmpty ? nil : self
     }
+}
+
+private struct MacRuntimeMessageError: LocalizedError {
+    let message: String
+
+    init(_ message: String) {
+        self.message = message
+    }
+
+    var errorDescription: String? { message }
 }

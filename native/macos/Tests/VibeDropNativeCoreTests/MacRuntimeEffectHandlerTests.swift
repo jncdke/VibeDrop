@@ -248,7 +248,10 @@ final class MacRuntimeEffectHandlerTests: XCTestCase {
 
         XCTAssertEqual(outbound, [])
         XCTAssertFalse(FileManager.default.fileExists(atPath: partURL.path))
-        XCTAssertEqual(try fixture.database.countEntries(), 0)
+        let recent = try fixture.database.fetchRecent(limit: 1)
+        XCTAssertEqual(recent.first?.status, "failed")
+        XCTAssertEqual(recent.first?.text, "[文件] cancel.txt")
+        XCTAssertEqual(recent.first?.sender?.displayName, "一加 Ace 5")
     }
 
     func testIncomingBatchFilesAreAggregatedIntoOneHistoryEntry() throws {
