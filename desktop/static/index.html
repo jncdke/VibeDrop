@@ -122,6 +122,13 @@
         <section id="history-view" class="view hidden">
             <div class="history-header">
                 <h2>传输历史</h2>
+                <div class="history-search-box">
+                    <label class="history-search-field" for="history-search-input">
+                        <span class="history-search-prefix">搜索</span>
+                        <input id="history-search-input" type="search" placeholder="搜索内容、设备或文件名" autocomplete="off" spellcheck="false">
+                    </label>
+                    <button id="history-search-clear-btn" type="button" class="secondary-btn history-search-clear hidden">清空</button>
+                </div>
                 <div class="history-filter" id="history-filter-btns">
                     <button class="filter-btn active" data-filter="all">全部</button>
                 </div>
@@ -140,7 +147,7 @@
                 <div class="history-heatmap-header">
                     <div>
                         <h3>活跃热力图</h3>
-                        <p id="history-heatmap-caption" class="hint">每个方块代表某天某小时的传输记录数量。左右拖动查看更多日期，点方块筛选该小时。</p>
+                        <p id="history-heatmap-caption" class="hint">每个方块代表某天某小时的传输记录数量。左右滑动查看更多日期，点方块筛选该小时。</p>
                     </div>
                     <button id="history-heatmap-reset-btn" class="secondary-btn history-heatmap-reset hidden">回到最近</button>
                 </div>
@@ -155,8 +162,10 @@
                             <span class="history-heatmap-axis-label is-bottom" style="--offset: 100%;">24:00</span>
                         </div>
                     </div>
-                    <div id="history-heatmap-viewport" class="history-heatmap-viewport">
-                        <div id="history-heatmap-track" class="history-heatmap-track"></div>
+                    <div class="history-heatmap-shell">
+                        <div id="history-heatmap-viewport" class="history-heatmap-viewport">
+                            <div id="history-heatmap-track" class="history-heatmap-track"></div>
+                        </div>
                     </div>
                 </div>
                 <div class="history-heatmap-legend" aria-hidden="true">

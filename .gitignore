@@ -1,10 +1,17 @@
 target/
 node_modules/
 .DS_Store
+Thumbs.db
 *.apk
 *.idsig
 
 # Android build artifacts
 .gradle/
+.gradle-cache/
 build/
 local.properties
+
+# Local caches and research worktrees
+__pycache__/
+*.pyc
+.research/

@@ -48,6 +48,21 @@
                 </div>
             </section>
 
+            <details id="connection-diagnostics-panel" class="settings-card diagnostics-panel">
+                <summary class="advanced-connect-summary">
+                    <div class="advanced-connect-copy">
+                        <h3>连接诊断</h3>
+                        <p class="hint">查看前端连接、原生后台剪贴板和最近一次智能发现的实时状态。默认折叠，展开后才刷新。</p>
+                    </div>
+                    <span class="advanced-connect-toggle">实时状态</span>
+                </summary>
+                <div class="advanced-connect-body diagnostics-body">
+                    <div id="connection-diagnostics-summary" class="diagnostics-summary">展开后加载诊断信息。</div>
+                    <div id="connection-diagnostics-error" class="diagnostics-error hidden"></div>
+                    <div id="connection-diagnostics-sections" class="diagnostics-sections"></div>
+                </div>
+            </details>
+
             <details id="advanced-connect-panel" class="settings-card advanced-connect-panel">
                 <summary class="advanced-connect-summary">
                     <div class="advanced-connect-copy">
@@ -122,6 +137,13 @@
         <section id="history-view" class="view hidden">
             <div class="history-header">
                 <h2>传输历史</h2>
+                <div class="history-search-box">
+                    <label class="history-search-field" for="history-search-input">
+                        <span class="history-search-prefix">搜索</span>
+                        <input id="history-search-input" type="search" placeholder="搜索内容、设备或文件名" autocomplete="off" spellcheck="false">
+                    </label>
+                    <button id="history-search-clear-btn" type="button" class="secondary-btn history-search-clear hidden">清空</button>
+                </div>
                 <div class="history-filter" id="history-filter-btns">
                     <button class="filter-btn active" data-filter="all">全部</button>
                 </div>
@@ -140,7 +162,7 @@
                 <div class="history-heatmap-header">
                     <div>
                         <h3>活跃热力图</h3>
-                        <p id="history-heatmap-caption" class="hint">每个方块代表某天某小时的传输记录数量。左右拖动查看更多日期，点方块筛选该小时。</p>
+                        <p id="history-heatmap-caption" class="hint">每个方块代表某天某小时的传输记录数量。左右滑动查看更多日期，点方块筛选该小时。</p>
                     </div>
                     <button id="history-heatmap-reset-btn" class="secondary-btn history-heatmap-reset hidden">回到最近</button>
                 </div>
@@ -155,8 +177,10 @@
                             <span class="history-heatmap-axis-label is-bottom" style="--offset: 100%;">24:00</span>
                         </div>
                     </div>
-                    <div id="history-heatmap-viewport" class="history-heatmap-viewport">
-                        <div id="history-heatmap-track" class="history-heatmap-track"></div>
+                    <div class="history-heatmap-shell">
+                        <div id="history-heatmap-viewport" class="history-heatmap-viewport">
+                            <div id="history-heatmap-track" class="history-heatmap-track"></div>
+                        </div>
                     </div>
                 </div>
                 <div class="history-heatmap-legend" aria-hidden="true">

@@ -154,6 +154,13 @@
                             <button id="btn-export-log" class="btn-small" title="导出备份">导出</button>
                         </div>
 
+                        <div class="desktop-history-search-bar">
+                            <label class="desktop-history-search-field" for="desktop-history-search-input">
+                                <span class="desktop-history-search-prefix">搜索</span>
+                                <input id="desktop-history-search-input" type="search" placeholder="搜索内容、设备或文件名" autocomplete="off" spellcheck="false">
+                            </label>
+                            <button id="desktop-history-search-clear-btn" class="btn-small hidden" type="button">清空</button>
+                        </div>
                         <div class="desktop-history-filter-row" id="desktop-history-device-filter"></div>
                         <div class="desktop-history-filter-row" id="desktop-history-time-filter">
                             <button type="button" class="desktop-history-filter-btn" data-time-filter="all">全部时间</button>
@@ -214,7 +221,7 @@
                             <div class="heatmap-header">
                                 <div>
                                     <h3>接收热力图</h3>
-                                    <p id="log-heatmap-caption" class="heatmap-caption">当前窗口内每个方块代表某天某小时的传输记录数量。拖动查看更多日期，点方块筛选该小时。</p>
+                                    <p id="log-heatmap-caption" class="heatmap-caption">当前窗口内每个方块代表某天某小时的传输记录数量。左右滑动查看更多日期，点方块筛选该小时。</p>
                                 </div>
                                 <button id="btn-log-heatmap-reset" class="btn-small hidden" title="回到最近">回到最近</button>
                             </div>

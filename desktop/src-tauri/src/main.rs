@@ -5,7 +5,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         ConnectInfo, Path as AxumPath, State as AxumState,
     },
-    http::StatusCode,
+    http::{header::HOST, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -20,7 +20,7 @@ use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
 use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -82,6 +82,9 @@ struct ClientMessage {
     #[serde(default)]
     transfer_id: Option<String>,
     #[serde(default)]
+    chunk_base64: Option<String>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
     saved_path: Option<String>,
     #[serde(default)]
     error: Option<String>,
@@ -94,6 +97,15 @@ struct ServerMessage {
     hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IncomingDesktopTransferMeta {
+    file_name: String,
+    mime_type: String,
+    size_bytes: u64,
+    client_id: Option<String>,
+    client_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -217,7 +229,12 @@ fn desktop_debug_log_path() -> PathBuf {
     dirs_log_dir().join("debug.log")
 }
 
+static DEBUG_LOG_LOCK: Mutex<()> = Mutex::new(());
+
 fn append_debug_log(scope: &str, event: &str, detail: serde_json::Value) {
+    let _debug_log_guard = DEBUG_LOG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let log_path = desktop_debug_log_path();
     if let Some(parent) = log_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -262,6 +279,12 @@ struct DiscoverResponse {
     hostname: String,
     ip: String,
     port: u16,
+    protocol_version: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscoverProbe {
+    kind: String,
     protocol_version: u16,
 }
 
@@ -700,8 +723,12 @@ fn resolve_macos_drag_promised_files(
             hinted_names,
             hinted_content_types,
         } => {
-            let staged_paths =
-                export_photos_selection_to_stage_dir(&transfer_id, &staged_dir, &hinted_names, &hinted_content_types)?;
+            let staged_paths = export_photos_selection_to_stage_dir(
+                &transfer_id,
+                &staged_dir,
+                &hinted_names,
+                &hinted_content_types,
+            )?;
             Ok(Some(ResolvedDropPaths {
                 paths: staged_paths,
                 cleanup_dir: Some(staged_dir),
@@ -723,12 +750,10 @@ unsafe fn resolve_macos_drag_promised_files_inner(
     use objc2_foundation::{NSArray, NSDictionary, NSError, NSOperationQueue, NSString, NSURL};
     use std::sync::mpsc::Sender;
 
-    unsafe fn collect_item_strings(
-        item: &NSPasteboardItem,
-        type_name: &str,
-    ) -> Option<String> {
+    unsafe fn collect_item_strings(item: &NSPasteboardItem, type_name: &str) -> Option<String> {
         let data_type = NSString::from_str(type_name);
-        item.stringForType(&data_type).map(|value| value.to_string())
+        item.stringForType(&data_type)
+            .map(|value| value.to_string())
     }
 
     unsafe fn collect_photos_drag_hints(
@@ -736,7 +761,12 @@ unsafe fn resolve_macos_drag_promised_files_inner(
     ) -> (bool, Vec<String>, Vec<String>, serde_json::Value) {
         let types = pasteboard
             .types()
-            .map(|types| types.iter().map(|item| item.to_string()).collect::<Vec<_>>())
+            .map(|types| {
+                types
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
 
         let mut contains_photos_asset_reference = false;
@@ -1056,9 +1086,7 @@ fn configure_macos_native_drag_support(window: &tauri::WebviewWindow) -> Result<
     let window_label = window.label().to_string();
     window
         .with_webview(move |webview| unsafe {
-            use objc2_app_kit::{
-                NSFilePromiseReceiver, NSPasteboardTypeFileURL, NSView, NSWindow,
-            };
+            use objc2_app_kit::{NSFilePromiseReceiver, NSPasteboardTypeFileURL, NSView, NSWindow};
             use objc2_foundation::NSMutableCopying;
 
             let ns_window: &NSWindow = &*webview.ns_window().cast();
@@ -1123,15 +1151,64 @@ fn set_preferred_share_client(
     Ok(())
 }
 
-async fn discover_handler(AxumState(state): AxumState<ServerState>) -> Json<DiscoverResponse> {
-    Json(DiscoverResponse {
-        kind: "desktop".to_string(),
-        server_id: state.app.server_id,
-        hostname: state.app.hostname,
-        ip: state.app.ip,
-        port: state.app.port,
-        protocol_version: DISCOVERY_PROTOCOL_VERSION,
-    })
+async fn discover_handler(
+    AxumState(state): AxumState<ServerState>,
+    headers: HeaderMap,
+) -> Json<DiscoverResponse> {
+    let advertised_ip = resolve_advertised_request_ip(&state, &headers);
+    Json(build_discover_response(&state, advertised_ip))
+}
+
+async fn run_udp_discovery_responder(state: ServerState) -> Result<(), String> {
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], state.app.port));
+    let socket = tokio::net::UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|e| format!("无法绑定 UDP 发现端口 {}: {}", state.app.port, e))?;
+
+    info!("UDP 发现应答已启动在 {}", bind_addr);
+    let mut buffer = [0u8; 2048];
+
+    loop {
+        let (length, source_addr) = match socket.recv_from(&mut buffer).await {
+            Ok(value) => value,
+            Err(error) => {
+                warn!("接收 UDP 发现报文失败: {}", error);
+                continue;
+            }
+        };
+
+        let probe = match serde_json::from_slice::<DiscoverProbe>(&buffer[..length]) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        if probe.kind != "discover_probe" || probe.protocol_version > DISCOVERY_PROTOCOL_VERSION {
+            continue;
+        }
+
+        let payload = match serde_json::to_vec(&build_discover_response(
+            &state,
+            current_advertised_ip(&state),
+        )) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!("编码 UDP 发现响应失败: {}", error);
+                continue;
+            }
+        };
+
+        let target_addr = SocketAddr::new(
+            match source_addr.ip() {
+                IpAddr::V4(addr) => IpAddr::V4(addr),
+                IpAddr::V6(addr) => IpAddr::V6(addr),
+            },
+            source_addr.port(),
+        );
+
+        if let Err(error) = socket.send_to(&payload, target_addr).await {
+            warn!("回复 UDP 发现响应失败: {}", error);
+        }
+    }
 }
 
 async fn request_pairing_handler(
@@ -1201,9 +1278,11 @@ async fn request_pairing_handler(
 
 async fn pair_status_handler(
     AxumState(state): AxumState<ServerState>,
+    headers: HeaderMap,
     AxumPath(request_id): AxumPath<String>,
 ) -> Json<PairRequestStatusResponse> {
     let status = pair_request_status_snapshot(&state.ws, &request_id);
+    let advertised_ip = resolve_advertised_request_ip(&state, &headers);
     Json(match status {
         Some(PairRequestStatus::Pending) => PairRequestStatusResponse {
             status: "pending".to_string(),
@@ -1220,7 +1299,7 @@ async fn pair_status_handler(
             request_id,
             server_id: Some(state.app.server_id),
             hostname: Some(state.app.hostname),
-            ip: Some(state.app.ip),
+            ip: Some(advertised_ip),
             port: Some(state.app.port),
             pin: Some(state.app.pin),
             error: None,
@@ -1408,9 +1487,55 @@ struct ServerState {
     ws: Arc<WsState>,
 }
 
+fn parse_request_host_ip(host: &str) -> Option<String> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = if let Some(stripped) = trimmed.strip_prefix('[') {
+        stripped.split(']').next()?.trim()
+    } else if trimmed.matches(':').count() == 1 {
+        trimmed.split(':').next()?.trim()
+    } else {
+        trimmed
+    };
+
+    candidate
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
+}
+
+fn resolve_advertised_request_ip(state: &ServerState, headers: &HeaderMap) -> String {
+    headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_request_host_ip)
+        .unwrap_or_else(|| current_advertised_ip(state))
+}
+
+fn current_advertised_ip(state: &ServerState) -> String {
+    local_ip_address::local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| state.app.ip.clone())
+}
+
+fn build_discover_response(state: &ServerState, advertised_ip: String) -> DiscoverResponse {
+    DiscoverResponse {
+        kind: "desktop".to_string(),
+        server_id: state.app.server_id.clone(),
+        hostname: state.app.hostname.clone(),
+        ip: advertised_ip,
+        port: state.app.port,
+        protocol_version: DISCOVERY_PROTOCOL_VERSION,
+    }
+}
+
 const MIN_WINDOW_WIDTH: f64 = 320.0;
 const MIN_WINDOW_HEIGHT: f64 = 420.0;
 const DESKTOP_TO_MOBILE_CHUNK_BYTES: usize = 192 * 1024;
+const DESKTOP_INBOX_DIR_NAME: &str = "VibeDrop 收件箱";
 const DESKTOP_TO_MOBILE_ACK_TIMEOUT_SECS: u64 = 90;
 const HISTORY_MEDIA_PREVIEW_LIMIT: usize = 6;
 const PAIR_REQUEST_TTL_SECS: i64 = 120;
@@ -1615,6 +1740,13 @@ fn main() {
             .unwrap();
 
         rt.block_on(async {
+            let udp_state = server_state.clone();
+            tokio::spawn(async move {
+                if let Err(error) = run_udp_discovery_responder(udp_state).await {
+                    warn!("UDP 发现应答未启动: {}", error);
+                }
+            });
+
             let app = Router::new()
                 .route("/ws", get(ws_handler))
                 .route("/discover", get(discover_handler))
@@ -1730,24 +1862,45 @@ fn main() {
                 *h = Some(app.handle().clone());
             }
             // 创建系统托盘菜单（类似 KDE Connect 风格）
-            let title = MenuItem::with_id(app, "title", "VibeDrop - 运行中", false, None::<&str>)?;
+            let server_addr = format!("{}:{}", ip, port);
+            let tray_pin = pin.clone();
+            let title = MenuItem::with_id(app, "title", "VibeDrop", false, None::<&str>)?;
             let addr_label = MenuItem::with_id(
                 app,
                 "addr",
-                &format!("📡 {}:{}", ip, port),
+                &format!("地址 {}", server_addr),
                 false,
                 None::<&str>,
             )?;
-            let pin_label =
-                MenuItem::with_id(app, "pin", &format!("🔑 PIN: {}", pin), false, None::<&str>)?;
+            let pin_label = MenuItem::with_id(
+                app,
+                "pin",
+                &format!("PIN {}", tray_pin),
+                false,
+                None::<&str>,
+            )?;
             let sep1 = PredefinedMenuItem::separator(app)?;
-            let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
+            let copy_addr = MenuItem::with_id(app, "copy_addr", "复制地址", true, None::<&str>)?;
+            let copy_pin = MenuItem::with_id(app, "copy_pin", "复制 PIN", true, None::<&str>)?;
             let sep2 = PredefinedMenuItem::separator(app)?;
+            let show = MenuItem::with_id(app, "show", "打开 VibeDrop", true, None::<&str>)?;
+            let sep3 = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "退出 VibeDrop", true, None::<&str>)?;
 
             let menu = Menu::with_items(
                 app,
-                &[&title, &addr_label, &pin_label, &sep1, &show, &sep2, &quit],
+                &[
+                    &title,
+                    &addr_label,
+                    &pin_label,
+                    &sep1,
+                    &copy_addr,
+                    &copy_pin,
+                    &sep2,
+                    &show,
+                    &sep3,
+                    &quit,
+                ],
             )?;
 
             // 加载托盘图标（白色透明底）
@@ -1764,8 +1917,22 @@ fn main() {
                 .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(true)
-                .tooltip(&format!("VibeDrop - {}:{}", ip, port))
-                .on_menu_event(|app, event| match event.id.as_ref() {
+                .tooltip(&format!("VibeDrop · {}", server_addr))
+                .on_menu_event(move |app, event| match event.id.as_ref() {
+                    "copy_addr" => {
+                        if let Err(err) = arboard::Clipboard::new()
+                            .and_then(|mut clipboard| clipboard.set_text(server_addr.clone()))
+                        {
+                            warn!("复制地址失败: {}", err);
+                        }
+                    }
+                    "copy_pin" => {
+                        if let Err(err) = arboard::Clipboard::new()
+                            .and_then(|mut clipboard| clipboard.set_text(tray_pin.clone()))
+                        {
+                            warn!("复制 PIN 失败: {}", err);
+                        }
+                    }
                     "quit" => {
                         app.exit(0);
                     }
@@ -1819,13 +1986,21 @@ async fn ws_handler(
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
-    info!("新的 WebSocket 连接");
     let mut authenticated = false;
     let session_id = state.session_counter.fetch_add(1, Ordering::Relaxed);
+    info!("新的 WebSocket 连接");
+    append_debug_log(
+        "websocket",
+        "open",
+        serde_json::json!({
+            "session_id": session_id,
+        }),
+    );
     let mut authenticated_client: Option<(String, u64)> = None;
     let mut current_client_id = String::new();
     let mut current_client_name = String::new();
     let mut current_receives_clipboard = false;
+    let mut active_incoming_file_transfers = std::collections::HashSet::new();
 
     // 拆分 WebSocket 为 sender/receiver，以便同时接收客户端消息和广播剪贴板
     let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -1885,7 +2060,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                                 ConnectedClient {
                                                     session_id,
                                                     id: client_id.clone(),
-                                                    base_id,
+                                                    base_id: base_id.clone(),
                                                     name: client_name.clone(),
                                                     can_receive_files,
                                                     receives_clipboard,
@@ -1895,10 +2070,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                         }
                                         current_client_id = client_id.clone();
                                         current_client_name = client_name.clone();
-                                        authenticated_client = Some((client_id, session_id));
+                                        authenticated_client = Some((client_id.clone(), session_id));
                                         broadcast_connected_clients(&state);
 
                                         info!("客户端认证成功: {} ({})", client_name, device_role);
+                                        append_debug_log(
+                                            "websocket",
+                                            "auth_ok",
+                                            serde_json::json!({
+                                                "session_id": session_id,
+                                                "client_id": client_id,
+                                                "base_id": base_id,
+                                                "client_name": client_name,
+                                                "device_role": device_role,
+                                                "can_receive_files": can_receive_files,
+                                                "receives_clipboard": receives_clipboard,
+                                            }),
+                                        );
                                         let reply = serde_json::json!({
                                             "status": "ok",
                                             "hostname": state.hostname.clone(),
@@ -1907,6 +2095,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                         let _ = ws_sender.send(Message::Text(reply.to_string().into())).await;
                                     } else {
                                         warn!("PIN 错误");
+                                        append_debug_log(
+                                            "websocket",
+                                            "auth_failed",
+                                            serde_json::json!({
+                                                "session_id": session_id,
+                                                "reason": "pin_mismatch",
+                                            }),
+                                        );
                                         let reply = ServerMessage {
                                             status: "error".to_string(),
                                             hostname: None,
@@ -1950,6 +2146,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                 }
 
                                 if let Some(transfer_id) = client_msg.transfer_id.as_deref() {
+                                    let mut handled_outbound = false;
                                     if let Ok(mut pending) = state.pending_transfers.lock() {
                                         if let Some(done_tx) = pending.remove(transfer_id) {
                                             let message = client_msg
@@ -1957,7 +2154,189 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                                 .clone()
                                                 .unwrap_or_else(|| "手机端保存失败".to_string());
                                             let _ = done_tx.send(Err(message));
+                                            handled_outbound = true;
                                         }
+                                    }
+
+                                    if !handled_outbound {
+                                        let _ = cancel_downloaded_file_transfer(transfer_id);
+                                        active_incoming_file_transfers.remove(transfer_id);
+                                    }
+                                }
+                            }
+
+                            "incoming_file_start" => {
+                                if !authenticated {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("未认证".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                }
+
+                                let Some(transfer_id) = client_msg.transfer_id.as_deref() else {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("缺少传输标识".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                };
+
+                                let Some(size_bytes) = client_msg.size_bytes else {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("缺少文件大小".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                };
+
+                                let result = begin_downloaded_file_transfer(
+                                    transfer_id,
+                                    client_msg.file_name.as_deref(),
+                                    client_msg.mime_type.as_deref(),
+                                    size_bytes,
+                                    if current_client_id.is_empty() {
+                                        None
+                                    } else {
+                                        Some(current_client_id.as_str())
+                                    },
+                                    if current_client_name.is_empty() {
+                                        None
+                                    } else {
+                                        Some(current_client_name.as_str())
+                                    },
+                                );
+
+                                let reply = match result {
+                                    Ok(()) => {
+                                        active_incoming_file_transfers
+                                            .insert(transfer_id.to_string());
+                                        ServerMessage {
+                                            status: "ok".to_string(),
+                                            hostname: None,
+                                            error: None,
+                                        }
+                                    }
+                                    Err(error) => ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some(error),
+                                    },
+                                };
+                                let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                            }
+
+                            "incoming_file_chunk" => {
+                                if !authenticated {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("未认证".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                }
+
+                                let Some(transfer_id) = client_msg.transfer_id.as_deref() else {
+                                    continue;
+                                };
+                                let Some(chunk_base64) = client_msg.chunk_base64.as_deref() else {
+                                    let reply = serde_json::json!({
+                                        "action": "incoming_file_error",
+                                        "transfer_id": transfer_id,
+                                        "error": "缺少文件分块数据",
+                                    });
+                                    let _ = ws_sender.send(Message::Text(reply.to_string().into())).await;
+                                    let _ = cancel_downloaded_file_transfer(transfer_id);
+                                    active_incoming_file_transfers.remove(transfer_id);
+                                    continue;
+                                };
+
+                                if let Err(error) =
+                                    append_downloaded_file_transfer_chunk(transfer_id, chunk_base64)
+                                {
+                                    let reply = serde_json::json!({
+                                        "action": "incoming_file_error",
+                                        "transfer_id": transfer_id,
+                                        "error": error,
+                                    });
+                                    let _ = ws_sender.send(Message::Text(reply.to_string().into())).await;
+                                    let _ = cancel_downloaded_file_transfer(transfer_id);
+                                    active_incoming_file_transfers.remove(transfer_id);
+                                }
+                            }
+
+                            "incoming_file_complete" => {
+                                if !authenticated {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("未认证".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                }
+
+                                let Some(transfer_id) = client_msg.transfer_id.as_deref() else {
+                                    continue;
+                                };
+
+                                match finish_downloaded_file_transfer(transfer_id) {
+                                    Ok((meta, saved_file_name, saved_file_path)) => {
+                                        active_incoming_file_transfers.remove(transfer_id);
+
+                                        let history_entry = HistoryEntry {
+                                            timestamp: chrono::Local::now().to_rfc3339_opts(
+                                                chrono::SecondsFormat::Millis,
+                                                false,
+                                            ),
+                                            text: format!("[文件] {}", saved_file_name),
+                                            client_ip: "ws-client".to_string(),
+                                            client_id: meta.client_id.clone(),
+                                            client_name: meta.client_name.clone(),
+                                            kind: Some("file".to_string()),
+                                            file_name: Some(saved_file_name.clone()),
+                                            image_path: None,
+                                            thumbnail_data_url: None,
+                                            file_path: Some(saved_file_path.clone()),
+                                            direction: None,
+                                            status: None,
+                                            session_id: None,
+                                            item_count: None,
+                                            save_target: None,
+                                            items: None,
+                                        };
+
+                                        append_history_entry(&history_entry);
+
+                                        if let Ok(guard) = state.app_handle.lock() {
+                                            if let Some(handle) = guard.as_ref() {
+                                                let _ = handle.emit("text-received", &history_entry);
+                                            }
+                                        }
+
+                                        let reply = serde_json::json!({
+                                            "action": "incoming_file_saved",
+                                            "transfer_id": transfer_id,
+                                            "saved_path": saved_file_path,
+                                        });
+                                        let _ = ws_sender.send(Message::Text(reply.to_string().into())).await;
+                                    }
+                                    Err(error) => {
+                                        let reply = serde_json::json!({
+                                            "action": "incoming_file_error",
+                                            "transfer_id": transfer_id,
+                                            "error": error,
+                                        });
+                                        let _ = ws_sender.send(Message::Text(reply.to_string().into())).await;
+                                        let _ = cancel_downloaded_file_transfer(transfer_id);
+                                        active_incoming_file_transfers.remove(transfer_id);
                                     }
                                 }
                             }
@@ -2339,7 +2718,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
         }
         broadcast_connected_clients(&state);
     }
+    for transfer_id in active_incoming_file_transfers {
+        let _ = cancel_downloaded_file_transfer(&transfer_id);
+    }
     info!("WebSocket 连接关闭");
+    append_debug_log(
+        "websocket",
+        "close",
+        serde_json::json!({
+            "session_id": session_id,
+            "authenticated": authenticated,
+            "client_id": current_client_id,
+            "client_name": current_client_name,
+        }),
+    );
 }
 
 fn connected_clients_snapshot(state: &Arc<WsState>) -> Vec<ConnectedClientInfo> {
@@ -2893,10 +3285,12 @@ fn build_outbound_history_session(
             None
         };
         let file_path = if cleanup_dir.is_some_and(|root| path.starts_with(root)) {
-            cache_outbound_history_media(path, session_id, index).map_err(|error| {
-                warn!("缓存桌面发送历史媒体失败: {}", error);
-                error
-            }).ok()
+            cache_outbound_history_media(path, session_id, index)
+                .map_err(|error| {
+                    warn!("缓存桌面发送历史媒体失败: {}", error);
+                    error
+                })
+                .ok()
         } else {
             Some(path.to_string_lossy().to_string())
         };
@@ -2926,15 +3320,16 @@ fn build_outbound_history_session(
     };
 
     let (kind, text) = if item_count == 1 {
-        let item = items
-            .first()
-            .ok_or_else(|| "发送内容为空".to_string())?;
+        let item = items.first().ok_or_else(|| "发送内容为空".to_string())?;
         let prefix = match item.kind.as_str() {
             "image" => "图片",
             "video" => "视频",
             _ => "文件",
         };
-        (item.kind.clone(), format!("[{}] {}", prefix, item.file_name))
+        (
+            item.kind.clone(),
+            format!("[{}] {}", prefix, item.file_name),
+        )
     } else if image_count == item_count {
         ("image".to_string(), format!("[图片] {} 张", item_count))
     } else if video_count == item_count {
@@ -3055,7 +3450,10 @@ fn build_video_thumbnail_data_url(path: &Path) -> Result<String, String> {
     let preview_path = WalkDir::new(&preview_dir)
         .into_iter()
         .filter_map(Result::ok)
-        .find(|entry| entry.file_type().is_file() && entry.path().extension().and_then(|ext| ext.to_str()) == Some("png"))
+        .find(|entry| {
+            entry.file_type().is_file()
+                && entry.path().extension().and_then(|ext| ext.to_str()) == Some("png")
+        })
         .map(|entry| entry.path().to_path_buf())
         .ok_or_else(|| "系统未返回视频预览图".to_string())?;
 
@@ -3191,15 +3589,15 @@ async fn run_prepared_desktop_outbound_transfer(
                     sent_bytes: 0,
                     total_bytes: prepared.total_bytes,
                     is_archive: prepared.is_archive,
-                detail: Some(format!("无法读取待发送文件: {}", error)),
-            },
-        );
-        return OutboundTransferResult {
-            item_index,
-            status: "error".to_string(),
-            saved_path: None,
-        };
-    }
+                    detail: Some(format!("无法读取待发送文件: {}", error)),
+                },
+            );
+            return OutboundTransferResult {
+                item_index,
+                status: "error".to_string(),
+                saved_path: None,
+            };
+        }
     };
 
     let mut sent_bytes = 0u64;
@@ -3565,8 +3963,7 @@ fn cache_outbound_history_media(
         .map(|name| sanitize_file_name(Some(name), &format!("media-{}", item_index + 1)))
         .unwrap_or_else(|| format!("media-{}", item_index + 1));
     let cache_path = unique_path(&cache_dir, &preferred_name);
-    fs::copy(source_path, &cache_path)
-        .map_err(|e| format!("无法缓存历史媒体文件: {}", e))?;
+    fs::copy(source_path, &cache_path).map_err(|e| format!("无法缓存历史媒体文件: {}", e))?;
 
     Ok(cache_path.to_string_lossy().to_string())
 }
@@ -3859,9 +4256,155 @@ fn unique_path(dir: &Path, preferred_name: &str) -> PathBuf {
     unreachable!()
 }
 
-fn downloads_dir() -> PathBuf {
+fn downloads_root_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join("Downloads")
+}
+
+fn desktop_inbox_dir() -> PathBuf {
+    downloads_root_dir().join(DESKTOP_INBOX_DIR_NAME)
+}
+
+fn incoming_download_temp_dir() -> PathBuf {
+    dirs_log_dir().join("incoming-download-temp")
+}
+
+fn sanitize_transfer_id(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "transfer".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn incoming_download_part_path(transfer_id: &str) -> PathBuf {
+    incoming_download_temp_dir().join(format!("{}.part", sanitize_transfer_id(transfer_id)))
+}
+
+fn incoming_download_meta_path(transfer_id: &str) -> PathBuf {
+    incoming_download_temp_dir().join(format!("{}.json", sanitize_transfer_id(transfer_id)))
+}
+
+fn begin_downloaded_file_transfer(
+    transfer_id: &str,
+    file_name: Option<&str>,
+    mime_type: Option<&str>,
+    size_bytes: u64,
+    client_id: Option<&str>,
+    client_name: Option<&str>,
+) -> Result<(), String> {
+    let temp_dir = incoming_download_temp_dir();
+    fs::create_dir_all(&temp_dir).map_err(|e| format!("无法创建接收临时目录: {}", e))?;
+
+    let meta = IncomingDesktopTransferMeta {
+        file_name: sanitize_file_name(file_name, "file.bin"),
+        mime_type: mime_type.unwrap_or("application/octet-stream").to_string(),
+        size_bytes,
+        client_id: client_id.map(str::to_string),
+        client_name: client_name.map(str::to_string),
+    };
+
+    let meta_payload =
+        serde_json::to_string(&meta).map_err(|e| format!("无法序列化接收元数据: {}", e))?;
+    fs::write(incoming_download_meta_path(transfer_id), meta_payload)
+        .map_err(|e| format!("无法写入接收元数据: {}", e))?;
+    fs::write(incoming_download_part_path(transfer_id), [])
+        .map_err(|e| format!("无法创建接收临时文件: {}", e))?;
+    Ok(())
+}
+
+fn append_downloaded_file_transfer_chunk(
+    transfer_id: &str,
+    chunk_base64: &str,
+) -> Result<(), String> {
+    let chunk = decode_base64_bytes(chunk_base64)?;
+    let part_path = incoming_download_part_path(transfer_id);
+    if !part_path.exists() {
+        return Err("接收中的临时文件不存在".to_string());
+    }
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&part_path)
+        .map_err(|e| format!("无法写入接收临时文件: {}", e))?;
+    file.write_all(&chunk)
+        .map_err(|e| format!("写入接收临时文件失败: {}", e))
+}
+
+fn move_file_with_fallback(source: &Path, destination: &Path) -> Result<(), String> {
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            fs::copy(source, destination).map_err(|copy_error| {
+                format!(
+                    "无法移动文件: {}；回退复制也失败: {}",
+                    rename_error, copy_error
+                )
+            })?;
+            fs::remove_file(source)
+                .map_err(|e| format!("复制后无法清理临时文件: {}", e))?;
+            Ok(())
+        }
+    }
+}
+
+fn finish_downloaded_file_transfer(
+    transfer_id: &str,
+) -> Result<(IncomingDesktopTransferMeta, String, String), String> {
+    let meta_path = incoming_download_meta_path(transfer_id);
+    let part_path = incoming_download_part_path(transfer_id);
+    if !meta_path.exists() || !part_path.exists() {
+        return Err("接收临时文件已失效".to_string());
+    }
+
+    let meta_raw =
+        fs::read_to_string(&meta_path).map_err(|e| format!("无法读取接收元数据: {}", e))?;
+    let meta: IncomingDesktopTransferMeta = serde_json::from_str(&meta_raw)
+        .map_err(|e| format!("接收元数据无效: {}", e))?;
+
+    let actual_size = fs::metadata(&part_path)
+        .map_err(|e| format!("无法读取接收临时文件信息: {}", e))?
+        .len();
+    if actual_size != meta.size_bytes {
+        return Err(format!(
+            "文件大小校验失败：预期 {} 字节，实际 {} 字节",
+            meta.size_bytes, actual_size
+        ));
+    }
+
+    let dir = desktop_inbox_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("无法创建 {}: {}", DESKTOP_INBOX_DIR_NAME, e))?;
+
+    let file_path = unique_path(&dir, &meta.file_name);
+    let final_file_name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file.bin")
+        .to_string();
+
+    move_file_with_fallback(&part_path, &file_path)?;
+    let _ = fs::remove_file(&meta_path);
+
+    Ok((meta, final_file_name, file_path.to_string_lossy().to_string()))
+}
+
+fn cancel_downloaded_file_transfer(transfer_id: &str) -> Result<(), String> {
+    let part_path = incoming_download_part_path(transfer_id);
+    let meta_path = incoming_download_meta_path(transfer_id);
+    fs::remove_file(part_path).ok();
+    fs::remove_file(meta_path).ok();
+    Ok(())
 }
 
 fn save_received_image(
@@ -3888,8 +4431,8 @@ fn save_downloaded_file(
     file_name: Option<&str>,
 ) -> Result<(String, String), String> {
     let file_bytes = decode_base64_bytes(file_base64)?;
-    let dir = downloads_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("无法创建下载目录: {}", e))?;
+    let dir = desktop_inbox_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("无法创建 {}: {}", DESKTOP_INBOX_DIR_NAME, e))?;
 
     let preferred_name = sanitize_file_name(file_name, "file.bin");
     let file_path = unique_path(&dir, &preferred_name);

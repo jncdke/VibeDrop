@@ -287,9 +287,13 @@ cargo tauri build
 ./scripts/deploy-desktop.sh
 ```
 
-桌面端和 Android 端现在共用一张主图：
+桌面端和 Android 端现在共用一张主图链路：
 
-- 根目录 `图标.jpg` 作为 V1 原始图标源
+- 默认正式母版是根目录 `图标.png`，也就是由紫底白图标这条视觉线自动合成出的无损高清版
+- 根目录 `图标.jpg` 现在只作为紫色背景参考图，不再直接作为最终导出源
+- 老的金属版 `图标_v2.png` 只作为兼容 fallback
+- 根目录 `状态栏图标.png` 是单色辅助图，不再作为 App Icon 默认源
+- 也可以通过环境变量 `APP_ICON_SOURCE=/path/to/icon.png` 临时指定其他源图
 - 部署脚本会在构建前自动重建各端需要的 PNG / ICO / ICNS / Android launcher 资源
 
 注意：
@@ -381,9 +385,9 @@ adb shell am start -n com.vibedrop.mobile/.MainActivity
 ./scripts/deploy-android.sh
 ```
 
-这个脚本现在会在构建前自动读取根目录的 V1 原图 `图标.jpg`，并重新生成：
+这个脚本现在会在构建前自动读取 `APP_ICON_SOURCE`；未设置时，会先根据 `图标.jpg` 的紫色背景参考和 `状态栏图标.png` 的高清符号自动合成根目录无损母版 `图标.png`，然后再重新生成：
 
-- 根目录 `图标.jpg` 会先被转换成最新的：
+- 这张源图会先被转换成最新的：
 - `mobile/src/icon.png`
 - `mobile/src/icon-192.png`
 - `mobile/src/icon-512.png`
@@ -396,7 +400,7 @@ adb shell am start -n com.vibedrop.mobile/.MainActivity
 - `mobile/src-tauri/icons/{icon.ico,icon.icns}`
 - Android launcher 的各个 `mipmap-*` 图标资源
 
-也就是说，以后你只需要改一张源图 `图标.jpg`，再运行部署脚本即可。
+也就是说，以后你只需要维护这条默认视觉线对应的素材，或者通过 `APP_ICON_SOURCE` 指向一张新图，再运行部署脚本即可；实际导出时使用的是无损母版 `图标.png`。
 
 常用参数：
 
@@ -434,7 +438,7 @@ cp mobile/src/style.css  desktop/static/style.css
 
 - `.github/workflows/ci.yml`
   每次 `push` / `pull_request` 都会自动执行：
-  - 从根目录 `图标.jpg` 重建图标资源
+  - 从 `APP_ICON_SOURCE` 或默认无损母版 `图标.png` 重建图标资源
   - 校验 `mobile/src/*` 与 `desktop/static/*` 三个共享前端文件保持同步
   - `node --check` 校验 `mobile/src/app.js` 与 `desktop/src/main.js` 语法
   - `cargo check` 桌面端
@@ -535,6 +539,7 @@ gh release create v0.1.4 \
 |------|------|------|
 | Mac PIN | `~/.vibedrop/pin` | 4 位数字，重启不变，删除后重新生成 |
 | Mac 历史日志 | `~/.vibedrop/history.jsonl` | 收到的文字记录（JSONL 格式，每行一条） |
+| Mac 文件收件箱 | `~/Downloads/VibeDrop 收件箱` | 手机传到 Mac 的普通文件默认保存位置；不存在会自动创建 |
 | Mac 桌面签名 keychain | `~/.vibedrop/signing/vibedrop-codesign.keychain-db` | 桌面端固定本地签名身份，供 `deploy-desktop.sh` 使用 |
 | Mac 桌面签名备份 | `~/.vibedrop/signing/backups/VibeTech-Local-Code-Signing-*.p12` | 可迁移到其他机器的桌面签名身份备份 |
 | Mac 开机自启 | 系统“登录项”里的 `VibeDrop` | 当前推荐方式；部署脚本会自动清理旧的 `~/Library/LaunchAgents/com.voicedrop.desktop.plist` 残留 |

@@ -2,6 +2,7 @@ package com.vibedrop.mobile
 
 import android.content.ActivityNotFoundException
 import android.content.ClipData
+import android.content.ClipboardManager
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
@@ -34,6 +35,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
+import java.io.RandomAccessFile
 import java.net.URLConnection
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -46,6 +48,8 @@ class MainActivity : TauriActivity() {
     private const val TAG = "VibeDrop"
     private const val PREVIEW_ASSET_PREFIX = "/vibedrop-preview/"
     private const val PREVIEW_ASSET_HOST = "https://appassets.androidplatform.net"
+    @Volatile
+    private var backgroundClipboardStartupGateArmedInProcess = false
   }
 
   private data class PreviewMediaAsset(
@@ -73,9 +77,10 @@ class MainActivity : TauriActivity() {
   private var appWebView: WebView? = null
   private var pendingExportFilename: String? = null
   private var pendingExportData: String? = null
-  private var pendingSharedContent: PendingSharedContent? = null
+  private var pendingSharedContents: MutableList<PendingSharedContent> = mutableListOf()
   private val previewMediaAssets = ConcurrentHashMap<String, PreviewMediaAsset>()
   private var previewAssetLoaderInstalled = false
+  private var tauriInitFallbackApplied = false
 
   private val exportDocumentLauncher = registerForActivityResult(
     ActivityResultContracts.CreateDocument("application/json")
@@ -148,6 +153,8 @@ class MainActivity : TauriActivity() {
       }
     }
 
+    maybeArmBackgroundClipboardStartupGate()
+
     // 启动前台保活服务
     val serviceIntent = Intent(this, KeepAliveService::class.java)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -181,6 +188,7 @@ class MainActivity : TauriActivity() {
     webView.addJavascriptInterface(BackgroundClipboardBridge(this), "NativeBackgroundClipboard")
     webView.addJavascriptInterface(MediaLibraryBridge(this), "NativeMediaLibrary")
     Log.d(TAG, "JS Bridge NativeClipboard 已注入")
+    Log.d(TAG, "Tauri init scripts: ${(webView as? RustWebView)?.initScripts?.size ?: 0}")
     webView.post { installPreviewAssetLoaderIfNeeded(webView) }
     emitPendingShareIfAvailable()
   }
@@ -228,11 +236,61 @@ class MainActivity : TauriActivity() {
       override fun onPageFinished(view: WebView, url: String?) {
         previousClient?.onPageFinished(view, url)
         super.onPageFinished(view, url)
+        ensureTauriBridgeIfMissing(view)
       }
     }
 
     previewAssetLoaderInstalled = true
     Log.d(TAG, "媒体预览资源拦截已安装: ${previousClient?.javaClass?.name ?: "none"}")
+  }
+
+  private fun logWebViewBridgeState(view: WebView) {
+    val script = """
+      (() => JSON.stringify({
+        href: window.location?.href || '',
+        hasTauri: !!window.__TAURI__,
+        tauriKeys: window.__TAURI__ ? Object.keys(window.__TAURI__).slice(0, 12) : [],
+        hasTauriCore: !!window.__TAURI__?.core,
+        hasTauriInvoke: typeof window.__TAURI__?.core?.invoke === 'function',
+        hasInternals: !!window.__TAURI_INTERNALS__,
+        internalKeys: window.__TAURI_INTERNALS__ ? Object.keys(window.__TAURI_INTERNALS__).slice(0, 12) : [],
+        hasInternalInvoke: typeof window.__TAURI_INTERNALS__?.invoke === 'function',
+        hasWindowIpc: typeof window.ipc?.postMessage === 'function',
+        hasNativeClipboard: !!window.NativeClipboard
+      }))();
+    """.trimIndent()
+
+    view.evaluateJavascript(script) { result ->
+      Log.d(TAG, "WebView bridge state: $result")
+    }
+  }
+
+  private fun ensureTauriBridgeIfMissing(view: WebView) {
+    val stateScript = """
+      (() => JSON.stringify({
+        hasTauriInvoke: typeof window.__TAURI__?.core?.invoke === 'function',
+        hasInternalInvoke: typeof window.__TAURI_INTERNALS__?.invoke === 'function'
+      }))();
+    """.trimIndent()
+
+    view.evaluateJavascript(stateScript) { result ->
+      val hasInvoke = result?.contains("\"hasTauriInvoke\":true") == true
+        || result?.contains("\"hasInternalInvoke\":true") == true
+      if (!hasInvoke && !tauriInitFallbackApplied) {
+        val rustWebView = view as? RustWebView
+        if (rustWebView != null && rustWebView.initScripts.isNotEmpty()) {
+          tauriInitFallbackApplied = true
+          Log.w(TAG, "Tauri bridge missing after page load, replaying ${rustWebView.initScripts.size} init scripts")
+          rustWebView.initScripts.forEach { initScript ->
+            view.evaluateJavascript(initScript, null)
+          }
+          view.postDelayed({ logWebViewBridgeState(view) }, 150)
+          return@evaluateJavascript
+        }
+      }
+
+      logWebViewBridgeState(view)
+    }
   }
 
   private inner class PreviewMediaPathHandler : WebViewAssetLoader.PathHandler {
@@ -272,6 +330,21 @@ class MainActivity : TauriActivity() {
     fun writeText(text: String) {
       Log.d(TAG, "JS 调用 NativeClipboard.writeText, 长度: ${text.length}")
       ClipboardFloatingActivity.launchWrite(context, text)
+    }
+
+    @JavascriptInterface
+    fun readText(): String {
+      return try {
+        val clipboardManager = ContextCompat.getSystemService(context, ClipboardManager::class.java)
+        val clip = clipboardManager?.primaryClip ?: return ""
+        if (clip.itemCount <= 0) {
+          return ""
+        }
+        clip.getItemAt(0).coerceToText(context)?.toString() ?: ""
+      } catch (e: Exception) {
+        Log.e(TAG, "JS 调用 NativeClipboard.readText 失败", e)
+        ""
+      }
     }
   }
 
@@ -617,12 +690,19 @@ class MainActivity : TauriActivity() {
 
     @JavascriptInterface
     fun getPendingSharedContent(): String {
-      return pendingSharedContent?.toJson()?.toString() ?: ""
+      return pendingSharedContents.firstOrNull()?.toJson()?.toString() ?: ""
+    }
+
+    @JavascriptInterface
+    fun getPendingSharedContents(): String {
+      val items = JSONArray()
+      pendingSharedContents.forEach { items.put(it.toJson()) }
+      return items.toString()
     }
 
     @JavascriptInterface
     fun readPendingSharedContentBase64(): String {
-      val sharedContent = pendingSharedContent ?: return ""
+      val sharedContent = pendingSharedContents.firstOrNull() ?: return ""
       return try {
         Base64.encodeToString(File(sharedContent.cachePath).readBytes(), Base64.NO_WRAP)
       } catch (e: Exception) {
@@ -632,12 +712,84 @@ class MainActivity : TauriActivity() {
     }
 
     @JavascriptInterface
-    fun clearPendingSharedContent() {
-      pendingSharedContent?.let { content ->
-        runCatching { File(content.cachePath).delete() }
-          .onFailure { Log.w(TAG, "清理共享缓存失败", it) }
+    fun readPendingSharedContentBase64At(itemIndex: Int): String {
+      val sharedContent = pendingSharedContents.getOrNull(itemIndex) ?: return ""
+      return try {
+        Base64.encodeToString(File(sharedContent.cachePath).readBytes(), Base64.NO_WRAP)
+      } catch (e: Exception) {
+        Log.e(TAG, "读取共享内容失败", e)
+        ""
       }
-      pendingSharedContent = null
+    }
+
+    @JavascriptInterface
+    fun readPendingSharedContentChunkBase64(offsetBytes: Long, lengthBytes: Int): String {
+      return readPendingSharedContentChunkBase64At(0, offsetBytes, lengthBytes)
+    }
+
+    @JavascriptInterface
+    fun readPendingSharedContentChunkBase64At(itemIndex: Int, offsetBytes: Long, lengthBytes: Int): String {
+      val sharedContent = pendingSharedContents.getOrNull(itemIndex) ?: return ""
+      if (offsetBytes < 0 || lengthBytes <= 0) {
+        return ""
+      }
+
+      return try {
+        RandomAccessFile(sharedContent.cachePath, "r").use { file ->
+          val safeOffset = offsetBytes.coerceAtMost(file.length())
+          val readableBytes = (file.length() - safeOffset).coerceAtLeast(0L)
+          val targetLength = minOf(lengthBytes.toLong(), readableBytes).toInt()
+          if (targetLength <= 0) {
+            return ""
+          }
+
+          val buffer = ByteArray(targetLength)
+          file.seek(safeOffset)
+          val read = file.read(buffer)
+          if (read <= 0) {
+            ""
+          } else {
+            Base64.encodeToString(
+              if (read == buffer.size) buffer else buffer.copyOf(read),
+              Base64.NO_WRAP
+            )
+          }
+        }
+      } catch (e: Exception) {
+        Log.e(TAG, "分块读取共享内容失败", e)
+        ""
+      }
+    }
+
+    @JavascriptInterface
+    fun clearPendingSharedContent() {
+      clearPendingSharedContentsCache()
+    }
+
+    @JavascriptInterface
+    fun retainPendingSharedContentIndexes(indexesJson: String) {
+      val keepIndexes = mutableSetOf<Int>()
+      runCatching {
+        val array = JSONArray(indexesJson)
+        for (index in 0 until array.length()) {
+          keepIndexes.add(array.optInt(index, -1))
+        }
+      }.onFailure {
+        Log.w(TAG, "解析保留共享索引失败", it)
+      }
+
+      val nextContents = mutableListOf<PendingSharedContent>()
+      pendingSharedContents.forEachIndexed { index, content ->
+        if (keepIndexes.contains(index)) {
+          nextContents.add(content)
+        } else {
+          runCatching { File(content.cachePath).delete() }
+            .onFailure { Log.w(TAG, "清理共享缓存失败", it) }
+        }
+      }
+
+      pendingSharedContents.clear()
+      pendingSharedContents.addAll(nextContents)
     }
   }
 
@@ -672,11 +824,28 @@ class MainActivity : TauriActivity() {
     @JavascriptInterface
     fun syncConfig(configJson: String) {
       try {
+        val gateWasActive = BackgroundClipboardStartupGate.remainingMs(context) > 0L
+        BackgroundClipboardStartupGate.clear(context)
         BackgroundClipboardConfigStore.save(context, configJson)
         requestBackgroundClipboardRefresh(context)
+        if (gateWasActive) {
+          Log.d(TAG, "后台剪贴板冷启动门控已解除，开始应用前端同步配置")
+        }
         Log.d(TAG, "后台剪贴板配置已同步")
       } catch (e: Exception) {
         Log.e(TAG, "同步后台剪贴板配置失败", e)
+      }
+    }
+
+    @JavascriptInterface
+    fun getStatus(): String {
+      return try {
+        BackgroundClipboardDiagnosticsStore.toJson(context)
+      } catch (e: Exception) {
+        Log.e(TAG, "读取后台剪贴板状态失败", e)
+        JSONObject().apply {
+          put("error", e.message ?: e.javaClass.simpleName)
+        }.toString()
       }
     }
   }
@@ -694,6 +863,15 @@ class MainActivity : TauriActivity() {
   }
 
   private var hasCheckedPermissions = false
+
+  private fun maybeArmBackgroundClipboardStartupGate() {
+    if (backgroundClipboardStartupGateArmedInProcess) {
+      return
+    }
+    val untilMs = BackgroundClipboardStartupGate.arm(this)
+    backgroundClipboardStartupGateArmedInProcess = true
+    Log.d(TAG, "后台剪贴板冷启动门控已激活，等待前端同步，untilMs=$untilMs")
+  }
 
   private fun checkPermissionsOnce() {
     if (hasCheckedPermissions) return
@@ -788,49 +966,78 @@ class MainActivity : TauriActivity() {
   }
 
   private fun handleIncomingShare(intent: Intent?) {
-    if (intent?.action != Intent.ACTION_SEND) {
+    if (intent == null || (intent.action != Intent.ACTION_SEND && intent.action != Intent.ACTION_SEND_MULTIPLE)) {
       return
     }
 
-    val sharedUri = extractSharedUri(intent) ?: run {
+    val sharedUris = extractSharedUris(intent)
+    if (sharedUris.isEmpty()) {
       Log.w(TAG, "收到系统分享，但未找到文件 URI")
       return
     }
 
+    val nextContents = mutableListOf<PendingSharedContent>()
     try {
-      val mimeType = intent.type ?: contentResolver.getType(sharedUri) ?: "application/octet-stream"
-      val displayName = resolveSharedDisplayName(sharedUri, mimeType)
-      val cachedFile = copySharedContentToCache(sharedUri, displayName)
-
-      pendingSharedContent?.let { previous ->
-        runCatching { File(previous.cachePath).delete() }
-          .onFailure { Log.w(TAG, "清理旧的共享缓存失败", it) }
+      sharedUris.forEach { sharedUri ->
+        val mimeType = contentResolver.getType(sharedUri) ?: intent.type ?: "application/octet-stream"
+        val displayName = resolveSharedDisplayName(sharedUri, mimeType)
+        val cachedFile = copySharedContentToCache(sharedUri, displayName)
+        nextContents.add(
+          PendingSharedContent(
+            cachePath = cachedFile.absolutePath,
+            displayName = cachedFile.name,
+            mimeType = mimeType,
+            sizeBytes = cachedFile.length(),
+            isImage = mimeType.startsWith("image/")
+          )
+        )
       }
 
-      pendingSharedContent = PendingSharedContent(
-        cachePath = cachedFile.absolutePath,
-        displayName = cachedFile.name,
-        mimeType = mimeType,
-        sizeBytes = cachedFile.length(),
-        isImage = mimeType.startsWith("image/")
-      )
+      clearPendingSharedContentsCache()
+      pendingSharedContents.clear()
+      pendingSharedContents.addAll(nextContents)
 
-      Log.d(TAG, "已接收系统分享: ${cachedFile.name} ($mimeType)")
+      Log.d(TAG, "已接收系统分享: ${nextContents.size} 项")
       emitPendingShareIfAvailable()
     } catch (e: Exception) {
+      nextContents.forEach { content ->
+        runCatching { File(content.cachePath).delete() }
+          .onFailure { Log.w(TAG, "清理失败共享缓存失败", it) }
+      }
       Log.e(TAG, "处理系统分享失败", e)
     }
   }
 
-  private fun extractSharedUri(intent: Intent): Uri? {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-      intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)?.let { return it }
-    } else {
-      @Suppress("DEPRECATION")
-      (intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri)?.let { return it }
+  private fun extractSharedUris(intent: Intent): List<Uri> {
+    val uris = mutableListOf<Uri>()
+
+    if (intent.action == Intent.ACTION_SEND_MULTIPLE) {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+          ?.filterNotNull()
+          ?.let { uris.addAll(it) }
+      } else {
+        @Suppress("DEPRECATION")
+        intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+          ?.filterNotNull()
+          ?.let { uris.addAll(it) }
+      }
     }
 
-    return intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)?.let { uris.add(it) }
+    } else {
+      @Suppress("DEPRECATION")
+      (intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri)?.let { uris.add(it) }
+    }
+
+    intent.clipData?.let { clipData ->
+      for (index in 0 until clipData.itemCount) {
+        clipData.getItemAt(index)?.uri?.let { uris.add(it) }
+      }
+    }
+
+    return uris.distinctBy { it.toString() }
   }
 
   private fun resolveSharedDisplayName(uri: Uri, mimeType: String): String {
@@ -885,8 +1092,27 @@ class MainActivity : TauriActivity() {
     }
   }
 
+  private fun clearPendingSharedContentsCache() {
+    pendingSharedContents.forEach { content ->
+      runCatching { File(content.cachePath).delete() }
+        .onFailure { Log.w(TAG, "清理共享缓存失败", it) }
+    }
+    pendingSharedContents.clear()
+  }
+
   private fun emitPendingShareIfAvailable() {
-    pendingSharedContent?.let { emitBridgeEvent("native-incoming-share", it.toJson()) }
+    if (pendingSharedContents.isEmpty()) {
+      return
+    }
+
+    val items = JSONArray()
+    pendingSharedContents.forEach { items.put(it.toJson()) }
+    emitBridgeEvent(
+      "native-incoming-share",
+      JSONObject().apply {
+        put("items", items)
+      }
+    )
   }
 
   private fun emitBridgeEvent(eventName: String, payload: JSONObject) {

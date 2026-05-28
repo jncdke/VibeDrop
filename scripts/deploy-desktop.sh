@@ -83,7 +83,7 @@ ensure_share_extension_project() {
 
 regenerate_icons() {
   [[ -f "$ICON_GENERATOR" ]] || fail "Icon generator not found: $ICON_GENERATOR"
-  log "Regenerating icon assets from 图标.jpg"
+  log "Regenerating icon assets from APP_ICON_SOURCE or default icon source"
   python3 "$ICON_GENERATOR"
 }
 
@@ -229,6 +229,22 @@ refresh_launch_services() {
   "$LSREGISTER" -f "$app_path" >/dev/null
 }
 
+refresh_macos_icon_cache() {
+  local app_path="$1"
+  [[ -d "$app_path" ]] || return 0
+
+  log "Refreshing macOS icon caches for $app_path"
+  touch "$app_path" || true
+  qlmanage -r cache >/dev/null 2>&1 || true
+
+  find /private/var/folders -type f \( -name "com.apple.dock.iconcache" -o -name "com.apple.iconservices.store" \) -delete >/dev/null 2>&1 || true
+  find /private/var/folders -type d -name "com.apple.iconservices" -exec rm -rf {} + >/dev/null 2>&1 || true
+
+  killall Finder >/dev/null 2>&1 || true
+  killall Dock >/dev/null 2>&1 || true
+  killall iconservicesagent >/dev/null 2>&1 || true
+}
+
 register_share_extension() {
   local appex_path="$1"
   [[ -x "$PLUGINKIT" ]] || return 0
@@ -279,6 +295,15 @@ open_app() {
   open -n "$DEST_APP_PATH"
 }
 
+strip_extended_attributes() {
+  local target="$1"
+  [[ -e "$target" ]] || return 0
+  if command -v xattr >/dev/null 2>&1; then
+    log "Removing extended attributes from $target"
+    xattr -cr "$target" || true
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-icons)
@@ -310,6 +335,7 @@ require_cmd pkill
 require_cmd open
 require_cmd codesign
 require_cmd security
+require_cmd xattr
 require_cmd python3
 require_cmd ruby
 require_cmd xcodebuild
@@ -338,6 +364,8 @@ fi
 
 validate_app_identifier "$BUILT_APP_PATH"
 embed_share_extension "$BUILT_APP_PATH"
+strip_extended_attributes "$BUILT_APP_PATH/$SHARE_EXTENSION_INSTALL_PATH_SUFFIX"
+strip_extended_attributes "$BUILT_APP_PATH"
 sign_share_extension "$BUILT_APP_PATH/$SHARE_EXTENSION_INSTALL_PATH_SUFFIX" "$SIGNING_IDENTITY"
 sign_app "$BUILT_APP_PATH" "$SIGNING_IDENTITY"
 verify_app "$BUILT_APP_PATH"
@@ -347,10 +375,13 @@ cleanup_legacy_launch_agent
 install_app
 validate_app_identifier "$DEST_APP_PATH"
 embed_share_extension "$DEST_APP_PATH"
+strip_extended_attributes "$DEST_APP_PATH/$SHARE_EXTENSION_INSTALL_PATH_SUFFIX"
+strip_extended_attributes "$DEST_APP_PATH"
 sign_share_extension "$DEST_APP_PATH/$SHARE_EXTENSION_INSTALL_PATH_SUFFIX" "$SIGNING_IDENTITY"
 sign_app "$DEST_APP_PATH" "$SIGNING_IDENTITY"
 verify_app "$DEST_APP_PATH"
 refresh_launch_services "$DEST_APP_PATH"
+refresh_macos_icon_cache "$DEST_APP_PATH"
 register_share_extension "$DEST_APP_PATH/$SHARE_EXTENSION_INSTALL_PATH_SUFFIX"
 install_finder_workflow
 

@@ -1,10 +1,6 @@
 const { invoke } = window.__TAURI__.core;
 const LOG_HEATMAP_VISIBLE_DAYS = 7;
-const LOG_HEATMAP_RENDER_BUFFER_DAYS = 14;
 const LOG_HEATMAP_HOUR_SLOTS = 24;
-const LOG_HEATMAP_COLUMN_STEP = 90;
-const LOG_HEATMAP_DRAG_THRESHOLD = 8;
-const LOG_HEATMAP_INERTIA_MS = 180;
 const DEFAULT_LOG_HISTORY_FILTERS = {
     device: 'all',
     quickTime: '7d',
@@ -14,6 +10,7 @@ const DEFAULT_LOG_HISTORY_FILTERS = {
     startTime: '',
     endTime: '',
     kind: 'all',
+    query: '',
 };
 let connectedDropClients = [];
 let selectedDropClientId = '';
@@ -35,15 +32,10 @@ let logHeatmapState = {
     rangeToken: '',
     selectionDate: '',
     selectionHour: null,
-    dragPointerId: null,
-    dragStartX: 0,
-    dragOffsetX: 0,
-    dragLastX: 0,
-    dragLastTime: 0,
-    dragVelocity: 0,
-    dragMoved: false,
-    dragMinOffsetX: 0,
-    dragMaxOffsetX: 0,
+    scrollFrame: 0,
+    renderedEntries: [],
+    renderedCounts: null,
+    renderedBounds: null,
     suppressCellClickUntil: 0,
 };
 let pendingPairRequests = [];
@@ -733,6 +725,19 @@ function initDesktopHistoryControls() {
         renderLog();
     });
 
+    document.getElementById('desktop-history-search-input')?.addEventListener('input', (event) => {
+        currentLogHistoryFilters.query = event.target.value || '';
+        clearLogHeatmapSelection();
+        renderDesktopHistorySearchState();
+        renderLog();
+    });
+    document.getElementById('desktop-history-search-clear-btn')?.addEventListener('click', () => {
+        currentLogHistoryFilters.query = '';
+        clearLogHeatmapSelection();
+        syncDesktopHistoryFilterForm();
+        renderLog();
+        document.getElementById('desktop-history-search-input')?.focus();
+    });
     document.getElementById('desktop-history-time-range')?.addEventListener('change', () => {
         desktopHistoryAdvancedPanelVisible = true;
         syncDesktopCustomTimeInputsState();
@@ -853,6 +858,7 @@ function syncDesktopHistoryFilterForm() {
         startTime,
         endTime,
         kind,
+        query,
     } = currentLogHistoryFilters;
 
     if (document.getElementById('desktop-history-start-date')) document.getElementById('desktop-history-start-date').value = startDate;
@@ -861,13 +867,20 @@ function syncDesktopHistoryFilterForm() {
     if (document.getElementById('desktop-history-start-time')) document.getElementById('desktop-history-start-time').value = startTime;
     if (document.getElementById('desktop-history-end-time')) document.getElementById('desktop-history-end-time').value = endTime;
     if (document.getElementById('desktop-history-kind-filter')) document.getElementById('desktop-history-kind-filter').value = kind;
+    if (document.getElementById('desktop-history-search-input')) document.getElementById('desktop-history-search-input').value = query;
     syncDesktopCustomTimeInputsState();
+    renderDesktopHistorySearchState();
 }
 
 function syncDesktopCustomTimeInputsState() {
     const customTime = document.getElementById('desktop-history-time-range')?.value === 'custom';
     if (document.getElementById('desktop-history-start-time')) document.getElementById('desktop-history-start-time').disabled = !customTime;
     if (document.getElementById('desktop-history-end-time')) document.getElementById('desktop-history-end-time').disabled = !customTime;
+}
+
+function renderDesktopHistorySearchState() {
+    const hasQuery = Boolean(normalizeSearchText(currentLogHistoryFilters.query));
+    document.getElementById('desktop-history-search-clear-btn')?.classList.toggle('hidden', !hasQuery);
 }
 
 function readDesktopHistoryFilterForm() {
@@ -958,6 +971,10 @@ function renderHistoryFilterBanner(baseEntries, totalCount = 0) {
     if (!banner || !text) return;
 
     const labels = [];
+    const queryLabel = String(currentLogHistoryFilters.query || '').trim();
+    if (queryLabel) {
+        labels.push(`搜索：${queryLabel}`);
+    }
     const deviceLabel = getLogFilterDeviceLabel(currentLogHistoryFilters.device, getLog());
     if (deviceLabel) {
         labels.push(deviceLabel);
@@ -1024,11 +1041,14 @@ function renderLogList(entries, totalCount = 0) {
     if (!list) return;
 
     if (!entries.length) {
+        const hasSearchQuery = Boolean(normalizeSearchText(currentLogHistoryFilters.query));
         const emptyText = totalCount === 0
             ? '等待接收...'
             : logHeatmapState.selectionDate && logHeatmapState.selectionHour != null
                 ? '这个时段没有符合条件的记录'
-                : '没有符合筛选条件的记录';
+                : hasSearchQuery
+                    ? '没有匹配的历史记录'
+                    : '没有符合筛选条件的记录';
         list.innerHTML = `<p class="empty">${emptyText}</p>`;
         return;
     }
@@ -1063,6 +1083,10 @@ function filterLogEntries(entries, filters = currentLogHistoryFilters) {
         }
 
         if (!matchesLogKind(entry, filters)) {
+            return false;
+        }
+
+        if (!matchesLogSearch(entry, filters)) {
             return false;
         }
 
@@ -1144,6 +1168,54 @@ function parseClockMinutes(value) {
     return (Number(hour) * 60) + Number(minute);
 }
 
+function getLogKindLabel(kind = 'text') {
+    const labels = {
+        text: '文字',
+        image: '图片',
+        video: '视频',
+        media: '媒体',
+        file: '文件',
+    };
+    return labels[kind] || kind || '文字';
+}
+
+function normalizeSearchText(value) {
+    return String(value || '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function tokenizeSearchQuery(query) {
+    const normalized = normalizeSearchText(query);
+    return normalized ? normalized.split(' ') : [];
+}
+
+function buildLogSearchIndex(entry) {
+    const items = getLogEntryItems(entry);
+    return normalizeSearchText([
+        entry.text,
+        entry.client_name,
+        entry.client_ip,
+        entry.file_name,
+        entry.kind,
+        getLogKindLabel(entry.kind),
+        getLogEntryDeviceName(entry),
+        getLogEntryDeviceDetail(entry),
+        ...items.map((item) => item.file_name),
+    ].join(' '));
+}
+
+function matchesLogSearch(entry, filters = currentLogHistoryFilters) {
+    const tokens = tokenizeSearchQuery(filters.query);
+    if (!tokens.length) {
+        return true;
+    }
+
+    const searchIndex = buildLogSearchIndex(entry);
+    return tokens.every((token) => searchIndex.includes(token));
+}
+
 function getLogHeatmapRangeToken() {
     return [
         currentLogHistoryFilters.device,
@@ -1154,6 +1226,7 @@ function getLogHeatmapRangeToken() {
         currentLogHistoryFilters.startTime,
         currentLogHistoryFilters.endTime,
         currentLogHistoryFilters.kind,
+        normalizeSearchText(currentLogHistoryFilters.query),
     ].join('|');
 }
 
@@ -1209,22 +1282,77 @@ function getLogHeatmapBounds(baseEntries) {
     };
 }
 
-function getLogHeatmapDragOffsetBounds(bounds) {
-    const currentEnd = logHeatmapState.viewportEndDate || bounds.maxDate;
-    const minDeltaDays = diffDateKeys(currentEnd, bounds.minViewportEndDate);
-    const maxDeltaDays = diffDateKeys(currentEnd, bounds.maxDate);
+function getLogHeatmapDayKeys(minDate, maxDate) {
+    const days = [];
+    if (!minDate || !maxDate) {
+        return days;
+    }
+
+    for (let dayKey = minDate; dayKey <= maxDate; dayKey = shiftDateKey(dayKey, 1)) {
+        days.push(dayKey);
+    }
+
+    return days;
+}
+
+function getLogHeatmapMaxStartIndex(bounds) {
+    return Math.max(0, diffDateKeys(bounds.minDate, bounds.maxDate) - (LOG_HEATMAP_VISIBLE_DAYS - 1));
+}
+
+function clampLogHeatmapStartIndex(startIndex, bounds) {
+    return Math.max(0, Math.min(getLogHeatmapMaxStartIndex(bounds), startIndex));
+}
+
+function getLogHeatmapStartIndexForEndDate(bounds, endDate = bounds.preferredEnd) {
+    const clampedEnd = clampDateKey(endDate || bounds.preferredEnd, bounds.minViewportEndDate, bounds.maxDate);
+    const visibleStart = clampDateKey(
+        shiftDateKey(clampedEnd, -(LOG_HEATMAP_VISIBLE_DAYS - 1)),
+        bounds.minDate,
+        bounds.maxDate
+    );
+    return clampLogHeatmapStartIndex(diffDateKeys(bounds.minDate, visibleStart), bounds);
+}
+
+function getLogHeatmapVisibleWindow(bounds, startIndex) {
+    const safeStartIndex = clampLogHeatmapStartIndex(startIndex, bounds);
+    const visibleStart = shiftDateKey(bounds.minDate, safeStartIndex);
+    const visibleEnd = clampDateKey(
+        shiftDateKey(visibleStart, LOG_HEATMAP_VISIBLE_DAYS - 1),
+        bounds.minDate,
+        bounds.maxDate
+    );
 
     return {
-        minOffsetX: -maxDeltaDays * LOG_HEATMAP_COLUMN_STEP,
-        maxOffsetX: -minDeltaDays * LOG_HEATMAP_COLUMN_STEP,
+        startIndex: safeStartIndex,
+        visibleStart,
+        visibleEnd,
     };
 }
 
-function clampLogHeatmapOffset(offsetX) {
-    return Math.max(
-        logHeatmapState.dragMinOffsetX,
-        Math.min(logHeatmapState.dragMaxOffsetX, offsetX)
-    );
+function getLogHeatmapColumnStep(track = document.getElementById('log-heatmap-track')) {
+    const first = track?.children?.[0];
+    const second = track?.children?.[1];
+    if (first && second) {
+        return second.offsetLeft - first.offsetLeft;
+    }
+
+    const rootStyles = getComputedStyle(document.documentElement);
+    const columnWidth = parseFloat(rootStyles.getPropertyValue('--desktop-heatmap-column-width')) || 80;
+    const columnGap = parseFloat(rootStyles.getPropertyValue('--desktop-heatmap-column-gap')) || 10;
+    return columnWidth + columnGap;
+}
+
+function setLogHeatmapScrollPosition(viewport, track, startIndex) {
+    if (!viewport || !track) {
+        return;
+    }
+
+    const step = getLogHeatmapColumnStep(track);
+    const targetLeft = Math.max(0, startIndex) * step;
+    const previousBehavior = viewport.style.scrollBehavior;
+    viewport.style.scrollBehavior = 'auto';
+    viewport.scrollLeft = targetLeft;
+    viewport.style.scrollBehavior = previousBehavior;
 }
 
 function clearLogHeatmapSelection() {
@@ -1310,12 +1438,56 @@ function buildLogHeatmapStats(entries, visibleStart, visibleEnd) {
     ];
 }
 
+function syncLogHeatmapViewportMeta(baseEntries, counts, bounds) {
+    const viewport = document.getElementById('log-heatmap-viewport');
+    const stats = document.getElementById('log-heatmap-stats');
+    const caption = document.getElementById('log-heatmap-caption');
+    const resetBtn = document.getElementById('btn-log-heatmap-reset');
+    const track = document.getElementById('log-heatmap-track');
+    if (!viewport || !stats || !caption || !resetBtn || !track || !bounds) {
+        return;
+    }
+
+    const step = getLogHeatmapColumnStep(track);
+    const rawStartIndex = step > 0
+        ? Math.round(viewport.scrollLeft / step)
+        : getLogHeatmapStartIndexForEndDate(bounds, logHeatmapState.viewportEndDate);
+    const { startIndex, visibleStart, visibleEnd } = getLogHeatmapVisibleWindow(bounds, rawStartIndex);
+
+    logHeatmapState.viewportEndDate = visibleEnd;
+    stats.innerHTML = buildLogHeatmapStats(baseEntries, visibleStart, visibleEnd).map((item) => `
+        <div class="heatmap-stat">
+            <span class="heatmap-stat-label">${escapeHtml(item.label)}</span>
+            <span class="heatmap-stat-value">${escapeHtml(item.value)}</span>
+        </div>
+    `).join('');
+
+    caption.textContent = `当前窗口 ${formatHeatmapDateLabel(visibleStart)} 至 ${formatHeatmapDateLabel(visibleEnd)}。左右滑动查看更多日期，点方块筛选该小时。`;
+    resetBtn.classList.toggle('hidden', startIndex >= getLogHeatmapMaxStartIndex(bounds));
+}
+
+function scheduleLogHeatmapViewportMetaSync() {
+    if (logHeatmapState.scrollFrame) {
+        return;
+    }
+
+    logHeatmapState.scrollFrame = requestAnimationFrame(() => {
+        logHeatmapState.scrollFrame = 0;
+        syncLogHeatmapViewportMeta(
+            logHeatmapState.renderedEntries,
+            logHeatmapState.renderedCounts,
+            logHeatmapState.renderedBounds
+        );
+    });
+}
+
 function renderLogHeatmap(baseEntries) {
+    const viewport = document.getElementById('log-heatmap-viewport');
     const track = document.getElementById('log-heatmap-track');
     const stats = document.getElementById('log-heatmap-stats');
     const caption = document.getElementById('log-heatmap-caption');
     const resetBtn = document.getElementById('btn-log-heatmap-reset');
-    if (!track || !stats || !caption || !resetBtn) return;
+    if (!viewport || !track || !stats || !caption || !resetBtn) return;
 
     const rangeToken = getLogHeatmapRangeToken();
     const bounds = getLogHeatmapBounds(baseEntries);
@@ -1332,17 +1504,10 @@ function renderLogHeatmap(baseEntries) {
     );
 
     const visibleEnd = logHeatmapState.viewportEndDate;
-    const visibleStart = shiftDateKey(visibleEnd, -(LOG_HEATMAP_VISIBLE_DAYS - 1));
-    const renderStart = shiftDateKey(visibleStart, -LOG_HEATMAP_RENDER_BUFFER_DAYS);
-    const renderEnd = shiftDateKey(visibleEnd, LOG_HEATMAP_RENDER_BUFFER_DAYS);
     const counts = buildLogHeatmapCountMap(baseEntries);
     const maxCount = Array.from(counts.values()).reduce((max, value) => Math.max(max, value), 0);
     const todayKey = formatDateKey(new Date());
-    const days = [];
-
-    for (let dayKey = renderStart; dayKey <= renderEnd; dayKey = shiftDateKey(dayKey, 1)) {
-        days.push(dayKey);
-    }
+    const days = getLogHeatmapDayKeys(bounds.minDate, bounds.maxDate);
 
     track.innerHTML = days.map((dayKey) => {
         const dayDate = dateKeyToUtcDate(dayKey);
@@ -1382,22 +1547,13 @@ function renderLogHeatmap(baseEntries) {
         `;
     }).join('');
 
-    const baseOffset = -(diffDateKeys(renderStart, visibleStart) * LOG_HEATMAP_COLUMN_STEP);
-    track.dataset.baseOffset = String(baseOffset);
-    track.style.transition = logHeatmapState.dragPointerId == null
-        ? 'transform 220ms cubic-bezier(0.22, 1, 0.36, 1)'
-        : 'none';
-    track.style.transform = `translate3d(${baseOffset + logHeatmapState.dragOffsetX}px, 0, 0)`;
+    logHeatmapState.renderedEntries = baseEntries;
+    logHeatmapState.renderedCounts = counts;
+    logHeatmapState.renderedBounds = bounds;
 
-    stats.innerHTML = buildLogHeatmapStats(baseEntries, visibleStart, visibleEnd).map((item) => `
-        <div class="heatmap-stat">
-            <span class="heatmap-stat-label">${escapeHtml(item.label)}</span>
-            <span class="heatmap-stat-value">${escapeHtml(item.value)}</span>
-        </div>
-    `).join('');
-
-    caption.textContent = `当前窗口 ${formatHeatmapDateLabel(visibleStart)} 至 ${formatHeatmapDateLabel(visibleEnd)}。左右拖动查看更多日期，点方块筛选该小时。`;
-    resetBtn.classList.toggle('hidden', visibleEnd === bounds.maxDate);
+    const initialStartIndex = getLogHeatmapStartIndexForEndDate(bounds, logHeatmapState.viewportEndDate);
+    setLogHeatmapScrollPosition(viewport, track, initialStartIndex);
+    syncLogHeatmapViewportMeta(baseEntries, counts, bounds);
 
     track.querySelectorAll('.heatmap-cell').forEach((cell) => {
         cell.addEventListener('click', () => {
@@ -1429,92 +1585,14 @@ function initDesktopLogHeatmapInteractions() {
 
     viewport.dataset.ready = '1';
 
-    viewport.addEventListener('pointerdown', (event) => {
-        const bounds = getLogHeatmapBounds(filterLogEntries(getLog().map((entry) => normalizeLogEntry(entry))));
-        const dragBounds = getLogHeatmapDragOffsetBounds(bounds);
-        logHeatmapState.dragPointerId = event.pointerId;
-        logHeatmapState.dragStartX = event.clientX;
-        logHeatmapState.dragOffsetX = 0;
-        logHeatmapState.dragLastX = event.clientX;
-        logHeatmapState.dragLastTime = Date.now();
-        logHeatmapState.dragVelocity = 0;
-        logHeatmapState.dragMoved = false;
-        logHeatmapState.dragMinOffsetX = dragBounds.minOffsetX;
-        logHeatmapState.dragMaxOffsetX = dragBounds.maxOffsetX;
-        viewport.setPointerCapture?.(event.pointerId);
+    viewport.addEventListener('scroll', () => {
+        logHeatmapState.suppressCellClickUntil = Date.now() + 120;
+        scheduleLogHeatmapViewportMetaSync();
     });
-
-    viewport.addEventListener('pointermove', (event) => {
-        if (event.pointerId !== logHeatmapState.dragPointerId) {
-            return;
-        }
-
-        const rawOffsetX = event.clientX - logHeatmapState.dragStartX;
-        const offsetX = clampLogHeatmapOffset(rawOffsetX);
-        const now = Date.now();
-        const deltaTime = Math.max(now - logHeatmapState.dragLastTime, 1);
-
-        logHeatmapState.dragVelocity = (event.clientX - logHeatmapState.dragLastX) / deltaTime;
-        logHeatmapState.dragLastX = event.clientX;
-        logHeatmapState.dragLastTime = now;
-
-        if (!logHeatmapState.dragMoved && Math.abs(offsetX) < LOG_HEATMAP_DRAG_THRESHOLD) {
-            return;
-        }
-
-        logHeatmapState.dragMoved = true;
-        logHeatmapState.dragOffsetX = offsetX;
-
-        const track = document.getElementById('log-heatmap-track');
-        if (!track) return;
-
-        const baseOffset = Number(track.dataset.baseOffset || 0);
-        track.style.transition = 'none';
-        track.style.transform = `translate3d(${baseOffset + offsetX}px, 0, 0)`;
-    });
-
-    const finishDrag = (event) => {
-        if (event.pointerId !== logHeatmapState.dragPointerId) {
-            return;
-        }
-
-        viewport.releasePointerCapture?.(event.pointerId);
-
-        const moved = logHeatmapState.dragMoved;
-        const predictedOffset = clampLogHeatmapOffset(
-            logHeatmapState.dragOffsetX + (logHeatmapState.dragVelocity * LOG_HEATMAP_INERTIA_MS)
-        );
-
-        logHeatmapState.dragPointerId = null;
-        logHeatmapState.dragOffsetX = 0;
-        logHeatmapState.dragVelocity = 0;
-        logHeatmapState.dragLastX = 0;
-        logHeatmapState.dragLastTime = 0;
-        logHeatmapState.dragMoved = false;
-        logHeatmapState.dragMinOffsetX = 0;
-        logHeatmapState.dragMaxOffsetX = 0;
-
-        if (!moved) {
-            return;
-        }
-
-        const bounds = getLogHeatmapBounds(filterLogEntries(getLog().map((entry) => normalizeLogEntry(entry))));
-        const deltaDays = -Math.round(predictedOffset / LOG_HEATMAP_COLUMN_STEP);
-        logHeatmapState.viewportEndDate = clampDateKey(
-            shiftDateKey(logHeatmapState.viewportEndDate, deltaDays),
-            bounds.minViewportEndDate,
-            bounds.maxDate
-        );
-        clearLogHeatmapSelection();
-        logHeatmapState.suppressCellClickUntil = Date.now() + 180;
-        renderLog();
-    };
-
-    viewport.addEventListener('pointerup', finishDrag);
-    viewport.addEventListener('pointercancel', finishDrag);
 
     resetBtn?.addEventListener('click', () => {
-        const bounds = getLogHeatmapBounds(filterLogEntries(getLog().map((entry) => normalizeLogEntry(entry))));
+        const bounds = logHeatmapState.renderedBounds
+            || getLogHeatmapBounds(filterLogEntries(getLog().map((entry) => normalizeLogEntry(entry))));
         logHeatmapState.viewportEndDate = bounds.maxDate;
         clearLogHeatmapSelection();
         renderLog();

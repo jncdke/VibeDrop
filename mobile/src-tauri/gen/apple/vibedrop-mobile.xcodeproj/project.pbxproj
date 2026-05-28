@@ -1,0 +1,476 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1B59561BCB61DFDB210A91D8 /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4BF3173D02002597C7688450 /* libapp.a */; };
+		1DDADA2F3554133B9291ACB2 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8D41DEA1CF1A5BF53956F44C /* MetalKit.framework */; };
+		6A26DA7FBC7BD2785752740C /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 5769E7F3343758BE56944AA0 /* Assets.xcassets */; };
+		7A6300E4C826136E5DDF01E1 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D037A25B43FE3B38603657CC /* Metal.framework */; };
+		8CEFA3F29020C2C036B7F34C /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3EEF1E730B63485109E520DD /* UIKit.framework */; };
+		958659BF5690525589BB5164 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 5B5D8EB00AA6447CE2D93C8F /* main.mm */; };
+		97D357396B73BD40483DAC48 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0723096F3FC9775787D2F863 /* CoreGraphics.framework */; };
+		A732081D26B8D7ED2AC2E53B /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 767814DDF07EB72CB4C9B9E2 /* assets */; };
+		D12988EF761B82E6B8953075 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D806F991B40DDA345549343C /* QuartzCore.framework */; };
+		E9525455DEFF79856940495E /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3D6608E9CD8CE9373096A4D9 /* WebKit.framework */; };
+		F1F50B3E8459589F4517BA79 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F9F36A0DA72FE348C3615D3C /* Security.framework */; };
+		FBB1A3077F6C6ABDF019BABB /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = B7722912B95859A489832722 /* LaunchScreen.storyboard */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		0723096F3FC9775787D2F863 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		080A89692663AADFC6C986A4 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
+		3D6608E9CD8CE9373096A4D9 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		3EEF1E730B63485109E520DD /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		4B0D3D03751D659588475576 /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
+		4BF3173D02002597C7688450 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		5769E7F3343758BE56944AA0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		5B5D8EB00AA6447CE2D93C8F /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		5D2513C85BE8E4A89ADD7FA8 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		767814DDF07EB72CB4C9B9E2 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
+		8D41DEA1CF1A5BF53956F44C /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		B124AE239844BD3C4C855CA8 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		B15A7993B2074E4001403EE5 /* vibedrop-mobile_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "vibedrop-mobile_iOS.entitlements"; sourceTree = "<group>"; };
+		B7722912B95859A489832722 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		D037A25B43FE3B38603657CC /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		D806F991B40DDA345549343C /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		DC746C787F0BC26CAC5AD947 /* vibedrop-mobile_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "vibedrop-mobile_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		F9F36A0DA72FE348C3615D3C /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		E21036EDE7788BC92EAD4E1D /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1B59561BCB61DFDB210A91D8 /* libapp.a in Frameworks */,
+				97D357396B73BD40483DAC48 /* CoreGraphics.framework in Frameworks */,
+				7A6300E4C826136E5DDF01E1 /* Metal.framework in Frameworks */,
+				1DDADA2F3554133B9291ACB2 /* MetalKit.framework in Frameworks */,
+				D12988EF761B82E6B8953075 /* QuartzCore.framework in Frameworks */,
+				F1F50B3E8459589F4517BA79 /* Security.framework in Frameworks */,
+				8CEFA3F29020C2C036B7F34C /* UIKit.framework in Frameworks */,
+				E9525455DEFF79856940495E /* WebKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		3FEE53EF35955F35B95EAB79 /* bindings */ = {
+			isa = PBXGroup;
+			children = (
+				5D2513C85BE8E4A89ADD7FA8 /* bindings.h */,
+			);
+			path = bindings;
+			sourceTree = "<group>";
+		};
+		7BEC8861E24D909E505EE6B2 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				D96E23E40933C25F2C60F144 /* vibedrop-mobile */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		7CF5D4F119C7F536A5BBB45B /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				0723096F3FC9775787D2F863 /* CoreGraphics.framework */,
+				4BF3173D02002597C7688450 /* libapp.a */,
+				D037A25B43FE3B38603657CC /* Metal.framework */,
+				8D41DEA1CF1A5BF53956F44C /* MetalKit.framework */,
+				D806F991B40DDA345549343C /* QuartzCore.framework */,
+				F9F36A0DA72FE348C3615D3C /* Security.framework */,
+				3EEF1E730B63485109E520DD /* UIKit.framework */,
+				3D6608E9CD8CE9373096A4D9 /* WebKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		8CB123C8A4391FE3F33902DE /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				DC746C787F0BC26CAC5AD947 /* vibedrop-mobile_iOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		99BAC5741DBD9F91FF18DF02 /* src */ = {
+			isa = PBXGroup;
+			children = (
+				080A89692663AADFC6C986A4 /* lib.rs */,
+				4B0D3D03751D659588475576 /* main.rs */,
+			);
+			name = src;
+			path = ../../src;
+			sourceTree = "<group>";
+		};
+		C9D0AAB80B67C26E5C96A5A6 /* vibedrop-mobile_iOS */ = {
+			isa = PBXGroup;
+			children = (
+				B124AE239844BD3C4C855CA8 /* Info.plist */,
+				B15A7993B2074E4001403EE5 /* vibedrop-mobile_iOS.entitlements */,
+			);
+			path = "vibedrop-mobile_iOS";
+			sourceTree = "<group>";
+		};
+		D96E23E40933C25F2C60F144 /* vibedrop-mobile */ = {
+			isa = PBXGroup;
+			children = (
+				5B5D8EB00AA6447CE2D93C8F /* main.mm */,
+				3FEE53EF35955F35B95EAB79 /* bindings */,
+			);
+			path = "vibedrop-mobile";
+			sourceTree = "<group>";
+		};
+		DEEEDBCAE2BB665550C073CC = {
+			isa = PBXGroup;
+			children = (
+				767814DDF07EB72CB4C9B9E2 /* assets */,
+				5769E7F3343758BE56944AA0 /* Assets.xcassets */,
+				B7722912B95859A489832722 /* LaunchScreen.storyboard */,
+				F9ACF105A120DE29547DCC1D /* Externals */,
+				7BEC8861E24D909E505EE6B2 /* Sources */,
+				99BAC5741DBD9F91FF18DF02 /* src */,
+				C9D0AAB80B67C26E5C96A5A6 /* vibedrop-mobile_iOS */,
+				7CF5D4F119C7F536A5BBB45B /* Frameworks */,
+				8CB123C8A4391FE3F33902DE /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		F9ACF105A120DE29547DCC1D /* Externals */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Externals;
+			sourceTree = "<group>";
+		};
+		"TEMP_222A5000-0411-4272-8E99-2A19B2178AFB" /* x86_64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = x86_64;
+			sourceTree = "<group>";
+		};
+		"TEMP_35F22464-54EB-4313-ADED-78A3571EE267" /* arm64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = arm64;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1F121AFF6B64DBCCCE8C0C24 /* vibedrop-mobile_iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = BC3FD1CBFD9E564698461418 /* Build configuration list for PBXNativeTarget "vibedrop-mobile_iOS" */;
+			buildPhases = (
+				8C1AFF8D22AD53E460DBFE73 /* Build Rust Code */,
+				9EAD65E5D22CF7E1227B3AD0 /* Sources */,
+				7027BB0089700809514D5C20 /* Resources */,
+				E21036EDE7788BC92EAD4E1D /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "vibedrop-mobile_iOS";
+			packageProductDependencies = (
+			);
+			productName = "vibedrop-mobile_iOS";
+			productReference = DC746C787F0BC26CAC5AD947 /* vibedrop-mobile_iOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		BBF71CC6D48C1567ECE3A239 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = 907F2A98EDF4F7353A28E23F /* Build configuration list for PBXProject "vibedrop-mobile" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = DEEEDBCAE2BB665550C073CC;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 8CB123C8A4391FE3F33902DE /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				1F121AFF6B64DBCCCE8C0C24 /* vibedrop-mobile_iOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		7027BB0089700809514D5C20 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6A26DA7FBC7BD2785752740C /* Assets.xcassets in Resources */,
+				FBB1A3077F6C6ABDF019BABB /* LaunchScreen.storyboard in Resources */,
+				A732081D26B8D7ED2AC2E53B /* assets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		8C1AFF8D22AD53E460DBFE73 /* Build Rust Code */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Code";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a",
+				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "${SRCROOT}/../../../../scripts/run-tauri-ios-xcode-script.sh -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		9EAD65E5D22CF7E1227B3AD0 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				958659BF5690525589BB5164 /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		0F3F91069D7DC3823E223B83 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "vibedrop-mobile_iOS/vibedrop-mobile_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "vibedrop-mobile_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME) $(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME) $(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.vibedrop.mobile;
+				PRODUCT_NAME = "VibeDrop";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+				DEVELOPMENT_TEAM = "RU5468UXDG";
+			};
+			name = release;
+		};
+		7C73C8F5F3FE7CBC06B9D243 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "vibedrop-mobile_iOS/vibedrop-mobile_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "vibedrop-mobile_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME) $(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME) $(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.vibedrop.mobile;
+				PRODUCT_NAME = "VibeDrop";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+				DEVELOPMENT_TEAM = "RU5468UXDG";
+			};
+			name = debug;
+		};
+		E03A7E2B76C2A8C2EA7D0950 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = debug;
+		};
+		E225BDC311A95B696E9A4FD2 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		907F2A98EDF4F7353A28E23F /* Build configuration list for PBXProject "vibedrop-mobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E03A7E2B76C2A8C2EA7D0950 /* debug */,
+				E225BDC311A95B696E9A4FD2 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		BC3FD1CBFD9E564698461418 /* Build configuration list for PBXNativeTarget "vibedrop-mobile_iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7C73C8F5F3FE7CBC06B9D243 /* debug */,
+				0F3F91069D7DC3823E223B83 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = BBF71CC6D48C1567ECE3A239 /* Project object */;
+}

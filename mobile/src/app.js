@@ -3,25 +3,31 @@
 // ============================================
 
 // ---- 常量 ----
-const HEARTBEAT_INTERVAL = 5000;
-const HEARTBEAT_TIMEOUT = 10000;
-const RECONNECT_INTERVAL = 3000;
+const HEARTBEAT_INTERVAL = 15000;
+const HEARTBEAT_TIMEOUT = 45000;
+const RECONNECT_BASE_INTERVAL = 2000;
+const RECONNECT_MAX_INTERVAL = 30000;
 const HISTORY_KEY = 'voicedrop_history';
 const SETTINGS_KEY = 'voicedrop_settings';
 const CLIENT_IDENTITY_KEY = 'vibedrop_client_identity';
 const MAX_IMAGE_FILE_BYTES = 10 * 1024 * 1024;
-const MAX_FILE_TRANSFER_BYTES = 32 * 1024 * 1024;
+const FILE_TRANSFER_CHUNK_BYTES = 192 * 1024;
+const FILE_TRANSFER_START_TIMEOUT_MS = 10000;
+const FILE_TRANSFER_ACK_TIMEOUT_MS = 10 * 60 * 1000;
+const FILE_TRANSFER_WS_BUFFER_HIGH_WATER_BYTES = 768 * 1024;
+const FILE_TRANSFER_WS_BUFFER_POLL_MS = 20;
 const HEATMAP_VISIBLE_DAYS = 5;
-const HEATMAP_RENDER_BUFFER_DAYS = 14;
 const HEATMAP_HOUR_SLOTS = 24;
-const HEATMAP_COLUMN_STEP = 52;
-const HEATMAP_DRAG_THRESHOLD = 8;
-const HEATMAP_INERTIA_MS = 180;
 const HISTORY_RENDER_INITIAL_BATCH = 12;
 const HISTORY_RENDER_BATCH_SIZE = 20;
 const DESKTOP_DISCOVERY_DEFAULT_PORT = 9001;
 const DESKTOP_PAIRING_POLL_MS = 1200;
 const MEDIA_OPENER_KINDS = ['image', 'video'];
+const NEARBY_REORDER_LONG_PRESS_MS = 260;
+const NEARBY_REORDER_CANCEL_DISTANCE = 10;
+const NEARBY_REORDER_HINT_KEY = 'vibedrop_nearby_reorder_hint_seen';
+const SMART_DISCOVERY_REFRESH_COOLDOWN_MS = 15000;
+const DIAGNOSTICS_REFRESH_INTERVAL_MS = 1000;
 const DEFAULT_HISTORY_FILTERS = {
     device: 'all',
     quickTime: 'all',
@@ -32,12 +38,16 @@ const DEFAULT_HISTORY_FILTERS = {
     endTime: '',
     kind: 'all',
     status: 'all',
+    query: '',
 };
 
 // ---- 状态 ----
 const connections = {}; // key = device.id, value = { ws, authenticated, hostname, ... }
 const incomingDesktopTransfers = {};
-let pendingSharedContent = null;
+const outboundDesktopFileTransfers = {};
+const sendDrafts = new Map();
+let sendDraftFocusState = null;
+let pendingSharedContents = [];
 let currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS };
 let historyDatePickerState = {
     field: null,
@@ -51,16 +61,11 @@ let historyHeatmapState = {
     rangeToken: '',
     selectionDate: '',
     selectionHour: null,
-    dragPointerId: null,
-    dragStartX: 0,
-    dragOffsetX: 0,
-    dragLastX: 0,
-    dragLastTime: 0,
-    dragVelocity: 0,
-    dragMoved: false,
-    dragMinOffsetX: 0,
-    dragMaxOffsetX: 0,
     suppressCellClickUntil: 0,
+    scrollFrame: 0,
+    renderedEntries: [],
+    renderedCounts: new Map(),
+    renderedBounds: null,
 };
 let nearbyDesktopState = {
     items: [],
@@ -68,6 +73,35 @@ let nearbyDesktopState = {
     scanError: '',
     pairing: null,
     pollTimer: null,
+};
+let smartDiscoveryRefreshState = {
+    inFlight: null,
+    lastStartedAt: 0,
+};
+let connectionDiagnosticsState = {
+    pollTimer: null,
+    inFlight: null,
+    frontend: null,
+    background: null,
+    discovery: null,
+    error: '',
+};
+let nearbyDesktopReorderState = {
+    pointerId: null,
+    list: null,
+    item: null,
+    placeholder: null,
+    deviceId: '',
+    originX: 0,
+    originY: 0,
+    originLeft: 0,
+    originTop: 0,
+    offsetX: 0,
+    offsetY: 0,
+    itemWidth: 0,
+    itemHeight: 0,
+    longPressTimer: null,
+    active: false,
 };
 let historyMediaPreviewInitialized = false;
 let historyMediaPreviewState = {
@@ -125,32 +159,37 @@ window.addEventListener('vibedrop:photoswipe-ready', () => {
 // ---- DOM 缓存 ----
 const $ = (id) => document.getElementById(id);
 let clientIdentity = getClientIdentity();
+let nativeCapabilityWatcherStarted = false;
+let lastNativeCapabilityState = supportsNativeFileReceive();
 
 // ---- 初始化 ----
 document.addEventListener('DOMContentLoaded', async () => {
     clientIdentity = getClientIdentity();
     await loadPersistentHistory(); // 从文件恢复历史（优先于 localStorage）
-    loadSettings();
-    syncNativeBackgroundClipboardConfig(clientIdentity);
+    const hasSavedDevices = loadSettings();
+    if (!hasSavedDevices) {
+        syncNativeBackgroundClipboardConfig(clientIdentity, []);
+    }
     initNavigation();
     initSettingsButton();
     initMediaOpenerSettings();
     initNearbyDesktopDiscovery();
+    initConnectionDiagnostics();
     initHistoryActions();
     initHistoryFilterControls();
     initHistoryHeatmapInteractions();
     initHistoryMediaPreview();
     initHistoryMediaViewer();
     initNativeShareInbox();
+    startNativeCapabilityWatcher();
     await loadPendingSharedContent();
-    void discoverNearbyDesktops({ silent: true, syncKnownDevices: true });
 });
 
 // ---- 持久化存储（Tauri 文件系统）----
 async function loadPersistentHistory() {
-    if (!window.__TAURI__) return;
+    if (!supportsNativeFileReceive()) return;
     try {
-        const data = await window.__TAURI__.core.invoke('load_history');
+        const data = await invokeNative('load_history');
         if (data && data !== '[]') {
             setStoredHistoryRaw(data);
         }
@@ -158,32 +197,86 @@ async function loadPersistentHistory() {
 }
 
 function persistHistory() {
-    if (!window.__TAURI__) return;
+    if (!supportsNativeFileReceive()) return;
     const data = localStorage.getItem(HISTORY_KEY) || '[]';
-    window.__TAURI__.core.invoke('save_history', { data }).catch(() => {});
+    invokeNative('save_history', { data }).catch(() => {});
 }
 
-function syncNativeBackgroundClipboardConfig(identity = clientIdentity) {
+function startNativeCapabilityWatcher() {
+    if (nativeCapabilityWatcherStarted) {
+        return;
+    }
+
+    nativeCapabilityWatcherStarted = true;
+    lastNativeCapabilityState = supportsNativeFileReceive();
+    if (lastNativeCapabilityState) {
+        return;
+    }
+
+    let remainingChecks = 40;
+    const poll = () => {
+        const currentState = supportsNativeFileReceive();
+        if (currentState !== lastNativeCapabilityState) {
+            lastNativeCapabilityState = currentState;
+            if (currentState) {
+                console.log('检测到 Tauri 原生 bridge 已就绪，刷新原生能力状态');
+                handleNativeCapabilityReady();
+                return;
+            }
+        }
+
+        if (remainingChecks <= 0) {
+            return;
+        }
+        remainingChecks -= 1;
+        window.setTimeout(poll, 150);
+    };
+
+    window.setTimeout(poll, 150);
+}
+
+function handleNativeCapabilityReady() {
+    clientIdentity = getClientIdentity();
+    void loadPersistentHistory();
+    void loadPendingSharedContent();
+    reconnectDevicesForNativeCapability();
+    renderNearbyDesktops();
+}
+
+function reconnectDevicesForNativeCapability() {
+    console.log('原生接收能力已就绪，重连已保存设备以刷新 can_receive_files 能力');
+    void connectAll({
+        refreshDiscovery: true,
+        alignNativeBackgroundConfig: true,
+        forceDiscovery: true,
+        discoveryReason: 'native-capability-ready',
+    });
+}
+
+function buildNativeBackgroundClipboardDevices(devices = getDevices()) {
+    return devices
+        .filter((device) => device && device.id && device.ip && device.pin)
+        .map((device) => ({
+            id: device.id,
+            name: device.name || '设备',
+            ip: String(device.ip || '').trim(),
+            port: String(device.port || '9001').trim() || '9001',
+            pin: String(device.pin || '').trim(),
+        }));
+}
+
+function syncNativeBackgroundClipboardConfig(identity = clientIdentity, devices = getDevices()) {
     if (!window.NativeBackgroundClipboard || !window.NativeBackgroundClipboard.syncConfig) {
         return;
     }
 
     try {
-        const devices = getDevices()
-            .filter((device) => device && device.id && device.ip && device.pin)
-            .map((device) => ({
-                id: device.id,
-                name: device.name || '设备',
-                ip: String(device.ip || '').trim(),
-                port: String(device.port || '9001').trim() || '9001',
-                pin: String(device.pin || '').trim(),
-            }));
         const payload = JSON.stringify({
             identity: identity ? {
                 id: identity.id,
                 name: identity.name,
             } : null,
-            devices,
+            devices: buildNativeBackgroundClipboardDevices(devices),
         });
         window.NativeBackgroundClipboard.syncConfig(payload);
     } catch (error) {
@@ -256,6 +349,14 @@ function saveDevices(devices) {
         devices: normalized,
     });
     syncNativeBackgroundClipboardConfig();
+}
+
+function rerenderAllDeviceViews(devices = getDevices()) {
+    renderDeviceCards(devices);
+    renderSendCards(devices);
+    renderHistoryFilters(devices);
+    renderNearbyDesktops();
+    return devices;
 }
 
 function getStoredSettingsObject() {
@@ -375,10 +476,11 @@ function supportsMediaOpenerPreferences() {
 }
 
 function normalizeDeviceRecord(device) {
+    const rawHostName = String(device?.hostName || device?.hostname || '').trim();
     return {
         id: String(device?.id || newDeviceId()),
         name: String(device?.name || '未命名设备').trim() || '未命名设备',
-        hostName: String(device?.hostName || device?.hostname || '').trim(),
+        hostName: looksLikeTargetHost(rawHostName) ? rawHostName : '',
         ip: String(device?.ip || '').trim(),
         port: String(device?.port || DESKTOP_DISCOVERY_DEFAULT_PORT).trim() || String(DESKTOP_DISCOVERY_DEFAULT_PORT),
         pin: String(device?.pin || '').trim(),
@@ -553,6 +655,15 @@ function getDeviceIdentityLabels(device, historyEntries = readStoredHistoryEntri
     ].filter(Boolean)));
 }
 
+function getDeviceHostIdentityTokens(device, historyEntries = readStoredHistoryEntries()) {
+    return Array.from(new Set([
+        String(device?.hostName || '').trim(),
+        ...getKnownDeviceHostNames(device, historyEntries),
+    ]
+        .map((value) => normalizeDesktopName(value))
+        .filter((value) => value && looksLikeTargetHost(value))));
+}
+
 function labelsLookLikeSameMachine(a, b) {
     const normalizedA = normalizeMachineIdentity(a);
     const normalizedB = normalizeMachineIdentity(b);
@@ -663,6 +774,42 @@ function shouldMergeDeviceRecords(primary, secondary, historyEntries = readStore
     return Boolean((primary.serverId && !secondary.serverId) || (!primary.serverId && secondary.serverId));
 }
 
+function shouldForceMergeDeviceRecords(primary, secondary, historyEntries = readStoredHistoryEntries()) {
+    if (!primary || !secondary) {
+        return false;
+    }
+
+    const primaryHostTokens = getDeviceHostIdentityTokens(primary, historyEntries);
+    const secondaryHostTokens = getDeviceHostIdentityTokens(secondary, historyEntries);
+    const exactHostOverlap = primaryHostTokens.some((left) => secondaryHostTokens.includes(left));
+    const primaryHasRealHost = primaryHostTokens.length > 0;
+    const secondaryHasRealHost = secondaryHostTokens.length > 0;
+
+    if (
+        primary.serverId
+        && secondary.serverId
+        && primary.serverId !== secondary.serverId
+        && primaryHasRealHost
+        && secondaryHasRealHost
+        && !exactHostOverlap
+    ) {
+        return false;
+    }
+
+    const primaryLabels = getDeviceIdentityLabels(primary, historyEntries);
+    const secondaryLabels = getDeviceIdentityLabels(secondary, historyEntries);
+    const fuzzyOverlap = primaryLabels.some((left) => secondaryLabels.some((right) => labelsLookLikeSameMachine(left, right)));
+    if (!fuzzyOverlap) {
+        return false;
+    }
+
+    if (exactHostOverlap) {
+        return true;
+    }
+
+    return !primaryHasRealHost || !secondaryHasRealHost;
+}
+
 function normalizeDevices(devices = [], historyEntries = readStoredHistoryEntries()) {
     const merged = new Map();
     const order = [];
@@ -691,7 +838,10 @@ function normalizeDevices(devices = [], historyEntries = readStoredHistoryEntrie
     const normalized = [];
     order.forEach((key) => {
         const device = merged.get(key);
-        const mergeIndex = normalized.findIndex((existing) => shouldMergeDeviceRecords(existing, device, historyEntries));
+        const mergeIndex = normalized.findIndex((existing) => (
+            shouldMergeDeviceRecords(existing, device, historyEntries)
+            || shouldForceMergeDeviceRecords(existing, device, historyEntries)
+        ));
         if (mergeIndex === -1) {
             normalized.push(device);
             return;
@@ -722,6 +872,8 @@ function ensureConnection(deviceId) {
         connections[deviceId] = {
             ws: null, authenticated: false, hostname: null,
             heartbeatTimer: null, timeoutTimer: null, reconnectTimer: null,
+            heartbeatPending: false, heartbeatStartedAt: 0, lastMessageAt: 0,
+            reconnectAttempts: 0,
             _sendCallback: null,
             incomingTransferQueue: Promise.resolve(),
         };
@@ -741,7 +893,7 @@ function getClientIdentity() {
                     id: parsed.id,
                     name: buildClientDisplayName(parsed.id, nativeInfo) || parsed.name || buildClientDisplayName(parsed.id),
                 };
-                persistClientIdentity(identity);
+                persistClientIdentity(identity, { syncNative: false });
                 return identity;
             }
         }
@@ -754,14 +906,16 @@ function getClientIdentity() {
         id,
         name: buildClientDisplayName(id, nativeInfo),
     };
-    persistClientIdentity(identity);
+    persistClientIdentity(identity, { syncNative: false });
     return identity;
 }
 
-function persistClientIdentity(identity) {
+function persistClientIdentity(identity, { syncNative = true } = {}) {
     try {
         localStorage.setItem(CLIENT_IDENTITY_KEY, JSON.stringify(identity));
-        syncNativeBackgroundClipboardConfig(identity);
+        if (syncNative) {
+            syncNativeBackgroundClipboardConfig(identity);
+        }
     } catch (error) {
         console.warn('保存客户端标识失败', error);
     }
@@ -785,6 +939,54 @@ function getNativeDeviceInfo() {
     }
 }
 
+function looksLikeIOSUserAgent() {
+    const ua = navigator.userAgent || '';
+    const platform = navigator.platform || '';
+    return /iPhone|iPad|iPod/i.test(ua) || (platform === 'MacIntel' && Number(navigator.maxTouchPoints || 0) > 1);
+}
+
+function getNativeMobilePlatform() {
+    if (!supportsNativeFileReceive()) {
+        return 'web';
+    }
+
+    const ua = navigator.userAgent || '';
+    if (
+        window.NativeClipboard
+        || window.NativeShare
+        || window.NativeBackgroundClipboard
+        || window.NativeMediaLibrary
+        || window.NativeDevice
+        || /Android/i.test(ua)
+    ) {
+        return 'android';
+    }
+
+    if (looksLikeIOSUserAgent()) {
+        return 'ios';
+    }
+
+    return 'native';
+}
+
+function isIOSNativeApp() {
+    return getNativeMobilePlatform() === 'ios';
+}
+
+function getNativeMobileDefaultLabel() {
+    const platform = getNativeMobilePlatform();
+    if (platform === 'android') {
+        return 'Android 手机';
+    }
+    if (platform === 'ios') {
+        return 'iPhone';
+    }
+    if (platform === 'native') {
+        return '移动 App';
+    }
+    return '移动浏览器';
+}
+
 function buildClientDisplayName(clientId, nativeInfo = null) {
     const preferredName = nativeInfo?.friendlyName || nativeInfo?.marketName;
     if (preferredName) {
@@ -792,19 +994,34 @@ function buildClientDisplayName(clientId, nativeInfo = null) {
     }
 
     const suffix = String(clientId || '').slice(-4).toUpperCase();
-    const label = supportsNativeFileReceive() ? 'Android 手机' : '移动浏览器';
+    const label = getNativeMobileDefaultLabel();
     return suffix ? `${label} ${suffix}` : label;
 }
 
+function getNativeInvoker() {
+    const tauriInvoke = window.__TAURI__?.core?.invoke;
+    if (typeof tauriInvoke === 'function') {
+        return tauriInvoke.bind(window.__TAURI__.core);
+    }
+
+    const internalInvoke = window.__TAURI_INTERNALS__?.invoke;
+    if (typeof internalInvoke === 'function') {
+        return internalInvoke;
+    }
+
+    return null;
+}
+
 function supportsNativeFileReceive() {
-    return Boolean(window.__TAURI__ && window.__TAURI__.core && typeof window.__TAURI__.core.invoke === 'function');
+    return Boolean(getNativeInvoker());
 }
 
 function invokeNative(command, payload = {}) {
-    if (!supportsNativeFileReceive()) {
+    const invoke = getNativeInvoker();
+    if (!invoke) {
         return Promise.reject(new Error('当前环境不支持原生命令'));
     }
-    return window.__TAURI__.core.invoke(command, payload);
+    return invoke(command, payload);
 }
 
 function supportsNearbyDesktopDiscovery() {
@@ -823,7 +1040,13 @@ function loadSettings() {
         renderSendCards(devices);
         renderHistoryFilters(devices);
         showView('send-view');
-        connectAll();
+        void connectAll({
+            refreshDiscovery: true,
+            alignNativeBackgroundConfig: true,
+            forceDiscovery: true,
+            discoveryReason: 'startup',
+        });
+        return true;
     } else {
         // 首次打开：创建一个空设备
         const defaultDevices = [{ id: newDeviceId(), name: '设备 1', ip: '', port: '9001', pin: '' }];
@@ -839,6 +1062,7 @@ function loadSettings() {
         renderDeviceCards(defaultDevices);
         renderSendCards(defaultDevices);
         renderHistoryFilters(defaultDevices);
+        return false;
     }
 }
 
@@ -858,7 +1082,7 @@ function saveSettingsFromUI() {
         });
     });
     saveDevices(devices);
-    return devices;
+    return getDevices();
 }
 
 function getDevicesFromUI() {
@@ -958,10 +1182,503 @@ function initNearbyDesktopDiscovery() {
         }
     });
 
+    initNearbyDesktopReorder();
     renderNearbyDesktops();
 }
 
-async function discoverNearbyDesktops({ silent = false, syncKnownDevices = false } = {}) {
+function initConnectionDiagnostics() {
+    const panel = $('connection-diagnostics-panel');
+    if (!panel) {
+        return;
+    }
+    panel.addEventListener('toggle', () => {
+        renderConnectionDiagnostics();
+        syncConnectionDiagnosticsPolling();
+    });
+    renderConnectionDiagnostics();
+}
+
+function syncConnectionDiagnosticsPolling() {
+    const panel = $('connection-diagnostics-panel');
+    const settingsVisible = Boolean($('settings-view')) && !$('settings-view').classList.contains('hidden');
+    const shouldPoll = Boolean(panel?.open && settingsVisible);
+
+    if (!shouldPoll) {
+        clearInterval(connectionDiagnosticsState.pollTimer);
+        connectionDiagnosticsState.pollTimer = null;
+        return;
+    }
+
+    if (connectionDiagnosticsState.pollTimer) {
+        return;
+    }
+
+    void refreshConnectionDiagnostics();
+    connectionDiagnosticsState.pollTimer = setInterval(() => {
+        void refreshConnectionDiagnostics();
+    }, DIAGNOSTICS_REFRESH_INTERVAL_MS);
+}
+
+async function refreshConnectionDiagnostics() {
+    if (connectionDiagnosticsState.inFlight) {
+        return connectionDiagnosticsState.inFlight;
+    }
+
+    connectionDiagnosticsState.frontend = buildFrontendConnectionDiagnostics();
+    renderConnectionDiagnostics();
+
+    connectionDiagnosticsState.inFlight = (async () => {
+        const settled = await Promise.allSettled([
+            fetchBackgroundClipboardDiagnostics(),
+            fetchDiscoveryDiagnostics(),
+        ]);
+
+        const errors = [];
+        const [backgroundResult, discoveryResult] = settled;
+        connectionDiagnosticsState.background = backgroundResult.status === 'fulfilled'
+            ? backgroundResult.value
+            : null;
+        connectionDiagnosticsState.discovery = discoveryResult.status === 'fulfilled'
+            ? discoveryResult.value
+            : null;
+
+        if (backgroundResult.status === 'rejected') {
+            errors.push(`后台状态读取失败：${backgroundResult.reason?.message || backgroundResult.reason}`);
+        } else if (backgroundResult.value?.error) {
+            errors.push(`后台状态异常：${backgroundResult.value.error}`);
+        }
+
+        if (discoveryResult.status === 'rejected') {
+            errors.push(`发现状态读取失败：${discoveryResult.reason?.message || discoveryResult.reason}`);
+        }
+
+        connectionDiagnosticsState.error = errors.join('；');
+        connectionDiagnosticsState.frontend = buildFrontendConnectionDiagnostics();
+        renderConnectionDiagnostics();
+    })().finally(() => {
+        connectionDiagnosticsState.inFlight = null;
+    });
+
+    return connectionDiagnosticsState.inFlight;
+}
+
+function fetchBackgroundClipboardDiagnostics() {
+    if (!window.NativeBackgroundClipboard || typeof window.NativeBackgroundClipboard.getStatus !== 'function') {
+        return Promise.resolve(null);
+    }
+
+    try {
+        const raw = window.NativeBackgroundClipboard.getStatus();
+        if (!raw) {
+            return Promise.resolve(null);
+        }
+        return Promise.resolve(typeof raw === 'string' ? JSON.parse(raw) : raw);
+    } catch (error) {
+        return Promise.reject(error);
+    }
+}
+
+function fetchDiscoveryDiagnostics() {
+    if (!supportsNativeFileReceive()) {
+        return Promise.resolve(null);
+    }
+    return invokeNative('get_discovery_diagnostics');
+}
+
+function buildFrontendConnectionDiagnostics(devices = getDevices()) {
+    const items = devices.map((device) => {
+        const conn = connections[device.id] || null;
+        return {
+            id: device.id,
+            name: device.name || device.hostName || device.id,
+            ip: device.ip || '',
+            port: String(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+            hostName: device.hostName || '',
+            serverId: device.serverId || '',
+            authenticated: Boolean(conn?.authenticated),
+            currentHost: conn?.hostname || '',
+            hasSocket: Boolean(conn?.ws),
+        };
+    });
+    return {
+        devices: items,
+        deviceCount: items.length,
+        authenticatedCount: items.filter((item) => item.authenticated).length,
+        updatedAtMs: Date.now(),
+    };
+}
+
+function renderConnectionDiagnostics() {
+    const summary = $('connection-diagnostics-summary');
+    const error = $('connection-diagnostics-error');
+    const sections = $('connection-diagnostics-sections');
+    const panel = $('connection-diagnostics-panel');
+    if (!summary || !error || !sections || !panel) {
+        return;
+    }
+
+    if (!panel.open) {
+        summary.textContent = '展开后加载诊断信息。';
+        error.classList.add('hidden');
+        error.textContent = '';
+        sections.innerHTML = '';
+        return;
+    }
+
+    const frontend = connectionDiagnosticsState.frontend || buildFrontendConnectionDiagnostics();
+    const background = connectionDiagnosticsState.background;
+    const discovery = connectionDiagnosticsState.discovery;
+
+    summary.textContent = buildConnectionDiagnosticsSummary(frontend, background, discovery);
+
+    if (connectionDiagnosticsState.error) {
+        error.textContent = connectionDiagnosticsState.error;
+        error.classList.remove('hidden');
+    } else {
+        error.textContent = '';
+        error.classList.add('hidden');
+    }
+
+    sections.innerHTML = [
+        renderFrontendDiagnosticsSection(frontend),
+        renderBackgroundDiagnosticsSection(background),
+        renderDiscoveryDiagnosticsSection(discovery),
+    ].join('');
+}
+
+function buildConnectionDiagnosticsSummary(frontend, background, discovery) {
+    const frontendText = frontend
+        ? `前台已认证 ${frontend.authenticatedCount}/${frontend.deviceCount || 0}`
+        : '前台状态未加载';
+    const backgroundAuthenticated = Array.isArray(background?.connections)
+        ? background.connections.filter((item) => item.authenticated).length
+        : 0;
+    const backgroundText = background
+        ? `后台已认证 ${backgroundAuthenticated}/${Number(background.configuredDeviceCount || 0)}`
+        : '后台状态未加载';
+    const discoveryText = summarizeDiscoveryPath(discovery);
+    return [frontendText, backgroundText, discoveryText].filter(Boolean).join('；');
+}
+
+function renderFrontendDiagnosticsSection(frontend) {
+    const pillTone = frontend?.authenticatedCount > 0 ? '' : 'is-warn';
+    const pillText = frontend
+        ? `已认证 ${frontend.authenticatedCount}/${frontend.deviceCount || 0}`
+        : '未加载';
+    const items = frontend?.devices?.length
+        ? frontend.devices.map((device) => `
+            <div class="diagnostics-item">
+                <div class="diagnostics-item-head">
+                    <div class="diagnostics-item-title">${escapeHtml(device.name || '未命名设备')}</div>
+                    ${diagnosticsPillHtml(device.authenticated ? '前台已认证' : (device.hasSocket ? '前台已连通' : '前台未连接'), device.authenticated ? '' : 'is-warn')}
+                </div>
+                <div class="diagnostics-item-meta">保存地址：${escapeHtml(device.ip ? `${device.ip}:${device.port}` : '未配置')}</div>
+                <div class="diagnostics-item-subtle">hostName：${escapeHtml(device.hostName || '未记录')} · serverId：${escapeHtml(device.serverId || '未记录')}</div>
+                <div class="diagnostics-item-subtle">最近前台主机名：${escapeHtml(device.currentHost || '暂无')}</div>
+            </div>
+        `).join('')
+        : '<div class="diagnostics-empty">当前没有已保存设备。</div>';
+
+    return `
+        <section class="diagnostics-section">
+            <div class="diagnostics-section-title">
+                <strong>前端主连接</strong>
+                ${diagnosticsPillHtml(pillText, pillTone)}
+            </div>
+            <div class="diagnostics-list">${items}</div>
+        </section>
+    `;
+}
+
+function renderBackgroundDiagnosticsSection(background) {
+    if (!background) {
+        return `
+            <section class="diagnostics-section">
+                <div class="diagnostics-section-title">
+                    <strong>原生后台剪贴板</strong>
+                    ${diagnosticsPillHtml('未加载', 'is-warn')}
+                </div>
+                <div class="diagnostics-empty">当前环境未暴露后台诊断接口，或诊断信息尚未返回。</div>
+            </section>
+        `;
+    }
+
+    const connectionMap = new Map((background.connections || []).map((item) => [item.id, item]));
+    const configuredDevices = Array.isArray(background.configuredDevices) ? background.configuredDevices : [];
+    const items = configuredDevices.length
+        ? configuredDevices.map((device) => {
+            const connection = connectionMap.get(device.id) || null;
+            const status = connection?.status || 'idle';
+            const tone = toneForDiagnosticsStatus(status, Boolean(connection?.authenticated), Boolean(connection?.lastError));
+            const lastUpdate = connection?.lastStateAtMs ? formatDiagnosticsWhen(connection.lastStateAtMs) : '暂无';
+            return `
+                <div class="diagnostics-item">
+                    <div class="diagnostics-item-head">
+                        <div class="diagnostics-item-title">${escapeHtml(device.name || '未命名设备')}</div>
+                        ${diagnosticsPillHtml(formatBackgroundStatusLabel(status, connection), tone)}
+                    </div>
+                    <div class="diagnostics-item-meta">后台目标：${escapeHtml(device.ip ? `${device.ip}:${device.port}` : '未配置')}</div>
+                    <div class="diagnostics-item-subtle">PIN：${device.pinPresent ? '已配置' : '未配置'} · 最近状态更新时间：${escapeHtml(lastUpdate)}</div>
+                    <div class="diagnostics-item-subtle">最近错误：${escapeHtml(connection?.lastError || '无')}</div>
+                </div>
+            `;
+        }).join('')
+        : '<div class="diagnostics-empty">后台当前没有已配置设备。</div>';
+
+    const gateLabel = background.gateActive
+        ? `门控中，剩余 ${formatDurationMs(background.gateRemainingMs || 0)}`
+        : '门控已解除';
+    const gateTone = background.gateActive ? 'is-warn' : '';
+    const appliedText = background.lastClipboardAppliedAtMs
+        ? `最近后台剪贴板写入：${formatDiagnosticsWhen(background.lastClipboardAppliedAtMs)}`
+        : '最近后台剪贴板写入：暂无';
+
+    return `
+        <section class="diagnostics-section">
+            <div class="diagnostics-section-title">
+                <strong>原生后台剪贴板</strong>
+                ${diagnosticsPillHtml(gateLabel, gateTone)}
+            </div>
+            <div class="diagnostics-item">
+                <div class="diagnostics-item-meta">最近配置刷新：${escapeHtml(formatDiagnosticsWhen(background.lastReloadAtMs || 0))}</div>
+                <div class="diagnostics-item-subtle">${escapeHtml(appliedText)}${background.lastClipboardSourceName ? ` · 来源：${escapeHtml(background.lastClipboardSourceName)}` : ''}</div>
+            </div>
+            <div class="diagnostics-list">${items}</div>
+        </section>
+    `;
+}
+
+function renderDiscoveryDiagnosticsSection(discovery) {
+    if (!discovery) {
+        return `
+            <section class="diagnostics-section">
+                <div class="diagnostics-section-title">
+                    <strong>智能发现</strong>
+                    ${diagnosticsPillHtml('未加载', 'is-warn')}
+                </div>
+                <div class="diagnostics-empty">最近一次发现快照尚未返回。</div>
+            </section>
+        `;
+    }
+
+    const summaryTone = discovery.last_error
+        ? 'is-error'
+        : discovery.skip_http_sweep
+            ? ''
+            : Number(discovery.full_http_target_count || 0) > 0
+                ? 'is-warn'
+                : '';
+    const strategyText = summarizeDiscoveryPath(discovery);
+    const interfaceItems = Array.isArray(discovery.candidate_interfaces) && discovery.candidate_interfaces.length
+        ? discovery.candidate_interfaces.map((item) => `
+            <div class="diagnostics-item">
+                <div class="diagnostics-item-head">
+                    <div class="diagnostics-item-title">${escapeHtml(item.interface_name || 'unknown')}</div>
+                    ${diagnosticsPillHtml(item.allow_http_sweep ? '参与 HTTP 扫描' : '不扫 HTTP', item.allow_http_sweep ? '' : 'is-warn')}
+                </div>
+                <div class="diagnostics-item-meta">${escapeHtml(item.ip || '')}</div>
+                <div class="diagnostics-item-subtle">priority=${escapeHtml(String(item.priority ?? ''))} · directed_broadcast=${item.allow_directed_broadcast ? 'true' : 'false'} · http_sweep=${item.allow_http_sweep ? 'true' : 'false'}</div>
+            </div>
+        `).join('')
+        : '<div class="diagnostics-empty">最近一次发现没有记录接口快照。</div>';
+    const directTargets = Array.isArray(discovery.direct_targets) ? discovery.direct_targets : [];
+    const directTargetSummary = directTargets.length
+        ? directTargets.map((target) => `${target.target_host}:${target.port} (${target.target_kind})`).join('，')
+        : '无';
+    const mergedResults = Array.isArray(discovery.merged_results) ? discovery.merged_results : [];
+    const mergedResultSummary = mergedResults.length
+        ? mergedResults.map((item) => `${item.hostname || '未命名电脑'} -> ${item.ip}:${item.port}`).join('，')
+        : '无';
+
+    return `
+        <section class="diagnostics-section">
+            <div class="diagnostics-section-title">
+                <strong>智能发现</strong>
+                ${diagnosticsPillHtml(strategyText, summaryTone)}
+            </div>
+            <div class="diagnostics-item">
+                <div class="diagnostics-item-meta">开始：${escapeHtml(formatDiagnosticsWhen(discovery.last_started_at_ms || 0))} · 结束：${escapeHtml(formatDiagnosticsWhen(discovery.last_finished_at_ms || 0))}</div>
+                <div class="diagnostics-item-subtle">耗时：${escapeHtml(formatDurationMs(discovery.last_duration_ms || 0))} · UDP 结果：${escapeHtml(String(discovery.udp_result_count || 0))} · 定向命中：${escapeHtml(`${discovery.direct_http_result_count || 0}/${discovery.expected_direct_devices || 0}`)} · 全量 HTTP 目标：${escapeHtml(String(discovery.full_http_target_count || 0))} · 合并结果：${escapeHtml(String(discovery.merged_result_count || 0))}</div>
+                <div class="diagnostics-item-subtle">定向目标：${escapeHtml(directTargetSummary)}</div>
+                <div class="diagnostics-item-subtle">发现结果：${escapeHtml(mergedResultSummary)}</div>
+                <div class="diagnostics-item-subtle">最近错误：${escapeHtml(discovery.last_error || '无')}</div>
+            </div>
+            <div class="diagnostics-list">${interfaceItems}</div>
+        </section>
+    `;
+}
+
+function summarizeDiscoveryPath(discovery) {
+    if (!discovery) {
+        return '发现状态未加载';
+    }
+    if (discovery.in_progress) {
+        return '发现进行中';
+    }
+    if (discovery.last_error) {
+        return '最近发现失败';
+    }
+    if (discovery.skip_http_sweep) {
+        return '定向探测命中，已跳过子网扫描';
+    }
+    if (Number(discovery.full_http_target_count || 0) > 0) {
+        return `回退子网扫描 ${discovery.full_http_target_count} 个目标`;
+    }
+    return '最近发现已完成';
+}
+
+function diagnosticsPillHtml(text, tone = '') {
+    const className = tone ? `diagnostics-pill ${tone}` : 'diagnostics-pill';
+    return `<span class="${className}">${escapeHtml(text)}</span>`;
+}
+
+function toneForDiagnosticsStatus(status, authenticated = false, hasError = false) {
+    if (hasError) {
+        return 'is-error';
+    }
+    if (authenticated) {
+        return '';
+    }
+    return status === 'connecting' || status === 'open' || status === 'scheduled_reconnect'
+        ? 'is-warn'
+        : 'is-warn';
+}
+
+function formatBackgroundStatusLabel(status, connection = null) {
+    const labels = {
+        idle: '空闲',
+        connecting: '连接中',
+        open: '已打开待认证',
+        authenticated: '已认证',
+        failed: '连接失败',
+        scheduled_reconnect: '等待重连',
+        closed: '已关闭',
+    };
+    if (connection?.authenticated) {
+        return '已认证';
+    }
+    return labels[status] || status || '未知';
+}
+
+function formatDiagnosticsWhen(valueMs) {
+    const ms = Number(valueMs || 0);
+    if (!ms) {
+        return '暂无';
+    }
+    const date = new Date(ms);
+    if (Number.isNaN(date.getTime())) {
+        return '暂无';
+    }
+    return `${date.toLocaleTimeString('zh-CN', { hour12: false })} · ${formatRelativeTimeFromNow(ms)}`;
+}
+
+function formatRelativeTimeFromNow(valueMs) {
+    const delta = Date.now() - Number(valueMs || 0);
+    if (!Number.isFinite(delta)) {
+        return '未知';
+    }
+    if (delta < 1000) {
+        return '刚刚';
+    }
+    const seconds = Math.floor(delta / 1000);
+    if (seconds < 60) {
+        return `${seconds} 秒前`;
+    }
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) {
+        return `${minutes} 分钟前`;
+    }
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) {
+        return `${hours} 小时前`;
+    }
+    const days = Math.floor(hours / 24);
+    return `${days} 天前`;
+}
+
+function formatDurationMs(durationMs) {
+    const ms = Number(durationMs || 0);
+    if (!Number.isFinite(ms) || ms <= 0) {
+        return '0 ms';
+    }
+    if (ms < 1000) {
+        return `${Math.round(ms)} ms`;
+    }
+    const seconds = ms / 1000;
+    if (seconds < 60) {
+        return `${seconds.toFixed(seconds >= 10 ? 1 : 2)} s`;
+    }
+    const minutes = Math.floor(seconds / 60);
+    const remainSeconds = Math.round(seconds % 60);
+    return `${minutes} 分 ${remainSeconds} 秒`;
+}
+
+function hasSavedDevicesForSmartDiscovery() {
+    return getDevices().some((device) => device && (device.ip || device.serverId || device.hostName));
+}
+
+function buildNativeDiscoveryHints(devices = getDevices(), historyEntries = readStoredHistoryEntries()) {
+    return devices
+        .map((device) => normalizeDeviceRecord(device))
+        .map((device) => {
+            const hostnames = Array.from(new Set([
+                device.hostName,
+                ...getKnownDeviceHostNames(device, historyEntries),
+            ]
+                .map((value) => normalizeDesktopName(value))
+                .filter((value) => value && looksLikeTargetHost(value))));
+            const ip = String(device.ip || '').trim();
+            if (!ip && !hostnames.length) {
+                return null;
+            }
+            return {
+                deviceId: device.id,
+                serverId: device.serverId || '',
+                ip,
+                port: Number(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT) || DESKTOP_DISCOVERY_DEFAULT_PORT,
+                hostnames,
+            };
+        })
+        .filter(Boolean);
+}
+
+function requestSmartDiscoveryRefresh(reason = 'endpoint-refresh', { force = false } = {}) {
+    if (!supportsNearbyDesktopDiscovery() || !hasSavedDevicesForSmartDiscovery()) {
+        return Promise.resolve([]);
+    }
+
+    if (smartDiscoveryRefreshState.inFlight) {
+        return smartDiscoveryRefreshState.inFlight;
+    }
+
+    const now = Date.now();
+    if (!force && now - smartDiscoveryRefreshState.lastStartedAt < SMART_DISCOVERY_REFRESH_COOLDOWN_MS) {
+        return Promise.resolve(nearbyDesktopState.items);
+    }
+
+    smartDiscoveryRefreshState.lastStartedAt = now;
+    console.log(`[smart-discovery] refreshing saved endpoints: ${reason}`);
+    smartDiscoveryRefreshState.inFlight = discoverNearbyDesktops({
+        silent: true,
+        syncKnownDevices: true,
+        prioritizeSavedDevices: true,
+    })
+        .catch((error) => {
+            console.warn(`[smart-discovery] endpoint refresh failed: ${reason}`, error);
+            return [];
+        })
+        .finally(() => {
+            smartDiscoveryRefreshState.inFlight = null;
+        });
+
+    return smartDiscoveryRefreshState.inFlight;
+}
+
+async function discoverNearbyDesktops({
+    silent = false,
+    syncKnownDevices = false,
+    prioritizeSavedDevices = false,
+} = {}) {
     if (!supportsNearbyDesktopDiscovery()) {
         nearbyDesktopState.scanError = '当前浏览器模式不支持自动扫描，请继续使用手动 IP / PIN。';
         nearbyDesktopState.items = [];
@@ -975,7 +1692,14 @@ async function discoverNearbyDesktops({ silent = false, syncKnownDevices = false
     renderNearbyDesktops();
 
     try {
-        const discovered = await invokeNative('discover_desktops');
+        const payload = {};
+        if (prioritizeSavedDevices) {
+            const knownDevices = buildNativeDiscoveryHints();
+            if (knownDevices.length) {
+                payload.knownDevices = knownDevices;
+            }
+        }
+        const discovered = await invokeNative('discover_desktops', payload);
         nearbyDesktopState.items = Array.isArray(discovered) ? discovered.map((item) => ({
             ...item,
             ip: item.ip || '',
@@ -1026,6 +1750,8 @@ function renderNearbyDesktops() {
         ? '正在扫描当前局域网中的 VibeDrop 桌面端…'
         : '自动扫描当前局域网中的 VibeDrop 桌面端，发起配对后即可保存并自动连接。';
 
+    resetNearbyDesktopReorderState();
+
     const devices = getDevices();
     const visibleItems = buildVisibleNearbyDesktops(devices);
 
@@ -1043,6 +1769,11 @@ function renderNearbyDesktops() {
     empty.classList.add('hidden');
     list.innerHTML = visibleItems.map((desktop) => {
         const matched = resolveNearbyDesktopMatch(desktop, devices);
+        const displayName = matched?.name || desktop.displayName || desktop.hostname || '未命名电脑';
+        const metaLines = Array.from(new Set([
+            matched?.hostName || desktop.resolvedHostname || desktop.hostname || '',
+            desktop.ip ? `${desktop.ip}:${String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT)}` : '',
+        ].filter(Boolean)));
         const isConnected = matched && connections[matched.id]?.authenticated;
         const badgeText = isConnected ? '已连接' : matched ? '已配对' : '附近电脑';
         const primaryLabel = isConnected ? '已连接' : matched ? '连接' : '请求配对';
@@ -1050,13 +1781,15 @@ function renderNearbyDesktops() {
         const secondaryLabel = matched ? '查看参数' : '填入配置';
         const disabledAttr = nearbyDesktopState.pairing ? 'disabled' : '';
         const nearbyKey = getNearbyDesktopKey(desktop, devices);
+        const sortableDeviceId = matched?.id || '';
+        const sortableClass = sortableDeviceId ? ' is-sortable' : '';
 
         return `
-            <div class="nearby-desktop-item">
+            <div class="nearby-desktop-item${sortableClass}" data-nearby-key="${escapeHtml(nearbyKey)}"${sortableDeviceId ? ` data-sortable-device-id="${escapeHtml(sortableDeviceId)}"` : ''}>
                 <div class="nearby-desktop-top">
                     <div>
-                        <div class="nearby-desktop-name">${escapeHtml(desktop.hostname)}</div>
-                        <div class="nearby-desktop-meta">${escapeHtml(desktop.ip)}:${escapeHtml(String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT))}</div>
+                        <div class="nearby-desktop-name">${escapeHtml(displayName)}</div>
+                        <div class="nearby-desktop-meta">${metaLines.map((line) => escapeHtml(line)).join('<br>')}</div>
                     </div>
                     <span class="nearby-desktop-badge${matched ? ' is-paired' : ''}">${escapeHtml(badgeText)}</span>
                 </div>
@@ -1131,6 +1864,7 @@ function resolveNearbyDesktopMatch(desktop, devices = getDevices()) {
 function buildVisibleNearbyDesktops(devices = getDevices()) {
     const visible = [];
     const seen = new Set();
+    const discoveredByKey = new Map();
 
     nearbyDesktopState.items.forEach((desktop) => {
         const matched = matchSavedDevice(desktop, devices);
@@ -1138,6 +1872,57 @@ function buildVisibleNearbyDesktops(devices = getDevices()) {
             ...desktop,
             source: 'discovered',
             deviceId: matched?.id || desktop.deviceId || '',
+            displayName: matched?.name || desktop.hostname || desktop.resolvedHostname || '未命名电脑',
+        };
+        const key = getDesktopIdentityKey(item, matched);
+        if (!discoveredByKey.has(key)) {
+            discoveredByKey.set(key, item);
+        }
+    });
+
+    devices
+        .filter((device) => device && (device.ip || device.serverId))
+        .forEach((device) => {
+            const savedItem = {
+                server_id: device.serverId || '',
+                hostname: device.hostName || device.name || '未命名电脑',
+                resolvedHostname: device.hostName || '',
+                ip: device.ip || '',
+                port: Number(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+                source: 'saved',
+                deviceId: device.id,
+                displayName: device.name || device.hostName || '未命名电脑',
+            };
+            const key = getDesktopIdentityKey(savedItem, device);
+            if (seen.has(key)) {
+                return;
+            }
+
+            const discovered = discoveredByKey.get(key);
+            const merged = discovered ? {
+                ...savedItem,
+                ...discovered,
+                source: discovered.source || savedItem.source,
+                deviceId: device.id,
+                server_id: discovered.server_id || savedItem.server_id,
+                hostname: discovered.hostname || savedItem.hostname,
+                resolvedHostname: discovered.resolvedHostname || discovered.hostname || savedItem.resolvedHostname || '',
+                ip: discovered.ip || savedItem.ip,
+                port: Number(discovered.port || savedItem.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+                displayName: device.name || discovered.displayName || discovered.hostname || savedItem.displayName,
+            } : savedItem;
+
+            seen.add(key);
+            visible.push(merged);
+        });
+
+    nearbyDesktopState.items.forEach((desktop) => {
+        const matched = matchSavedDevice(desktop, devices);
+        const item = {
+            ...desktop,
+            source: 'discovered',
+            deviceId: matched?.id || desktop.deviceId || '',
+            displayName: matched?.name || desktop.hostname || desktop.resolvedHostname || '未命名电脑',
         };
         const key = getDesktopIdentityKey(item, matched);
         if (seen.has(key)) {
@@ -1147,27 +1932,282 @@ function buildVisibleNearbyDesktops(devices = getDevices()) {
         visible.push(item);
     });
 
-    devices
-        .filter((device) => device && (device.ip || device.serverId))
-        .forEach((device) => {
-            const item = {
-                server_id: device.serverId || '',
-                hostname: device.name || '未命名电脑',
-                resolvedHostname: device.hostName || '',
-                ip: device.ip || '',
-                port: Number(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
-                source: 'saved',
-                deviceId: device.id,
-            };
-            const key = getDesktopIdentityKey(item, device);
-            if (seen.has(key)) {
-                return;
-            }
-            seen.add(key);
-            visible.push(item);
-        });
-
     return visible;
+}
+
+function initNearbyDesktopReorder() {
+    const list = $('nearby-desktops-list');
+    if (!list || list.dataset.reorderBound === 'true') {
+        return;
+    }
+
+    list.dataset.reorderBound = 'true';
+    list.addEventListener('pointerdown', handleNearbyDesktopPointerDown);
+    window.addEventListener('pointermove', handleNearbyDesktopPointerMove, { passive: false });
+    window.addEventListener('pointerup', handleNearbyDesktopPointerEnd);
+    window.addEventListener('pointercancel', handleNearbyDesktopPointerEnd);
+}
+
+function handleNearbyDesktopPointerDown(event) {
+    if ((event.pointerType === 'mouse' && event.button !== 0) || nearbyDesktopReorderState.active || nearbyDesktopReorderState.longPressTimer) {
+        return;
+    }
+
+    const item = event.target.closest('.nearby-desktop-item[data-sortable-device-id]');
+    if (!item || event.target.closest('button')) {
+        return;
+    }
+
+    nearbyDesktopReorderState.pointerId = event.pointerId;
+    nearbyDesktopReorderState.list = item.parentElement;
+    nearbyDesktopReorderState.item = item;
+    nearbyDesktopReorderState.deviceId = item.dataset.sortableDeviceId || '';
+    nearbyDesktopReorderState.originX = event.clientX;
+    nearbyDesktopReorderState.originY = event.clientY;
+    nearbyDesktopReorderState.longPressTimer = window.setTimeout(() => {
+        activateNearbyDesktopReorder(event);
+    }, NEARBY_REORDER_LONG_PRESS_MS);
+    item.classList.add('is-pressing');
+}
+
+function handleNearbyDesktopPointerMove(event) {
+    if (!nearbyDesktopReorderState.pointerId || event.pointerId !== nearbyDesktopReorderState.pointerId) {
+        return;
+    }
+
+    if (!nearbyDesktopReorderState.active) {
+        const dx = event.clientX - nearbyDesktopReorderState.originX;
+        const dy = event.clientY - nearbyDesktopReorderState.originY;
+        if (Math.hypot(dx, dy) > NEARBY_REORDER_CANCEL_DISTANCE) {
+            resetNearbyDesktopReorderState();
+        }
+        return;
+    }
+
+    event.preventDefault();
+    updateNearbyDesktopDraggedItemPosition(event.clientX, event.clientY);
+    moveNearbyDesktopPlaceholder(event.clientY);
+}
+
+function handleNearbyDesktopPointerEnd(event) {
+    if (!nearbyDesktopReorderState.pointerId || event.pointerId !== nearbyDesktopReorderState.pointerId) {
+        return;
+    }
+
+    if (!nearbyDesktopReorderState.active) {
+        resetNearbyDesktopReorderState();
+        return;
+    }
+
+    finishNearbyDesktopReorder();
+}
+
+function activateNearbyDesktopReorder(event) {
+    const item = nearbyDesktopReorderState.item;
+    const list = nearbyDesktopReorderState.list;
+    if (!item || !list) {
+        resetNearbyDesktopReorderState();
+        return;
+    }
+
+    const rect = item.getBoundingClientRect();
+    const placeholder = document.createElement('div');
+    placeholder.className = 'nearby-desktop-placeholder';
+    placeholder.style.height = `${rect.height}px`;
+    placeholder.dataset.sortablePlaceholder = 'true';
+    item.after(placeholder);
+
+    nearbyDesktopReorderState.placeholder = placeholder;
+    nearbyDesktopReorderState.active = true;
+    nearbyDesktopReorderState.originLeft = rect.left;
+    nearbyDesktopReorderState.originTop = rect.top;
+    nearbyDesktopReorderState.offsetX = event.clientX - rect.left;
+    nearbyDesktopReorderState.offsetY = event.clientY - rect.top;
+    nearbyDesktopReorderState.itemWidth = rect.width;
+    nearbyDesktopReorderState.itemHeight = rect.height;
+
+    item.classList.remove('is-pressing');
+    item.classList.add('is-dragging');
+    item.style.width = `${rect.width}px`;
+    item.style.height = `${rect.height}px`;
+    item.style.left = `${rect.left}px`;
+    item.style.top = `${rect.top}px`;
+
+    list.classList.add('is-reordering');
+    document.body.classList.add('nearby-reorder-active');
+    updateNearbyDesktopDraggedItemPosition(event.clientX, event.clientY);
+
+    if (!localStorage.getItem(NEARBY_REORDER_HINT_KEY)) {
+        localStorage.setItem(NEARBY_REORDER_HINT_KEY, '1');
+        showToast('长按后拖动卡片，可以调整设备顺序');
+    }
+    if (navigator.vibrate) {
+        navigator.vibrate(12);
+    }
+}
+
+function updateNearbyDesktopDraggedItemPosition(clientX, clientY) {
+    const item = nearbyDesktopReorderState.item;
+    if (!item) {
+        return;
+    }
+
+    const x = clientX - nearbyDesktopReorderState.offsetX;
+    const y = clientY - nearbyDesktopReorderState.offsetY;
+    item.style.transform = `translate3d(${x - nearbyDesktopReorderState.originLeft}px, ${y - nearbyDesktopReorderState.originTop}px, 0) scale(1.02)`;
+}
+
+function moveNearbyDesktopPlaceholder(clientY) {
+    const list = nearbyDesktopReorderState.list;
+    const placeholder = nearbyDesktopReorderState.placeholder;
+    const item = nearbyDesktopReorderState.item;
+    if (!list || !placeholder || !item) {
+        return;
+    }
+
+    const sortableItems = Array.from(list.querySelectorAll('.nearby-desktop-item[data-sortable-device-id]'))
+        .filter((element) => element !== item);
+    let target = null;
+    for (const sibling of sortableItems) {
+        const rect = sibling.getBoundingClientRect();
+        if (clientY < rect.top + rect.height / 2) {
+            target = sibling;
+            break;
+        }
+    }
+
+    const fallbackTarget = Array.from(list.children).find((child) => (
+        child !== item
+        && child !== placeholder
+        && !child.matches('.nearby-desktop-item[data-sortable-device-id]')
+    )) || null;
+    const desiredParent = list;
+    const desiredNextSibling = target || fallbackTarget;
+    if (placeholder.parentElement === desiredParent && placeholder.nextSibling === desiredNextSibling) {
+        return;
+    }
+
+    animateNearbyDesktopListMutation(list, () => {
+        if (desiredNextSibling) {
+            desiredParent.insertBefore(placeholder, desiredNextSibling);
+        } else {
+            desiredParent.appendChild(placeholder);
+        }
+    });
+}
+
+function animateNearbyDesktopListMutation(list, mutate) {
+    const trackedBefore = Array.from(list.children).filter((child) => child !== nearbyDesktopReorderState.item);
+    const firstRects = new Map(trackedBefore.map((child) => [child, child.getBoundingClientRect()]));
+
+    mutate();
+
+    const trackedAfter = Array.from(list.children).filter((child) => child !== nearbyDesktopReorderState.item);
+    trackedAfter.forEach((child) => {
+        const firstRect = firstRects.get(child);
+        if (!firstRect) {
+            return;
+        }
+        const lastRect = child.getBoundingClientRect();
+        const deltaX = firstRect.left - lastRect.left;
+        const deltaY = firstRect.top - lastRect.top;
+        if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) {
+            return;
+        }
+        child.style.transition = 'none';
+        child.style.transform = `translate(${deltaX}px, ${deltaY}px)`;
+        child.offsetHeight;
+        child.style.transition = '';
+        child.style.transform = '';
+    });
+}
+
+function finishNearbyDesktopReorder() {
+    const list = nearbyDesktopReorderState.list;
+    const placeholder = nearbyDesktopReorderState.placeholder;
+    const movedDeviceId = nearbyDesktopReorderState.deviceId;
+    if (!list || !placeholder || !movedDeviceId) {
+        resetNearbyDesktopReorderState();
+        return;
+    }
+
+    const orderedIds = [];
+    Array.from(list.children).forEach((child) => {
+        if (child === placeholder) {
+            orderedIds.push(movedDeviceId);
+            return;
+        }
+        if (child.matches('.nearby-desktop-item[data-sortable-device-id]')) {
+            orderedIds.push(child.dataset.sortableDeviceId);
+        }
+    });
+
+    const currentDevices = document.querySelectorAll('#device-cards .settings-card').length ? getDevicesFromUI() : getDevices();
+    const originalOrder = currentDevices.map((device) => device.id);
+    const reorderedDevices = [];
+    const used = new Set();
+
+    orderedIds.forEach((deviceId) => {
+        const match = findDeviceByAnyId(deviceId, currentDevices);
+        if (match && !used.has(match.id)) {
+            reorderedDevices.push(match);
+            used.add(match.id);
+        }
+    });
+
+    currentDevices.forEach((device) => {
+        if (!used.has(device.id)) {
+            reorderedDevices.push(device);
+            used.add(device.id);
+        }
+    });
+
+    resetNearbyDesktopReorderState();
+
+    if (JSON.stringify(originalOrder) === JSON.stringify(reorderedDevices.map((device) => device.id))) {
+        return;
+    }
+
+    saveDevices(reorderedDevices);
+    rerenderAllDeviceViews(getDevices());
+    showToast('设备顺序已更新');
+}
+
+function resetNearbyDesktopReorderState() {
+    if (nearbyDesktopReorderState.longPressTimer) {
+        clearTimeout(nearbyDesktopReorderState.longPressTimer);
+    }
+
+    if (nearbyDesktopReorderState.item) {
+        nearbyDesktopReorderState.item.classList.remove('is-pressing', 'is-dragging');
+        nearbyDesktopReorderState.item.style.width = '';
+        nearbyDesktopReorderState.item.style.height = '';
+        nearbyDesktopReorderState.item.style.left = '';
+        nearbyDesktopReorderState.item.style.top = '';
+        nearbyDesktopReorderState.item.style.transform = '';
+    }
+
+    nearbyDesktopReorderState.placeholder?.remove();
+    nearbyDesktopReorderState.list?.classList.remove('is-reordering');
+    document.body.classList.remove('nearby-reorder-active');
+
+    nearbyDesktopReorderState = {
+        pointerId: null,
+        list: null,
+        item: null,
+        placeholder: null,
+        deviceId: '',
+        originX: 0,
+        originY: 0,
+        originLeft: 0,
+        originTop: 0,
+        offsetX: 0,
+        offsetY: 0,
+        itemWidth: 0,
+        itemHeight: 0,
+        longPressTimer: null,
+        active: false,
+    };
 }
 
 function matchSavedDevice(desktop, devices = getDevices()) {
@@ -1229,7 +2269,7 @@ function deviceMatchesDesktop(device, desktop) {
 
 function syncKnownDevicesWithDiscovery(discovered) {
     const devices = getDevices();
-    if (!devices.length) return;
+    if (!devices.length) return false;
 
     let changed = false;
     discovered.forEach((desktop) => {
@@ -1246,11 +2286,15 @@ function syncKnownDevicesWithDiscovery(discovered) {
                 || matched.hostName !== nextHostName
                 || matched.serverId !== nextServerId
             ) {
+                const previousEndpoint = `${matched.ip || ''}:${String(matched.port || DESKTOP_DISCOVERY_DEFAULT_PORT)}`;
                 matched.ip = desktop.ip;
                 matched.port = nextPort;
                 matched.hostName = nextHostName;
                 matched.serverId = nextServerId;
                 changed = true;
+                console.log(
+                    `[smart-discovery] matched ${matched.name || matched.hostName || matched.id}: ${previousEndpoint} -> ${matched.ip}:${matched.port}`
+                );
                 if (connections[matched.id]) {
                     connectDevice(matched.id, matched.ip, matched.port, matched.pin || '');
                 }
@@ -1258,12 +2302,11 @@ function syncKnownDevicesWithDiscovery(discovered) {
         });
     });
 
-    if (!changed) return;
+    if (!changed) return false;
 
     saveDevices(devices);
-    renderDeviceCards(devices);
-    renderSendCards(devices);
-    renderHistoryFilters(devices);
+    rerenderAllDeviceViews();
+    return true;
 }
 
 function fillDesktopIntoSettings(desktop) {
@@ -1285,7 +2328,7 @@ function fillDesktopIntoSettings(desktop) {
             serverId: desktop.server_id || '',
         });
     }
-    renderDeviceCards(devices);
+    renderDeviceCards(normalizeDevices(devices));
     showToast('已填入桌面端配置');
 }
 
@@ -1303,11 +2346,10 @@ function connectMatchedDesktop(desktop) {
     matched.port = String(desktop.port || DESKTOP_DISCOVERY_DEFAULT_PORT);
     matched.serverId = desktop.server_id || matched.serverId || '';
     saveDevices(devices);
-    renderDeviceCards(devices);
-    renderSendCards(devices);
-    renderHistoryFilters(devices);
-    connectDevice(matched.id, matched.ip, matched.port, matched.pin || '');
-    showToast(`正在连接 ${matched.name}`);
+    const normalized = rerenderAllDeviceViews();
+    const normalizedMatched = findDeviceByAnyId(matched.id, normalized) || matched;
+    connectDevice(normalizedMatched.id, normalizedMatched.ip, normalizedMatched.port, normalizedMatched.pin || '');
+    showToast(`正在连接 ${normalizedMatched.name}`);
 }
 
 function reconcileAuthenticatedDesktopIdentity(deviceId, payload = {}) {
@@ -1336,10 +2378,7 @@ function reconcileAuthenticatedDesktopIdentity(deviceId, payload = {}) {
     }
 
     saveDevices(devices);
-    const normalized = getDevices();
-    renderDeviceCards(normalized);
-    renderSendCards(normalized);
-    renderHistoryFilters(normalized);
+    rerenderAllDeviceViews();
 }
 
 async function startDesktopPairing(desktop) {
@@ -1428,7 +2467,7 @@ async function pollDesktopPairingStatus() {
             finalizePairedDesktop({
                 serverId: status.server_id || pairing.serverId,
                 hostname: status.hostname || pairing.hostname,
-                ip: status.ip || pairing.ip,
+                ip: pairing.ip || status.ip,
                 port: Number(status.port || pairing.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
                 pin: status.pin || '',
             });
@@ -1474,10 +2513,9 @@ function finalizePairedDesktop(pairing) {
     }
 
     saveDevices(devices);
-    renderDeviceCards(devices);
-    renderSendCards(devices);
-    renderHistoryFilters(devices);
-    connectDevice(matched.id, matched.ip, matched.port, matched.pin || '');
+    const normalized = rerenderAllDeviceViews();
+    const normalizedMatched = findDeviceByAnyId(matched.id, normalized) || matched;
+    connectDevice(normalizedMatched.id, normalizedMatched.ip, normalizedMatched.port, normalizedMatched.pin || '');
     void discoverNearbyDesktops({ silent: true });
 }
 
@@ -1485,8 +2523,72 @@ function finalizePairedDesktop(pairing) {
 // 动态渲染 — 发送页
 // ============================================
 
+function setSendDraft(deviceId, value) {
+    const text = String(value || '');
+    if (text) {
+        sendDrafts.set(deviceId, text);
+    } else {
+        sendDrafts.delete(deviceId);
+    }
+}
+
+function getSendDraft(deviceId) {
+    return sendDrafts.get(deviceId) || '';
+}
+
+function captureSendDraftsFromDom() {
+    sendDraftFocusState = null;
+    document.querySelectorAll('#send-cards textarea[id^="input-"]').forEach((input) => {
+        const deviceId = input.id.replace(/^input-/, '');
+        if (deviceId) {
+            setSendDraft(deviceId, input.value);
+        }
+    });
+
+    const active = document.activeElement;
+    if (active?.matches?.('#send-cards textarea[id^="input-"]')) {
+        sendDraftFocusState = {
+            deviceId: active.id.replace(/^input-/, ''),
+            selectionStart: active.selectionStart,
+            selectionEnd: active.selectionEnd,
+        };
+    }
+}
+
+function pruneSendDrafts(devices = []) {
+    const activeIds = new Set(devices.map((device) => device.id).filter(Boolean));
+    Array.from(sendDrafts.keys()).forEach((deviceId) => {
+        if (!activeIds.has(deviceId)) {
+            sendDrafts.delete(deviceId);
+        }
+    });
+}
+
+function restoreSendDraftFocus() {
+    if (!sendDraftFocusState?.deviceId) {
+        return;
+    }
+
+    const input = $(`input-${sendDraftFocusState.deviceId}`);
+    if (!input) {
+        sendDraftFocusState = null;
+        return;
+    }
+
+    const start = Math.min(sendDraftFocusState.selectionStart ?? input.value.length, input.value.length);
+    const end = Math.min(sendDraftFocusState.selectionEnd ?? start, input.value.length);
+    requestAnimationFrame(() => {
+        input.focus();
+        if (typeof input.setSelectionRange === 'function') {
+            input.setSelectionRange(start, end);
+        }
+    });
+}
+
 function renderSendCards(devices) {
     const container = $('send-cards');
+    captureSendDraftsFromDom();
+    pruneSendDrafts(devices);
     container.innerHTML = '';
 
     devices.forEach(dev => {
@@ -1510,10 +2612,10 @@ function renderSendCards(devices) {
                 <button class="send-btn combo-btn" id="sendenterbtn-${dev.id}" disabled>发送并回车</button>
                 <div class="send-actions media-actions">
                     <button class="send-btn image-btn" id="imagebtn-${dev.id}" disabled>传图到剪贴板</button>
-                    <button class="send-btn image-btn" id="filebtn-${dev.id}" disabled>传文件到下载</button>
+                    <button class="send-btn image-btn" id="filebtn-${dev.id}" disabled>传到收件箱</button>
                 </div>
                 <input type="file" id="imageinput-${dev.id}" accept="image/*" class="hidden-file-input">
-                <input type="file" id="fileinput-${dev.id}" class="hidden-file-input">
+                <input type="file" id="fileinput-${dev.id}" class="hidden-file-input" multiple>
             </div>
         `;
         container.appendChild(card);
@@ -1527,14 +2629,21 @@ function renderSendCards(devices) {
         const imageInput = card.querySelector(`#imageinput-${dev.id}`);
         const fileInput = card.querySelector(`#fileinput-${dev.id}`);
         const input = card.querySelector('textarea');
+        input.value = getSendDraft(dev.id);
+        input.addEventListener('input', () => setSendDraft(dev.id, input.value));
 
         sendBtn.addEventListener('click', () => sendText(dev.id));
         enterBtn.addEventListener('click', () => sendEnter(dev.id));
         sendEnterBtn.addEventListener('click', () => sendTextAndEnter(dev.id));
         imageBtn.addEventListener('click', () => {
-            if (pendingSharedContent) {
-                if (!pendingSharedContent.isImage) {
-                    showToast('当前共享内容不是图片，请使用“传文件到下载”');
+            const primaryShared = getPrimaryPendingSharedContent();
+            if (pendingSharedContents.length) {
+                if (pendingSharedContents.length > 1) {
+                    showToast('批量内容请使用“传到收件箱”');
+                    return;
+                }
+                if (!primaryShared?.isImage) {
+                    showToast('当前共享内容不是图片，请使用“传到收件箱”');
                     return;
                 }
                 sendPendingSharedImage(dev.id);
@@ -1543,8 +2652,12 @@ function renderSendCards(devices) {
             imageInput.click();
         });
         fileBtn.addEventListener('click', () => {
-            if (pendingSharedContent) {
-                sendPendingSharedFile(dev.id);
+            if (pendingSharedContents.length) {
+                if (pendingSharedContents.length > 1) {
+                    sendPendingSharedFilesBatch(dev.id);
+                } else {
+                    sendPendingSharedFile(dev.id);
+                }
                 return;
             }
             fileInput.click();
@@ -1557,13 +2670,17 @@ function renderSendCards(devices) {
             }
         });
         fileInput.addEventListener('change', async (event) => {
-            const [file] = event.target.files || [];
+            const files = Array.from(event.target.files || []);
             event.target.value = '';
-            if (file) {
+            if (files.length > 1) {
+                await sendSelectedFilesBatch(dev.id, files);
+            } else if (files[0]) {
+                const [file] = files;
                 await sendSelectedFile(dev.id, file);
             }
         });
     });
+    restoreSendDraftFocus();
 }
 
 // ============================================
@@ -1687,8 +2804,7 @@ function initSettingsButton() {
     $('save-settings-btn').addEventListener('click', () => {
         const devices = saveSettingsFromUI();
         disconnectAll();
-        renderSendCards(devices);
-        renderHistoryFilters(devices);
+        rerenderAllDeviceViews(devices);
         showView('send-view');
         $('nav-send-btn').classList.add('active');
         connectAll();
@@ -1948,6 +3064,8 @@ function showView(viewId) {
     if (viewId === 'history-view') {
         scheduleHistoryRender();
     }
+    renderConnectionDiagnostics();
+    syncConnectionDiagnosticsPolling();
 }
 
 function scheduleHistoryRender() {
@@ -1995,9 +3113,26 @@ function initHistoryFilterControls() {
         });
     }
 
+    $('history-search-input')?.addEventListener('input', (event) => {
+        currentHistoryFilters.query = event.target.value || '';
+        clearHistoryHeatmapSelection();
+        renderHistorySearchState();
+        scheduleHistoryRender();
+    });
+    $('history-search-clear-btn')?.addEventListener('click', () => {
+        currentHistoryFilters.query = '';
+        clearHistoryHeatmapSelection();
+        syncHistoryFilterForm();
+        scheduleHistoryRender();
+        $('history-search-input')?.focus();
+    });
     $('history-filter-close-btn')?.addEventListener('click', closeHistoryFilterSheet);
     $('history-filter-reset-btn')?.addEventListener('click', () => {
-        currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS, device: currentHistoryFilters.device };
+        currentHistoryFilters = {
+            ...DEFAULT_HISTORY_FILTERS,
+            device: currentHistoryFilters.device,
+            query: currentHistoryFilters.query,
+        };
         clearHistoryHeatmapSelection();
         syncHistoryFilterForm();
         renderDeviceFilterState();
@@ -2055,6 +3190,7 @@ function syncHistoryFilterForm() {
         endTime,
         kind,
         status,
+        query,
     } = currentHistoryFilters;
 
     if ($('history-start-date')) $('history-start-date').value = startDate;
@@ -2064,7 +3200,9 @@ function syncHistoryFilterForm() {
     if ($('history-end-time')) $('history-end-time').value = endTime;
     if ($('history-kind-filter')) $('history-kind-filter').value = kind;
     if ($('history-status-filter')) $('history-status-filter').value = status;
+    if ($('history-search-input')) $('history-search-input').value = query;
     syncCustomTimeInputsState();
+    renderHistorySearchState();
     renderHistoryDateInputs();
 }
 
@@ -2123,6 +3261,11 @@ function renderTimeFilterState() {
     $('history-time-filter-btns')?.querySelectorAll('.filter-btn').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.timeFilter === currentHistoryFilters.quickTime);
     });
+}
+
+function renderHistorySearchState() {
+    const hasQuery = Boolean(normalizeSearchText(currentHistoryFilters.query));
+    $('history-search-clear-btn')?.classList.toggle('hidden', !hasQuery);
 }
 
 function renderHistoryDateInputs() {
@@ -2192,6 +3335,10 @@ function getHistoryDateAvailability() {
         }
 
         if (!matchesKind(entry, filters) || !matchesStatus(entry, filters)) {
+            return;
+        }
+
+        if (!matchesHistorySearch(hydratedEntry, filters)) {
             return;
         }
 
@@ -2413,9 +3560,16 @@ function formatHeatmapSelectionLabel(dateKey, hour) {
 
 function getHistoryHeatmapRangeToken() {
     return [
+        currentHistoryFilters.device,
         currentHistoryFilters.quickTime,
         currentHistoryFilters.startDate,
         currentHistoryFilters.endDate,
+        currentHistoryFilters.timeRange,
+        currentHistoryFilters.startTime,
+        currentHistoryFilters.endTime,
+        currentHistoryFilters.kind,
+        currentHistoryFilters.status,
+        normalizeSearchText(currentHistoryFilters.query),
     ].join('|');
 }
 
@@ -2473,22 +3627,121 @@ function getHistoryHeatmapBounds(baseEntries) {
     };
 }
 
-function getHistoryHeatmapDragOffsetBounds(bounds) {
-    const currentEnd = historyHeatmapState.viewportEndDate || bounds.maxDate;
-    const minDeltaDays = diffDateKeys(currentEnd, bounds.minViewportEndDate);
-    const maxDeltaDays = diffDateKeys(currentEnd, bounds.maxDate);
+function getHistoryHeatmapDayKeys(minDate, maxDate) {
+    const days = [];
+    if (!minDate || !maxDate) {
+        return days;
+    }
+
+    for (let dayKey = minDate; dayKey <= maxDate; dayKey = shiftDateKey(dayKey, 1)) {
+        days.push(dayKey);
+    }
+
+    return days;
+}
+
+function getHistoryHeatmapMaxStartIndex(bounds) {
+    return Math.max(0, diffDateKeys(bounds.minDate, bounds.maxDate) - (HEATMAP_VISIBLE_DAYS - 1));
+}
+
+function clampHistoryHeatmapStartIndex(startIndex, bounds) {
+    return Math.max(0, Math.min(getHistoryHeatmapMaxStartIndex(bounds), startIndex));
+}
+
+function getHistoryHeatmapStartIndexForEndDate(bounds, endDate = bounds.preferredEnd) {
+    const clampedEnd = clampDateKey(endDate || bounds.preferredEnd, bounds.minViewportEndDate, bounds.maxDate);
+    const visibleStart = clampDateKey(
+        shiftDateKey(clampedEnd, -(HEATMAP_VISIBLE_DAYS - 1)),
+        bounds.minDate,
+        bounds.maxDate
+    );
+    return clampHistoryHeatmapStartIndex(diffDateKeys(bounds.minDate, visibleStart), bounds);
+}
+
+function getHistoryHeatmapVisibleWindow(bounds, startIndex) {
+    const safeStartIndex = clampHistoryHeatmapStartIndex(startIndex, bounds);
+    const visibleStart = shiftDateKey(bounds.minDate, safeStartIndex);
+    const visibleEnd = clampDateKey(
+        shiftDateKey(visibleStart, HEATMAP_VISIBLE_DAYS - 1),
+        bounds.minDate,
+        bounds.maxDate
+    );
 
     return {
-        minOffsetX: -maxDeltaDays * HEATMAP_COLUMN_STEP,
-        maxOffsetX: -minDeltaDays * HEATMAP_COLUMN_STEP,
+        startIndex: safeStartIndex,
+        visibleStart,
+        visibleEnd,
     };
 }
 
-function clampHistoryHeatmapOffset(offsetX) {
-    return Math.max(
-        historyHeatmapState.dragMinOffsetX,
-        Math.min(historyHeatmapState.dragMaxOffsetX, offsetX)
-    );
+function getHistoryHeatmapColumnStep(track = $('history-heatmap-track')) {
+    const first = track?.children?.[0];
+    const second = track?.children?.[1];
+    if (first && second) {
+        return second.offsetLeft - first.offsetLeft;
+    }
+
+    const rootStyles = getComputedStyle(document.documentElement);
+    const columnWidth = parseFloat(rootStyles.getPropertyValue('--heatmap-column-width')) || 44;
+    const columnGap = parseFloat(rootStyles.getPropertyValue('--heatmap-column-gap')) || 8;
+    return columnWidth + columnGap;
+}
+
+function setHistoryHeatmapScrollPosition(viewport, track, startIndex) {
+    if (!viewport || !track) {
+        return;
+    }
+
+    const step = getHistoryHeatmapColumnStep(track);
+    const targetLeft = Math.max(0, startIndex) * step;
+    const previousBehavior = viewport.style.scrollBehavior;
+    viewport.style.scrollBehavior = 'auto';
+    viewport.scrollLeft = targetLeft;
+    viewport.style.scrollBehavior = previousBehavior;
+}
+
+function syncHistoryHeatmapViewportMeta(baseEntries, counts, bounds) {
+    const viewport = $('history-heatmap-viewport');
+    const stats = $('history-heatmap-stats');
+    const caption = $('history-heatmap-caption');
+    const resetBtn = $('history-heatmap-reset-btn');
+    const track = $('history-heatmap-track');
+    if (!viewport || !stats || !caption || !resetBtn || !track || !bounds) {
+        return;
+    }
+
+    const step = getHistoryHeatmapColumnStep(track);
+    const rawStartIndex = step > 0
+        ? Math.round(viewport.scrollLeft / step)
+        : getHistoryHeatmapStartIndexForEndDate(bounds, historyHeatmapState.viewportEndDate);
+    const { startIndex, visibleStart, visibleEnd } = getHistoryHeatmapVisibleWindow(bounds, rawStartIndex);
+
+    historyHeatmapState.viewportEndDate = visibleEnd;
+    updateHistoryHeatmapCellColors(counts, visibleStart, visibleEnd);
+    stats.innerHTML = buildHistoryHeatmapStats(baseEntries, visibleStart, visibleEnd).map((item) => `
+        <div class="history-heatmap-stat">
+            <span class="history-heatmap-stat-label">${escapeHtml(item.label)}</span>
+            <span class="history-heatmap-stat-value">${escapeHtml(item.value)}</span>
+        </div>
+    `).join('');
+
+    caption.textContent = `当前窗口 ${formatHistoryDateLabel(visibleStart)} 至 ${formatHistoryDateLabel(visibleEnd)}。左右滑动查看更多日期，点方块筛选该小时。`;
+    resetBtn.classList.toggle('hidden', startIndex >= getHistoryHeatmapMaxStartIndex(bounds));
+}
+
+function scheduleHistoryHeatmapViewportMetaSync() {
+    if (historyHeatmapState.scrollFrame) {
+        return;
+    }
+
+    historyHeatmapState.scrollFrame = requestAnimationFrame(() => {
+        historyHeatmapState.scrollFrame = 0;
+        syncHistoryHeatmapViewportMeta(
+            historyHeatmapState.renderedEntries,
+            historyHeatmapState.renderedCounts,
+            historyHeatmapState.renderedBounds
+        );
+    });
 }
 
 function clearHistoryHeatmapSelection() {
@@ -2532,16 +3785,70 @@ function getHistoryHeatmapCellCount(counts, dateKey, hour) {
     return counts.get(`${dateKey}|${hour}`) || 0;
 }
 
+function getHistoryHeatmapWindowMaxCount(counts, visibleStart, visibleEnd) {
+    let maxCount = 0;
+    if (!visibleStart || !visibleEnd) {
+        return maxCount;
+    }
+
+    for (let dayKey = visibleStart; dayKey <= visibleEnd; dayKey = shiftDateKey(dayKey, 1)) {
+        for (let hour = 0; hour < HEATMAP_HOUR_SLOTS; hour += 1) {
+            maxCount = Math.max(maxCount, getHistoryHeatmapCellCount(counts, dayKey, hour));
+        }
+    }
+
+    return maxCount;
+}
+
+function mixHistoryHeatmapRgb(from, to, amount) {
+    const t = Math.max(0, Math.min(1, amount));
+    const channel = (index) => Math.round(from[index] + ((to[index] - from[index]) * t));
+    return `rgb(${channel(0)}, ${channel(1)}, ${channel(2)})`;
+}
+
 function getHistoryHeatmapCellColor(count, maxCount) {
     if (count <= 0 || maxCount <= 0) {
-        return 'rgba(152, 162, 179, 0.12)';
+        return 'rgb(255, 255, 255)';
     }
-    const ratio = Math.pow(count / maxCount, 0.72);
-    const hue = 138 - (ratio * 6);
-    const saturation = 46 + (ratio * 28);
-    const lightness = 94 - (ratio * 68);
-    const alpha = 0.22 + (ratio * 0.76);
-    return `hsla(${hue}, ${saturation}%, ${lightness}%, ${alpha})`;
+
+    const rawRatio = Math.min(1, count / maxCount);
+    const ratio = Math.max(0.1, Math.pow(rawRatio, 0.78));
+    const stops = [
+        { at: 0, color: [255, 255, 255] },
+        { at: 0.22, color: [220, 252, 231] },
+        { at: 0.48, color: [74, 222, 128] },
+        { at: 0.74, color: [22, 163, 74] },
+        { at: 1, color: [6, 78, 59] },
+    ];
+
+    for (let index = 1; index < stops.length; index += 1) {
+        const previous = stops[index - 1];
+        const next = stops[index];
+        if (ratio <= next.at) {
+            return mixHistoryHeatmapRgb(
+                previous.color,
+                next.color,
+                (ratio - previous.at) / (next.at - previous.at)
+            );
+        }
+    }
+
+    return mixHistoryHeatmapRgb(stops[stops.length - 1].color, stops[stops.length - 1].color, 1);
+}
+
+function updateHistoryHeatmapCellColors(counts, visibleStart, visibleEnd) {
+    const track = $('history-heatmap-track');
+    if (!track || !counts) {
+        return;
+    }
+
+    const maxCount = getHistoryHeatmapWindowMaxCount(counts, visibleStart, visibleEnd);
+    track.querySelectorAll('.history-heatmap-cell').forEach((cell) => {
+        const dayKey = cell.dataset.dateKey;
+        const hour = Number(cell.dataset.hour);
+        const count = getHistoryHeatmapCellCount(counts, dayKey, hour);
+        cell.style.background = getHistoryHeatmapCellColor(count, maxCount);
+    });
 }
 
 function buildHistoryHeatmapStats(entries, visibleStart, visibleEnd) {
@@ -2606,11 +3913,12 @@ function buildHistoryHeatmapStats(entries, visibleStart, visibleEnd) {
 }
 
 function renderHistoryHeatmap(baseEntries) {
+    const viewport = $('history-heatmap-viewport');
     const track = $('history-heatmap-track');
     const stats = $('history-heatmap-stats');
     const caption = $('history-heatmap-caption');
     const resetBtn = $('history-heatmap-reset-btn');
-    if (!track || !stats || !caption || !resetBtn) return;
+    if (!viewport || !track || !stats || !caption || !resetBtn) return;
 
     const rangeToken = getHistoryHeatmapRangeToken();
     const bounds = getHistoryHeatmapBounds(baseEntries);
@@ -2626,18 +3934,12 @@ function renderHistoryHeatmap(baseEntries) {
         bounds.maxDate
     );
 
-    const visibleEnd = historyHeatmapState.viewportEndDate;
-    const visibleStart = shiftDateKey(visibleEnd, -(HEATMAP_VISIBLE_DAYS - 1));
-    const renderStart = shiftDateKey(visibleStart, -HEATMAP_RENDER_BUFFER_DAYS);
-    const renderEnd = shiftDateKey(visibleEnd, HEATMAP_RENDER_BUFFER_DAYS);
     const counts = buildHistoryHeatmapCountMap(baseEntries);
-    const maxCount = Array.from(counts.values()).reduce((max, value) => Math.max(max, value), 0);
+    const initialStartIndex = getHistoryHeatmapStartIndexForEndDate(bounds, historyHeatmapState.viewportEndDate);
+    const initialWindow = getHistoryHeatmapVisibleWindow(bounds, initialStartIndex);
+    const initialMaxCount = getHistoryHeatmapWindowMaxCount(counts, initialWindow.visibleStart, initialWindow.visibleEnd);
     const todayKey = formatDateKey(new Date());
-    const days = [];
-
-    for (let dayKey = renderStart; dayKey <= renderEnd; dayKey = shiftDateKey(dayKey, 1)) {
-        days.push(dayKey);
-    }
+    const days = getHistoryHeatmapDayKeys(bounds.minDate, bounds.maxDate);
 
     track.innerHTML = days.map((dayKey) => {
         const dayDate = dateKeyToUtcDate(dayKey);
@@ -2654,7 +3956,7 @@ function renderHistoryHeatmap(baseEntries) {
             const classes = ['history-heatmap-cell'];
             if (count > 0) classes.push('has-data');
             if (isSelected) classes.push('selected');
-            const style = `background:${getHistoryHeatmapCellColor(count, maxCount)};`;
+            const style = `background:${getHistoryHeatmapCellColor(count, initialMaxCount)};`;
             const label = `${formatHistoryDateLabel(dayKey)} ${formatHeatmapHourLabel(hour)}，${count} 条`;
 
             return `
@@ -2671,7 +3973,7 @@ function renderHistoryHeatmap(baseEntries) {
         }).join('');
 
         return `
-            <div class="history-heatmap-day ${isToday ? 'is-today' : ''}">
+            <div class="history-heatmap-day ${isToday ? 'is-today' : ''}" data-day-key="${dayKey}">
                 <div class="history-heatmap-day-header">
                     <span class="history-heatmap-day-weekday">${escapeHtml(headerLabel)}</span>
                     <span class="history-heatmap-day-date">${escapeHtml(formatShortDateLabel(dayKey))}</span>
@@ -2683,22 +3985,12 @@ function renderHistoryHeatmap(baseEntries) {
         `;
     }).join('');
 
-    const baseOffset = -(diffDateKeys(renderStart, visibleStart) * HEATMAP_COLUMN_STEP);
-    track.dataset.baseOffset = String(baseOffset);
-    track.style.transition = historyHeatmapState.dragPointerId == null
-        ? 'transform 220ms cubic-bezier(0.22, 1, 0.36, 1)'
-        : 'none';
-    track.style.transform = `translate3d(${baseOffset + historyHeatmapState.dragOffsetX}px, 0, 0)`;
+    historyHeatmapState.renderedEntries = baseEntries;
+    historyHeatmapState.renderedCounts = counts;
+    historyHeatmapState.renderedBounds = bounds;
 
-    stats.innerHTML = buildHistoryHeatmapStats(baseEntries, visibleStart, visibleEnd).map((item) => `
-        <div class="history-heatmap-stat">
-            <span class="history-heatmap-stat-label">${escapeHtml(item.label)}</span>
-            <span class="history-heatmap-stat-value">${escapeHtml(item.value)}</span>
-        </div>
-    `).join('');
-
-    caption.textContent = `当前窗口 ${formatHistoryDateLabel(visibleStart)} 至 ${formatHistoryDateLabel(visibleEnd)}。左右拖动查看更多日期，点方块筛选该小时。`;
-    resetBtn.classList.toggle('hidden', visibleEnd === bounds.maxDate);
+    setHistoryHeatmapScrollPosition(viewport, track, initialStartIndex);
+    syncHistoryHeatmapViewportMeta(baseEntries, counts, bounds);
 
     track.querySelectorAll('.history-heatmap-cell').forEach((cell) => {
         cell.addEventListener('click', () => {
@@ -2730,92 +4022,13 @@ function initHistoryHeatmapInteractions() {
 
     viewport.dataset.ready = '1';
 
-    viewport.addEventListener('pointerdown', (event) => {
-        const bounds = getHistoryHeatmapBounds(filterHistoryEntries(getHistory()));
-        const dragBounds = getHistoryHeatmapDragOffsetBounds(bounds);
-        historyHeatmapState.dragPointerId = event.pointerId;
-        historyHeatmapState.dragStartX = event.clientX;
-        historyHeatmapState.dragOffsetX = 0;
-        historyHeatmapState.dragLastX = event.clientX;
-        historyHeatmapState.dragLastTime = Date.now();
-        historyHeatmapState.dragVelocity = 0;
-        historyHeatmapState.dragMoved = false;
-        historyHeatmapState.dragMinOffsetX = dragBounds.minOffsetX;
-        historyHeatmapState.dragMaxOffsetX = dragBounds.maxOffsetX;
-        viewport.setPointerCapture?.(event.pointerId);
+    viewport.addEventListener('scroll', () => {
+        historyHeatmapState.suppressCellClickUntil = Date.now() + 120;
+        scheduleHistoryHeatmapViewportMetaSync();
     });
-
-    viewport.addEventListener('pointermove', (event) => {
-        if (event.pointerId !== historyHeatmapState.dragPointerId) {
-            return;
-        }
-
-        const rawOffsetX = event.clientX - historyHeatmapState.dragStartX;
-        const offsetX = clampHistoryHeatmapOffset(rawOffsetX);
-        const now = Date.now();
-        const deltaTime = Math.max(now - historyHeatmapState.dragLastTime, 1);
-
-        historyHeatmapState.dragVelocity = (event.clientX - historyHeatmapState.dragLastX) / deltaTime;
-        historyHeatmapState.dragLastX = event.clientX;
-        historyHeatmapState.dragLastTime = now;
-
-        if (!historyHeatmapState.dragMoved && Math.abs(offsetX) < HEATMAP_DRAG_THRESHOLD) {
-            return;
-        }
-
-        historyHeatmapState.dragMoved = true;
-        historyHeatmapState.dragOffsetX = offsetX;
-
-        const track = $('history-heatmap-track');
-        if (!track) return;
-
-        const baseOffset = Number(track.dataset.baseOffset || 0);
-        track.style.transition = 'none';
-        track.style.transform = `translate3d(${baseOffset + offsetX}px, 0, 0)`;
-    });
-
-    const finishDrag = (event) => {
-        if (event.pointerId !== historyHeatmapState.dragPointerId) {
-            return;
-        }
-
-        viewport.releasePointerCapture?.(event.pointerId);
-
-        const moved = historyHeatmapState.dragMoved;
-        const predictedOffset = clampHistoryHeatmapOffset(
-            historyHeatmapState.dragOffsetX + (historyHeatmapState.dragVelocity * HEATMAP_INERTIA_MS)
-        );
-
-        historyHeatmapState.dragPointerId = null;
-        historyHeatmapState.dragOffsetX = 0;
-        historyHeatmapState.dragVelocity = 0;
-        historyHeatmapState.dragLastX = 0;
-        historyHeatmapState.dragLastTime = 0;
-        historyHeatmapState.dragMoved = false;
-        historyHeatmapState.dragMinOffsetX = 0;
-        historyHeatmapState.dragMaxOffsetX = 0;
-
-        if (!moved) {
-            return;
-        }
-
-        const bounds = getHistoryHeatmapBounds(filterHistoryEntries(getHistory()));
-        const deltaDays = -Math.round(predictedOffset / HEATMAP_COLUMN_STEP);
-        historyHeatmapState.viewportEndDate = clampDateKey(
-            shiftDateKey(historyHeatmapState.viewportEndDate, deltaDays),
-            bounds.minViewportEndDate,
-            bounds.maxDate
-        );
-        clearHistoryHeatmapSelection();
-        historyHeatmapState.suppressCellClickUntil = Date.now() + 180;
-        scheduleHistoryRender();
-    };
-
-    viewport.addEventListener('pointerup', finishDrag);
-    viewport.addEventListener('pointercancel', finishDrag);
 
     resetBtn?.addEventListener('click', () => {
-        const bounds = getHistoryHeatmapBounds(filterHistoryEntries(getHistory()));
+        const bounds = historyHeatmapState.renderedBounds || getHistoryHeatmapBounds(filterHistoryEntries(getHistory()));
         historyHeatmapState.viewportEndDate = bounds.maxDate;
         clearHistoryHeatmapSelection();
         scheduleHistoryRender();
@@ -2826,8 +4039,25 @@ function initHistoryHeatmapInteractions() {
 // WebSocket 连接
 // ============================================
 
-function connectAll() {
+async function connectAll({
+    refreshDiscovery = false,
+    alignNativeBackgroundConfig = false,
+    forceDiscovery = false,
+    discoveryReason = 'connect-all',
+} = {}) {
+    if (refreshDiscovery && alignNativeBackgroundConfig) {
+        // 先清空原生后台的旧 endpoint，避免扫描更新前继续连错地址。
+        syncNativeBackgroundClipboardConfig(clientIdentity, []);
+    }
+
+    if (refreshDiscovery) {
+        await requestSmartDiscoveryRefresh(discoveryReason, { force: forceDiscovery });
+    }
+
     const devices = getDevices();
+    if (alignNativeBackgroundConfig) {
+        syncNativeBackgroundClipboardConfig(clientIdentity, devices);
+    }
     devices.forEach(dev => {
         if (dev.ip) {
             connectDevice(dev.id, dev.ip, dev.port || '9001', dev.pin || '');
@@ -2854,7 +4084,9 @@ function connectDevice(deviceId, ip, port, pin) {
 
     clearTimers(conn);
     if (conn.ws) {
-        conn.ws.close();
+        const previousWs = conn.ws;
+        conn.ws = null;
+        previousWs.close();
     }
     conn.authenticated = false;
 
@@ -2873,8 +4105,13 @@ function connectDevice(deviceId, ip, port, pin) {
     }
 
     conn.ws = ws;
+    conn.lastMessageAt = Date.now();
+    conn.heartbeatPending = false;
+    conn.heartbeatStartedAt = 0;
 
     ws.onopen = () => {
+        if (conn.ws !== ws) return;
+        conn.lastMessageAt = Date.now();
         console.log(`[${deviceId}] WebSocket 已连接，发送 PIN 认证`);
         ws.send(JSON.stringify({
             action: 'auth',
@@ -2887,11 +4124,16 @@ function connectDevice(deviceId, ip, port, pin) {
     };
 
     ws.onmessage = (event) => {
+        if (conn.ws !== ws) return;
+        conn.lastMessageAt = Date.now();
+        conn.heartbeatPending = false;
+        conn.heartbeatStartedAt = 0;
+        clearTimeout(conn.timeoutTimer);
+
         let data;
         try { data = JSON.parse(event.data); } catch { return; }
 
         if (data.action === 'pong') {
-            clearTimeout(conn.timeoutTimer);
             return;
         }
 
@@ -2916,10 +4158,20 @@ function connectDevice(deviceId, ip, port, pin) {
             return;
         }
 
+        if (
+            data.action === 'incoming_file_saved'
+            || data.action === 'incoming_file_error'
+        ) {
+            if (settleOutboundDesktopFileTransfer(deviceId, data)) {
+                return;
+            }
+        }
+
         if (!conn.authenticated) {
             if (data.status === 'ok' && data.hostname) {
                 conn.authenticated = true;
                 conn.hostname = data.hostname;
+                conn.reconnectAttempts = 0;
                 reconcileAuthenticatedDesktopIdentity(deviceId, data);
                 updateDeviceUI(deviceId, 'connected', data.hostname);
                 startHeartbeat(deviceId, ip, port, pin);
@@ -2936,11 +4188,16 @@ function connectDevice(deviceId, ip, port, pin) {
     };
 
     ws.onerror = () => {
+        if (conn.ws !== ws) return;
         updateDeviceUI(deviceId, 'error', '连接出错');
     };
 
     ws.onclose = () => {
+        if (conn.ws !== ws) return;
+        rejectOutboundDesktopTransfersForDevice(deviceId, '连接已断开');
+        conn.ws = null;
         conn.authenticated = false;
+        conn.hostname = null;
         updateDeviceUI(deviceId, 'disconnected', '已断开');
         clearTimers(conn);
         scheduleReconnect(deviceId, ip, port, pin);
@@ -2952,13 +4209,35 @@ function connectDevice(deviceId, ip, port, pin) {
 function startHeartbeat(deviceId, ip, port, pin) {
     const conn = connections[deviceId];
     clearTimers(conn);
+    conn.lastMessageAt = Date.now();
+    conn.heartbeatPending = false;
+    conn.heartbeatStartedAt = 0;
 
     conn.heartbeatTimer = setInterval(() => {
-        if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+        if (!conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
+            return;
+        }
+
+        const now = Date.now();
+        if (conn.heartbeatPending) {
+            const pendingFor = now - Number(conn.heartbeatStartedAt || 0);
+            const quietFor = now - Number(conn.lastMessageAt || 0);
+            if (pendingFor >= HEARTBEAT_TIMEOUT && quietFor >= HEARTBEAT_TIMEOUT) {
+                console.warn(`[${deviceId}] 心跳超时，关闭 WebSocket 以触发重连`);
+                conn.ws.close();
+            }
+            return;
+        }
+
+        try {
             conn.ws.send(JSON.stringify({ action: 'ping' }));
-            conn.timeoutTimer = setTimeout(() => {
-                if (conn.ws) conn.ws.close();
-            }, HEARTBEAT_TIMEOUT);
+            conn.heartbeatPending = true;
+            conn.heartbeatStartedAt = now;
+        } catch (error) {
+            console.warn(`[${deviceId}] 心跳发送失败，关闭 WebSocket 以触发重连`, error);
+            if (conn.ws) {
+                conn.ws.close();
+            }
         }
     }, HEARTBEAT_INTERVAL);
 }
@@ -2967,9 +4246,19 @@ function scheduleReconnect(deviceId, ip, port, pin) {
     const conn = connections[deviceId];
     if (!conn) return;
     clearTimeout(conn.reconnectTimer);
+    void requestSmartDiscoveryRefresh(`reconnect:${deviceId}`);
+    const attempt = Math.max(0, Number(conn.reconnectAttempts || 0));
+    const delay = Math.min(RECONNECT_MAX_INTERVAL, RECONNECT_BASE_INTERVAL * (2 ** Math.min(attempt, 6)));
+    conn.reconnectAttempts = attempt + 1;
     conn.reconnectTimer = setTimeout(() => {
-        connectDevice(deviceId, ip, port, pin);
-    }, RECONNECT_INTERVAL);
+        const latest = findDeviceByAnyId(deviceId, getDevices());
+        connectDevice(
+            deviceId,
+            latest?.ip || ip,
+            latest?.port || port,
+            latest?.pin || pin
+        );
+    }, delay);
 }
 
 function clearTimers(conn) {
@@ -2979,6 +4268,8 @@ function clearTimers(conn) {
     conn.heartbeatTimer = null;
     conn.timeoutTimer = null;
     conn.reconnectTimer = null;
+    conn.heartbeatPending = false;
+    conn.heartbeatStartedAt = 0;
 }
 
 function queueIncomingDesktopTransfer(deviceId, payload) {
@@ -3071,8 +4362,8 @@ async function beginIncomingDesktopFile(payload) {
         historyItemCount: Number(payload.history_item_count || 1),
     };
 
-    if (window.__TAURI__) {
-        await window.__TAURI__.core.invoke('begin_incoming_file', {
+    if (supportsNativeFileReceive()) {
+        await invokeNative('begin_incoming_file', {
             transferId,
             fileName: payload.file_name || 'file.bin',
             mimeType,
@@ -3088,8 +4379,8 @@ async function appendIncomingDesktopFileChunk(payload) {
         throw new Error('接收状态不存在');
     }
 
-    if (window.__TAURI__) {
-        await window.__TAURI__.core.invoke('append_incoming_file_chunk', {
+    if (supportsNativeFileReceive()) {
+        await invokeNative('append_incoming_file_chunk', {
             transferId,
             chunkBase64: payload.chunk_base64 || '',
         });
@@ -3107,8 +4398,8 @@ async function finishIncomingDesktopFile(payload) {
     }
 
     try {
-        if (window.__TAURI__) {
-            const savedPath = await window.__TAURI__.core.invoke('finish_incoming_file', {
+        if (supportsNativeFileReceive()) {
+            const savedPath = await invokeNative('finish_incoming_file', {
                 transferId,
                 saveTarget: transfer.saveTarget,
             });
@@ -3122,9 +4413,9 @@ async function finishIncomingDesktopFile(payload) {
                 } catch (scanError) {
                     console.warn('通知系统媒体库扫描失败', scanError);
                 }
-                showToast(`已保存到相册：${transfer.fileName}`);
+                showToast(`已保存到${getIncomingDesktopSavedLocationLabel(transfer.saveTarget)}：${transfer.fileName}`);
             } else {
-                showToast(`已保存到下载：${transfer.fileName}`);
+                showToast(`已保存到${getIncomingDesktopSavedLocationLabel(transfer.saveTarget)}：${transfer.fileName}`);
             }
             return savedPath;
         }
@@ -3148,6 +4439,10 @@ async function finishIncomingDesktopFile(payload) {
 }
 
 function resolveIncomingDesktopSaveTarget({ mimeType = '', isArchive = false } = {}) {
+    if (isIOSNativeApp()) {
+        return 'download';
+    }
+
     if (isArchive) {
         return 'download';
     }
@@ -3329,9 +4624,9 @@ async function cancelIncomingDesktopFile(transferId) {
     }
 
     delete incomingDesktopTransfers[transferId];
-    if (window.__TAURI__) {
+    if (supportsNativeFileReceive()) {
         try {
-            await window.__TAURI__.core.invoke('cancel_incoming_file', {
+            await invokeNative('cancel_incoming_file', {
                 transferId,
             });
         } catch (error) {
@@ -3454,16 +4749,7 @@ async function sendDeviceAction(deviceId, {
     setActionButtonsDisabled(deviceId, true);
 
     try {
-        const result = await new Promise((resolve, reject) => {
-            conn._sendCallback = resolve;
-            conn.ws.send(JSON.stringify({ action, ...payload }));
-            setTimeout(() => {
-                if (conn._sendCallback) {
-                    conn._sendCallback = null;
-                    reject(new Error('超时'));
-                }
-            }, timeoutMs);
-        });
+        const result = await sendDesktopRequest(conn, { action, ...payload }, timeoutMs);
 
         if (result.status === 'ok') {
             if (historyEntry) {
@@ -3477,6 +4763,7 @@ async function sendDeviceAction(deviceId, {
             btn.textContent = '✓';
             if (clearInput && input) {
                 input.value = '';
+                setSendDraft(deviceId, '');
             }
             return { ok: true };
         }
@@ -3514,10 +4801,10 @@ async function sendDeviceAction(deviceId, {
 
 async function sendText(deviceId) {
     const conn = connections[deviceId];
-    const input = $(`input-${deviceId}`);
-    const text = input.value.trim();
+    if (!conn || !conn.authenticated || !conn.ws) return;
 
-    if (!text || !conn || !conn.authenticated || !conn.ws) return;
+    const text = await resolveTextToSend(deviceId);
+    if (!text) return;
 
     const historyEntry = {
         id: Date.now(),
@@ -3549,9 +4836,10 @@ async function sendEnter(deviceId) {
 async function sendTextAndEnter(deviceId) {
     const conn = connections[deviceId];
     const input = $(`input-${deviceId}`);
-    const text = input.value.trim();
+    if (!conn || !conn.authenticated || !conn.ws) return;
 
-    if (!text || !conn || !conn.authenticated || !conn.ws) return;
+    const text = await resolveTextToSend(deviceId);
+    if (!text) return;
 
     const historyEntry = {
         id: Date.now(),
@@ -3576,7 +4864,24 @@ async function sendTextAndEnter(deviceId) {
         historyEntry.status = 'success';
         updateHistory(historyEntry);
         input.value = '';
+        setSendDraft(deviceId, '');
     }
+}
+
+async function resolveTextToSend(deviceId) {
+    const input = $(`input-${deviceId}`);
+    const typedText = (input?.value || '').trim();
+    if (typedText) {
+        return typedText;
+    }
+
+    const clipboardText = await readClipboardText();
+    if (clipboardText) {
+        return clipboardText;
+    }
+
+    showToast('输入框和剪贴板都没有可发送文字');
+    return '';
 }
 
 function readFileAsDataUrl(file) {
@@ -3586,6 +4891,514 @@ function readFileAsDataUrl(file) {
         reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
         reader.readAsDataURL(file);
     });
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildOutboundTransferId(prefix = 'mobile-file') {
+    return `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function uint8ArrayToBase64(bytes) {
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let index = 0; index < bytes.length; index += chunkSize) {
+        const slice = bytes.subarray(index, index + chunkSize);
+        binary += String.fromCharCode(...slice);
+    }
+    return btoa(binary);
+}
+
+async function readBlobChunkAsBase64(blob, offsetBytes, lengthBytes) {
+    const chunk = blob.slice(offsetBytes, offsetBytes + lengthBytes);
+    const buffer = await chunk.arrayBuffer();
+    return uint8ArrayToBase64(new Uint8Array(buffer));
+}
+
+function readPendingSharedContentChunkBase64At(itemIndex, offsetBytes, lengthBytes) {
+    if (!window.NativeShare) {
+        throw new Error('当前环境不支持分块读取共享文件');
+    }
+
+    const base64 = typeof window.NativeShare.readPendingSharedContentChunkBase64At === 'function'
+        ? window.NativeShare.readPendingSharedContentChunkBase64At(itemIndex, offsetBytes, lengthBytes)
+        : window.NativeShare.readPendingSharedContentChunkBase64?.(offsetBytes, lengthBytes);
+    if (typeof base64 !== 'string') {
+        throw new Error('共享文件分块读取失败');
+    }
+    return base64;
+}
+
+function readPendingSharedContentChunkBase64(offsetBytes, lengthBytes) {
+    return readPendingSharedContentChunkBase64At(0, offsetBytes, lengthBytes);
+}
+
+function calculateFileTransferAckTimeout(sizeBytes) {
+    const bySize = Math.ceil(Math.max(Number(sizeBytes) || 0, 1) / (8 * 1024 * 1024)) * 15000;
+    return Math.max(FILE_TRANSFER_ACK_TIMEOUT_MS, bySize);
+}
+
+function registerOutboundDesktopFileTransfer(deviceId, transferId, timeoutMs) {
+    const transfer = {
+        deviceId,
+        transferId,
+        state: 'pending',
+        errorMessage: '',
+        payload: null,
+        timeoutTimer: null,
+        resolve: null,
+        reject: null,
+        promise: null,
+    };
+
+    transfer.promise = new Promise((resolve, reject) => {
+        transfer.resolve = (payload) => {
+            if (transfer.state !== 'pending') {
+                return;
+            }
+            transfer.state = 'resolved';
+            transfer.payload = payload;
+            clearTimeout(transfer.timeoutTimer);
+            resolve(payload);
+        };
+        transfer.reject = (message) => {
+            if (transfer.state !== 'pending') {
+                return;
+            }
+            transfer.state = 'rejected';
+            transfer.errorMessage = message || '桌面端接收失败';
+            clearTimeout(transfer.timeoutTimer);
+            reject(new Error(transfer.errorMessage));
+        };
+    });
+
+    transfer.timeoutTimer = setTimeout(() => {
+        transfer.reject('等待桌面端完成确认超时');
+    }, timeoutMs);
+
+    outboundDesktopFileTransfers[transferId] = transfer;
+    return transfer;
+}
+
+function clearOutboundDesktopFileTransfer(transferId) {
+    const transfer = outboundDesktopFileTransfers[transferId];
+    if (!transfer) {
+        return;
+    }
+    clearTimeout(transfer.timeoutTimer);
+    delete outboundDesktopFileTransfers[transferId];
+}
+
+function settleOutboundDesktopFileTransfer(deviceId, payload) {
+    const transferId = payload?.transfer_id;
+    const transfer = transferId ? outboundDesktopFileTransfers[transferId] : null;
+    if (!transfer || transfer.deviceId !== deviceId) {
+        return false;
+    }
+
+    if (payload.action === 'incoming_file_saved') {
+        transfer.resolve(payload);
+    } else {
+        transfer.reject(payload.error || '桌面端接收失败');
+    }
+    return true;
+}
+
+function rejectOutboundDesktopTransfersForDevice(deviceId, message) {
+    Object.keys(outboundDesktopFileTransfers).forEach((transferId) => {
+        const transfer = outboundDesktopFileTransfers[transferId];
+        if (transfer?.deviceId === deviceId) {
+            transfer.reject(message || '连接已断开');
+        }
+    });
+}
+
+function sendWsJson(ws, payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        throw new Error('连接已断开');
+    }
+    ws.send(JSON.stringify(payload));
+}
+
+function sendDesktopRequest(conn, payload, timeoutMs = 5000) {
+    if (!conn || !conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new Error('未连接'));
+    }
+    if (conn._sendCallback) {
+        return Promise.reject(new Error('当前有未完成操作'));
+    }
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let timer = null;
+        const finish = (handler) => (value) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimeout(timer);
+            if (conn._sendCallback === callback) {
+                conn._sendCallback = null;
+            }
+            handler(value);
+        };
+        const callback = finish(resolve);
+        timer = setTimeout(() => {
+            finish(reject)(new Error('超时'));
+        }, timeoutMs);
+
+        conn._sendCallback = callback;
+        try {
+            sendWsJson(conn.ws, payload);
+        } catch (error) {
+            finish(reject)(error instanceof Error ? error : new Error(String(error || '发送失败')));
+        }
+    });
+}
+
+async function waitForFileTransferBufferDrain(conn, transferId) {
+    while (conn?.ws && conn.ws.readyState === WebSocket.OPEN && conn.ws.bufferedAmount > FILE_TRANSFER_WS_BUFFER_HIGH_WATER_BYTES) {
+        const transfer = outboundDesktopFileTransfers[transferId];
+        if (transfer?.state === 'rejected') {
+            throw new Error(transfer.errorMessage || '桌面端接收失败');
+        }
+        await sleep(FILE_TRANSFER_WS_BUFFER_POLL_MS);
+    }
+
+    if (!conn?.ws || conn.ws.readyState !== WebSocket.OPEN) {
+        throw new Error('连接已断开');
+    }
+
+    const transfer = outboundDesktopFileTransfers[transferId];
+    if (transfer?.state === 'rejected') {
+        throw new Error(transfer.errorMessage || '桌面端接收失败');
+    }
+}
+
+async function transferFileToDesktop(deviceId, {
+    fileName,
+    mimeType,
+    sizeBytes,
+    historyEntry = null,
+    readChunkBase64,
+    onProgress = null,
+}) {
+    const conn = connections[deviceId];
+
+    if (!conn || !conn.authenticated || !conn.ws) {
+        return { ok: false, error: '未连接' };
+    }
+
+    const safeFileName = fileName || 'file.bin';
+    const safeMimeType = mimeType || 'application/octet-stream';
+    const totalBytes = Math.max(Number(sizeBytes) || 0, 0);
+    const transferId = buildOutboundTransferId();
+    let transfer = null;
+
+    try {
+        const startResult = await sendDesktopRequest(conn, {
+            action: 'incoming_file_start',
+            transfer_id: transferId,
+            file_name: safeFileName,
+            mime_type: safeMimeType,
+            size_bytes: totalBytes,
+            is_archive: false,
+        }, FILE_TRANSFER_START_TIMEOUT_MS);
+
+        if (startResult.status !== 'ok') {
+            throw new Error(startResult.error || '桌面端拒绝接收文件');
+        }
+
+        transfer = registerOutboundDesktopFileTransfer(
+            deviceId,
+            transferId,
+            calculateFileTransferAckTimeout(totalBytes)
+        );
+
+        let sentBytes = 0;
+        while (sentBytes < totalBytes) {
+            const chunkLength = Math.min(FILE_TRANSFER_CHUNK_BYTES, totalBytes - sentBytes);
+            const chunkBase64 = await readChunkBase64(sentBytes, chunkLength);
+            if (typeof chunkBase64 !== 'string' || chunkBase64.length === 0) {
+                throw new Error('文件分块读取失败');
+            }
+
+            await waitForFileTransferBufferDrain(conn, transferId);
+            sendWsJson(conn.ws, {
+                action: 'incoming_file_chunk',
+                transfer_id: transferId,
+                chunk_base64: chunkBase64,
+            });
+
+            sentBytes += chunkLength;
+            if (onProgress && totalBytes > 0) {
+                const progress = Math.min(99, Math.max(1, Math.round((sentBytes / totalBytes) * 100)));
+                onProgress({
+                    stage: 'sending',
+                    sentBytes,
+                    totalBytes,
+                    progress,
+                });
+            }
+        }
+
+        await waitForFileTransferBufferDrain(conn, transferId);
+        onProgress?.({
+            stage: 'saving',
+            sentBytes: totalBytes,
+            totalBytes,
+            progress: 100,
+        });
+        sendWsJson(conn.ws, {
+            action: 'incoming_file_complete',
+            transfer_id: transferId,
+        });
+
+        const result = await transfer.promise;
+
+        if (historyEntry) {
+            historyEntry.status = 'success';
+            historyEntry.savedPath = result.saved_path || '';
+            updateHistory(historyEntry);
+        }
+        return { ok: true, savedPath: result.saved_path || '' };
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || '文件传输失败');
+        if (historyEntry) {
+            historyEntry.status = 'failed';
+            updateHistory(historyEntry);
+        }
+        try {
+            if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+                sendWsJson(conn.ws, {
+                    action: 'incoming_file_error',
+                    transfer_id: transferId,
+                    error: message,
+                });
+            }
+        } catch (notifyError) {
+            console.warn('通知桌面端取消文件传输失败', notifyError);
+        }
+        return { ok: false, error: message };
+    } finally {
+        clearOutboundDesktopFileTransfer(transferId);
+    }
+}
+
+async function sendFileToDesktopInChunks(deviceId, {
+    fileName,
+    mimeType,
+    sizeBytes,
+    buttonId,
+    pendingText,
+    historyEntry = null,
+    failureToast = false,
+    successToast = '',
+    readChunkBase64,
+}) {
+    const conn = connections[deviceId];
+    const btn = $(buttonId);
+
+    if (!btn || !conn || !conn.authenticated || !conn.ws) {
+        return { ok: false, error: '未连接' };
+    }
+
+    const originalText = btn.textContent;
+    btn.classList.add('sending');
+    btn.textContent = pendingText;
+    setActionButtonsDisabled(deviceId, true);
+
+    try {
+        const result = await transferFileToDesktop(deviceId, {
+            fileName,
+            mimeType,
+            sizeBytes,
+            historyEntry,
+            readChunkBase64,
+            onProgress: ({ stage, progress }) => {
+                btn.textContent = stage === 'saving' ? '保存中...' : `${progress}%`;
+            },
+        });
+
+        if (result.ok) {
+            if (successToast) {
+                showToast(successToast);
+            }
+            btn.classList.add('success');
+            btn.textContent = '✓';
+            return result;
+        }
+
+        if (failureToast) {
+            showToast(result.error || '文件传输失败');
+        }
+        btn.classList.add('fail');
+        btn.textContent = '✗';
+        return result;
+    } finally {
+        setTimeout(() => {
+            btn.classList.remove('sending', 'success', 'fail');
+            btn.textContent = originalText;
+            setActionButtonsDisabled(deviceId, !conn.authenticated);
+        }, 800);
+    }
+}
+
+function computeHistoryItemsAggregateStatus(items = []) {
+    const normalizedItems = items.map((item) => normalizeHistoryItem(item));
+    if (!normalizedItems.length) {
+        return 'pending';
+    }
+
+    if (normalizedItems.some((item) => item.status === 'pending')) {
+        return 'pending';
+    }
+
+    const successCount = normalizedItems.filter((item) => item.status === 'success').length;
+    const failedCount = normalizedItems.filter((item) => item.status === 'failed').length;
+    if (failedCount === 0) {
+        return 'success';
+    }
+    if (successCount === 0) {
+        return 'failed';
+    }
+    return 'partial';
+}
+
+function createOutboundBatchHistoryEntry(deviceId, items = []) {
+    const normalizedItems = items.map((item) => normalizeHistoryItem({
+        kind: item.kind || normalizeHistoryKind(item.mimeType || ''),
+        fileName: item.fileName || '文件',
+        mimeType: item.mimeType || 'application/octet-stream',
+        thumbnailDataUrl: item.thumbnailDataUrl || '',
+        status: 'pending',
+    }));
+    const summary = buildHistoryItemsSummary(normalizedItems);
+    const firstItem = normalizedItems[0] || null;
+    const historyEntry = {
+        id: buildOutboundTransferId('mobile-batch-history'),
+        sessionId: buildOutboundTransferId('mobile-batch-session'),
+        timestamp: getLocalTimestamp(),
+        text: summary.text,
+        status: 'pending',
+        kind: summary.kind,
+        itemCount: normalizedItems.length,
+        saveTarget: 'desktop-inbox',
+        items: normalizedItems,
+        fileName: firstItem?.fileName || '',
+        mimeType: firstItem?.mimeType || '',
+        thumbnailDataUrl: firstItem?.thumbnailDataUrl || '',
+        ...buildHistoryTargetMeta(deviceId),
+    };
+    addHistory(historyEntry);
+    return historyEntry;
+}
+
+function buildBatchTransferSummaryToast({ totalCount, successCount, failedCount }) {
+    if (successCount === totalCount) {
+        return `已发送 ${totalCount} 项到 VibeDrop 收件箱`;
+    }
+    if (failedCount === totalCount) {
+        return `${totalCount} 项发送失败`;
+    }
+    return `已发送 ${successCount} 项，失败 ${failedCount} 项`;
+}
+
+async function sendFilesToDesktopBatch(deviceId, items, {
+    buttonId,
+    pendingText = '批量传输中...',
+}) {
+    const conn = connections[deviceId];
+    const btn = $(buttonId);
+    const normalizedItems = Array.isArray(items) ? items : [];
+
+    if (!btn || !conn || !conn.authenticated || !conn.ws || normalizedItems.length <= 1) {
+        return { ok: false, error: '未连接或批量内容无效' };
+    }
+
+    const historyEntry = createOutboundBatchHistoryEntry(deviceId, normalizedItems);
+    const originalText = btn.textContent;
+    let successCount = 0;
+    let failedCount = 0;
+    const failedIndexes = [];
+
+    btn.classList.add('sending');
+    btn.textContent = pendingText;
+    setActionButtonsDisabled(deviceId, true);
+
+    try {
+        for (let index = 0; index < normalizedItems.length; index += 1) {
+            const item = normalizedItems[index];
+            const batchItem = historyEntry.items[index];
+            const prefix = `${index + 1}/${normalizedItems.length}`;
+
+            const result = await transferFileToDesktop(deviceId, {
+                fileName: item.fileName,
+                mimeType: item.mimeType,
+                sizeBytes: item.sizeBytes,
+                readChunkBase64: item.readChunkBase64,
+                onProgress: ({ stage, progress }) => {
+                    btn.textContent = stage === 'saving'
+                        ? `${prefix} · 保存中`
+                        : `${prefix} · ${progress}%`;
+                },
+            });
+
+            if (result.ok) {
+                successCount += 1;
+                historyEntry.items[index] = normalizeHistoryItem({
+                    ...batchItem,
+                    status: 'success',
+                    savedPath: result.savedPath || '',
+                    error: '',
+                });
+            } else {
+                failedCount += 1;
+                failedIndexes.push(index);
+                historyEntry.items[index] = normalizeHistoryItem({
+                    ...batchItem,
+                    status: 'failed',
+                    error: result.error || '发送失败',
+                });
+            }
+
+            historyEntry.status = computeHistoryItemsAggregateStatus(historyEntry.items);
+            updateHistory(historyEntry);
+        }
+
+        showToast(buildBatchTransferSummaryToast({
+            totalCount: normalizedItems.length,
+            successCount,
+            failedCount,
+        }));
+
+        if (failedCount === 0) {
+            btn.classList.add('success');
+            btn.textContent = '✓';
+        } else if (successCount === 0) {
+            btn.classList.add('fail');
+            btn.textContent = '✗';
+        } else {
+            btn.classList.add('success');
+            btn.textContent = `${successCount}/${normalizedItems.length}`;
+        }
+
+        return {
+            ok: failedCount === 0,
+            partial: successCount > 0 && failedCount > 0,
+            successCount,
+            failedCount,
+            failedIndexes,
+        };
+    } finally {
+        setTimeout(() => {
+            btn.classList.remove('sending', 'success', 'fail');
+            btn.textContent = originalText;
+            setActionButtonsDisabled(deviceId, !conn.authenticated);
+        }, 900);
+    }
 }
 
 function getTargetName(deviceId) {
@@ -3710,17 +5523,13 @@ async function sendSelectedFile(deviceId, file) {
     const conn = connections[deviceId];
     if (!file || !conn || !conn.authenticated || !conn.ws) return;
 
-    if (file.size > MAX_FILE_TRANSFER_BYTES) {
-        showToast('文件过大，请选择 32MB 以内的文件');
-        return;
-    }
-
     const historyEntry = {
         id: Date.now(),
         timestamp: getLocalTimestamp(),
         text: `[文件] ${file.name}`,
         status: 'pending',
         kind: 'file',
+        saveTarget: 'desktop-inbox',
         fileName: file.name,
         mimeType: file.type || 'application/octet-stream',
         ...buildHistoryTargetMeta(deviceId),
@@ -3728,26 +5537,16 @@ async function sendSelectedFile(deviceId, file) {
     addHistory(historyEntry);
 
     try {
-        const dataUrl = await readFileAsDataUrl(file);
-        const commaIndex = String(dataUrl).indexOf(',');
-        if (commaIndex === -1) {
-            throw new Error('文件编码失败');
-        }
-
-        const fileBase64 = String(dataUrl).slice(commaIndex + 1);
-        await sendDeviceAction(deviceId, {
-            action: 'file_download',
-            payload: {
-                file_name: file.name,
-                mime_type: file.type || 'application/octet-stream',
-                file_base64: fileBase64,
-            },
+        await sendFileToDesktopInChunks(deviceId, {
+            fileName: file.name,
+            mimeType: file.type || 'application/octet-stream',
+            sizeBytes: file.size,
             buttonId: `filebtn-${deviceId}`,
             pendingText: '传文件中...',
             historyEntry,
             failureToast: true,
-            successToast: '文件已保存到 Mac 下载文件夹',
-            timeoutMs: 45000,
+            successToast: '文件已保存到 VibeDrop 收件箱',
+            readChunkBase64: (offsetBytes, lengthBytes) => readBlobChunkAsBase64(file, offsetBytes, lengthBytes),
         });
     } catch (error) {
         historyEntry.status = 'failed';
@@ -3756,9 +5555,46 @@ async function sendSelectedFile(deviceId, file) {
     }
 }
 
-function normalizePendingSharedContent(raw) {
-    if (!raw) {
+async function sendSelectedFilesBatch(deviceId, files) {
+    const conn = connections[deviceId];
+    const normalizedFiles = Array.from(files || []).filter(Boolean);
+    if (normalizedFiles.length <= 1 || !conn || !conn.authenticated || !conn.ws) {
+        return;
+    }
+
+    const batchItems = normalizedFiles.map((file) => ({
+        fileName: file.name || 'file.bin',
+        mimeType: file.type || 'application/octet-stream',
+        sizeBytes: Number(file.size || 0),
+        kind: normalizeHistoryKind(file.type || ''),
+        readChunkBase64: (offsetBytes, lengthBytes) => readBlobChunkAsBase64(file, offsetBytes, lengthBytes),
+    }));
+
+    await sendFilesToDesktopBatch(deviceId, batchItems, {
+        buttonId: `filebtn-${deviceId}`,
+        pendingText: '批量传输中...',
+    });
+}
+
+function normalizePendingSharedContentItem(raw) {
+    if (!raw || !raw.displayName) {
         return null;
+    }
+
+    const mimeType = raw.mimeType || 'application/octet-stream';
+    return {
+        cachePath: raw.cachePath || '',
+        displayName: raw.displayName,
+        mimeType,
+        sizeBytes: Number(raw.sizeBytes || 0),
+        isImage: Boolean(raw.isImage || mimeType.startsWith('image/')),
+        kind: normalizeHistoryKind(mimeType),
+    };
+}
+
+function normalizePendingSharedContents(raw) {
+    if (!raw) {
+        return [];
     }
 
     let data = raw;
@@ -3766,19 +5602,35 @@ function normalizePendingSharedContent(raw) {
         try {
             data = JSON.parse(raw);
         } catch {
-            return null;
+            return [];
         }
     }
 
-    if (!data || !data.displayName) {
-        return null;
-    }
+    const candidates = Array.isArray(data)
+        ? data
+        : Array.isArray(data?.items)
+            ? data.items
+            : [data];
 
+    return candidates
+        .map((item) => normalizePendingSharedContentItem(item))
+        .filter(Boolean);
+}
+
+function getPrimaryPendingSharedContent() {
+    return pendingSharedContents[0] || null;
+}
+
+function summarizePendingSharedContents(items = pendingSharedContents) {
+    const normalizedItems = items.map((item) => normalizePendingSharedContentItem(item)).filter(Boolean);
+    const imageCount = normalizedItems.filter((item) => item.kind === 'image').length;
+    const videoCount = normalizedItems.filter((item) => item.kind === 'video').length;
+    const fileCount = normalizedItems.length - imageCount - videoCount;
     return {
-        displayName: data.displayName,
-        mimeType: data.mimeType || 'application/octet-stream',
-        sizeBytes: Number(data.sizeBytes || 0),
-        isImage: Boolean(data.isImage),
+        totalCount: normalizedItems.length,
+        imageCount,
+        videoCount,
+        fileCount,
     };
 }
 
@@ -3801,18 +5653,38 @@ function renderPendingSharedContent() {
     const hint = $('share-inbox-hint');
     if (!card || !title || !hint) return;
 
-    if (!pendingSharedContent) {
+    if (!pendingSharedContents.length) {
         card.classList.add('hidden');
         title.textContent = '';
         hint.textContent = '';
         return;
     }
 
-    const sizeText = formatFileSize(pendingSharedContent.sizeBytes);
-    title.textContent = pendingSharedContent.displayName;
-    hint.textContent = pendingSharedContent.isImage
-        ? `图片已从系统分享导入${sizeText ? ` · ${sizeText}` : ''}，现在可直接点任意设备的“传图到剪贴板”或“传文件到下载”。`
-        : `文件已从系统分享导入${sizeText ? ` · ${sizeText}` : ''}，现在可直接点任意设备的“传文件到下载”。`;
+    if (pendingSharedContents.length === 1) {
+        const [shared] = pendingSharedContents;
+        const sizeText = formatFileSize(shared.sizeBytes);
+        title.textContent = shared.displayName;
+        hint.textContent = shared.isImage
+            ? `图片已从系统分享导入${sizeText ? ` · ${sizeText}` : ''}，现在可直接点任意设备的“传图到剪贴板”或“传到收件箱”。`
+            : `文件已从系统分享导入${sizeText ? ` · ${sizeText}` : ''}，现在可直接点任意设备的“传到收件箱”。`;
+        card.classList.remove('hidden');
+        return;
+    }
+
+    const summary = summarizePendingSharedContents();
+    const segments = [];
+    if (summary.imageCount) {
+        segments.push(`图片 ${summary.imageCount} 张`);
+    }
+    if (summary.videoCount) {
+        segments.push(`视频 ${summary.videoCount} 个`);
+    }
+    if (summary.fileCount) {
+        segments.push(`文件 ${summary.fileCount} 项`);
+    }
+
+    title.textContent = `已选择 ${summary.totalCount} 项`;
+    hint.textContent = `${segments.join(' · ')}。现在可直接点任意设备的“传到收件箱”批量发送。`;
     card.classList.remove('hidden');
 }
 
@@ -3824,35 +5696,43 @@ function clearPendingSharedContentState({ silent = false } = {}) {
             console.warn('清理共享内容失败', error);
         }
     }
-    pendingSharedContent = null;
+    pendingSharedContents = [];
     renderPendingSharedContent();
     if (!silent) {
         showToast('已清除共享内容');
     }
 }
 
-function setPendingSharedContent(raw, { announce = false } = {}) {
-    const normalized = normalizePendingSharedContent(raw);
-    if (!normalized) {
+function setPendingSharedContents(raw, { announce = false } = {}) {
+    const normalized = normalizePendingSharedContents(raw);
+    if (!normalized.length) {
+        pendingSharedContents = [];
+        renderPendingSharedContent();
         return;
     }
-    pendingSharedContent = normalized;
+    pendingSharedContents = normalized;
     renderPendingSharedContent();
     focusSendView();
     if (announce) {
-        showToast(`已接收共享内容：${normalized.displayName}`);
+        showToast(
+            normalized.length === 1
+                ? `已接收共享内容：${normalized[0].displayName}`
+                : `已接收共享内容：${normalized.length} 项`
+        );
     }
 }
 
 async function loadPendingSharedContent() {
-    if (!window.NativeShare || !window.NativeShare.getPendingSharedContent) {
+    if (!window.NativeShare) {
         return;
     }
 
     try {
-        const raw = window.NativeShare.getPendingSharedContent();
+        const raw = typeof window.NativeShare.getPendingSharedContents === 'function'
+            ? window.NativeShare.getPendingSharedContents()
+            : window.NativeShare.getPendingSharedContent?.();
         if (raw) {
-            setPendingSharedContent(raw);
+            setPendingSharedContents(raw);
         } else {
             renderPendingSharedContent();
         }
@@ -3868,16 +5748,19 @@ function initNativeShareInbox() {
     }
 
     window.addEventListener('native-incoming-share', (event) => {
-        setPendingSharedContent(event.detail, { announce: true });
+        const payload = event.detail?.items || event.detail;
+        setPendingSharedContents(payload, { announce: true });
     });
 }
 
-function readPendingSharedContentBase64() {
-    if (!window.NativeShare || !window.NativeShare.readPendingSharedContentBase64) {
+function readPendingSharedContentBase64At(itemIndex) {
+    if (!window.NativeShare) {
         throw new Error('当前环境不支持系统分享内容读取');
     }
 
-    const base64 = window.NativeShare.readPendingSharedContentBase64();
+    const base64 = typeof window.NativeShare.readPendingSharedContentBase64At === 'function'
+        ? window.NativeShare.readPendingSharedContentBase64At(itemIndex)
+        : window.NativeShare.readPendingSharedContentBase64?.();
     if (!base64) {
         throw new Error('共享内容已失效，请重新分享一次');
     }
@@ -3885,13 +5768,31 @@ function readPendingSharedContentBase64() {
     return base64;
 }
 
+function readPendingSharedContentBase64() {
+    return readPendingSharedContentBase64At(0);
+}
+
+function retainPendingSharedContentsByIndexes(indexes = []) {
+    const keepIndexes = Array.from(new Set(indexes.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0)));
+    if (window.NativeShare && typeof window.NativeShare.retainPendingSharedContentIndexes === 'function') {
+        try {
+            window.NativeShare.retainPendingSharedContentIndexes(JSON.stringify(keepIndexes));
+        } catch (error) {
+            console.warn('原生保留失败项缓存失败', error);
+        }
+    }
+    pendingSharedContents = keepIndexes
+        .map((index) => pendingSharedContents[index])
+        .filter(Boolean);
+    renderPendingSharedContent();
+}
+
 async function sendPendingSharedImage(deviceId) {
+    const shared = getPrimaryPendingSharedContent();
     const conn = connections[deviceId];
-    if (!pendingSharedContent || !pendingSharedContent.isImage || !conn || !conn.authenticated || !conn.ws) {
+    if (!shared || pendingSharedContents.length !== 1 || !shared.isImage || !conn || !conn.authenticated || !conn.ws) {
         return;
     }
-
-    const shared = pendingSharedContent;
     const historyEntry = {
         id: Date.now(),
         timestamp: getLocalTimestamp(),
@@ -3905,7 +5806,7 @@ async function sendPendingSharedImage(deviceId) {
     addHistory(historyEntry);
 
     try {
-        const imageBase64 = readPendingSharedContentBase64();
+        const imageBase64 = readPendingSharedContentBase64At(0);
         const dataUrl = `data:${shared.mimeType};base64,${imageBase64}`;
 
         try {
@@ -3944,18 +5845,18 @@ async function sendPendingSharedImage(deviceId) {
 }
 
 async function sendPendingSharedFile(deviceId) {
+    const shared = getPrimaryPendingSharedContent();
     const conn = connections[deviceId];
-    if (!pendingSharedContent || !conn || !conn.authenticated || !conn.ws) {
+    if (!shared || pendingSharedContents.length !== 1 || !conn || !conn.authenticated || !conn.ws) {
         return;
     }
-
-    const shared = pendingSharedContent;
     const historyEntry = {
         id: Date.now(),
         timestamp: getLocalTimestamp(),
         text: `[文件] ${shared.displayName}`,
         status: 'pending',
         kind: 'file',
+        saveTarget: 'desktop-inbox',
         fileName: shared.displayName,
         mimeType: shared.mimeType,
         ...buildHistoryTargetMeta(deviceId),
@@ -3963,20 +5864,18 @@ async function sendPendingSharedFile(deviceId) {
     addHistory(historyEntry);
 
     try {
-        const fileBase64 = readPendingSharedContentBase64();
-        const result = await sendDeviceAction(deviceId, {
-            action: 'file_download',
-            payload: {
-                file_name: shared.displayName,
-                mime_type: shared.mimeType,
-                file_base64: fileBase64,
-            },
+        const result = await sendFileToDesktopInChunks(deviceId, {
+            fileName: shared.displayName,
+            mimeType: shared.mimeType,
+            sizeBytes: shared.sizeBytes,
             buttonId: `filebtn-${deviceId}`,
             pendingText: '传文件中...',
             historyEntry,
             failureToast: true,
-            successToast: '文件已保存到 Mac 下载文件夹',
-            timeoutMs: 45000,
+            successToast: '文件已保存到 VibeDrop 收件箱',
+            readChunkBase64: (offsetBytes, lengthBytes) => (
+                Promise.resolve(readPendingSharedContentChunkBase64At(0, offsetBytes, lengthBytes))
+            ),
         });
 
         if (result.ok) {
@@ -3986,6 +5885,38 @@ async function sendPendingSharedFile(deviceId) {
         historyEntry.status = 'failed';
         updateHistory(historyEntry);
         showToast(`共享文件发送失败：${error.message}`);
+    }
+}
+
+async function sendPendingSharedFilesBatch(deviceId) {
+    const conn = connections[deviceId];
+    if (pendingSharedContents.length <= 1 || !conn || !conn.authenticated || !conn.ws) {
+        return;
+    }
+
+    const sharedItems = pendingSharedContents.slice();
+    const batchItems = sharedItems.map((shared, index) => ({
+        fileName: shared.displayName,
+        mimeType: shared.mimeType,
+        sizeBytes: shared.sizeBytes,
+        kind: shared.kind,
+        readChunkBase64: (offsetBytes, lengthBytes) => (
+            Promise.resolve(readPendingSharedContentChunkBase64At(index, offsetBytes, lengthBytes))
+        ),
+    }));
+
+    const result = await sendFilesToDesktopBatch(deviceId, batchItems, {
+        buttonId: `filebtn-${deviceId}`,
+        pendingText: '批量传输中...',
+    });
+
+    if (result.ok) {
+        clearPendingSharedContentState({ silent: true });
+        return;
+    }
+
+    if (result.partial) {
+        retainPendingSharedContentsByIndexes(result.failedIndexes || []);
     }
 }
 
@@ -5071,12 +7002,15 @@ function renderHistory() {
     renderHistoryHeatmap(baseEntries);
     renderHistoryFilterSummary(baseEntries);
     const filtered = applyHistoryHeatmapSelection(baseEntries);
+    const hasSearchQuery = Boolean(normalizeSearchText(currentHistoryFilters.query));
 
     if (filtered.length === 0) {
         currentRenderedHistoryEntries = [];
         const emptyText = historyHeatmapState.selectionDate && historyHeatmapState.selectionHour != null
             ? '这个时段没有符合条件的记录'
-            : '没有符合筛选条件的记录';
+            : hasSearchQuery
+                ? '没有匹配的历史记录'
+                : '没有符合筛选条件的记录';
         list.innerHTML = `<p class="empty-hint">${emptyText}</p>`;
         return;
     }
@@ -5201,12 +7135,33 @@ function isHistoryMediaEntry(entry) {
     return ['image', 'video', 'media'].includes(entry.kind);
 }
 
+function getIncomingDesktopSavedLocationLabel(saveTarget = '') {
+    if (saveTarget === 'gallery' || saveTarget === 'gallery-image' || saveTarget === 'gallery-video') {
+        return '相册';
+    }
+    if (isIOSNativeApp()) {
+        return 'VibeDrop 收件箱';
+    }
+    return '下载';
+}
+
+function getDesktopIncomingHistoryHint(saveTarget = '') {
+    if (saveTarget === 'gallery' || saveTarget === 'gallery-image' || saveTarget === 'gallery-video') {
+        return '已从 Mac 保存到手机相册';
+    }
+    if (isIOSNativeApp()) {
+        return '已从 Mac 保存到 VibeDrop 收件箱';
+    }
+    return '已从 Mac 保存到手机下载';
+}
+
 function getHistoryEntryHint(entry) {
     if (entry.direction === 'desktop_to_mobile') {
-        if (entry.saveTarget === 'gallery') {
-            return '已从 Mac 保存到手机相册';
-        }
-        return '已从 Mac 保存到手机下载';
+        return getDesktopIncomingHistoryHint(entry.saveTarget);
+    }
+
+    if (entry.saveTarget === 'desktop-inbox') {
+        return '已保存到 VibeDrop 收件箱';
     }
 
     if (entry.kind === 'image') {
@@ -5216,7 +7171,7 @@ function getHistoryEntryHint(entry) {
         return '已发送到 Mac';
     }
     if (entry.kind === 'file') {
-        return '已保存到 Mac 下载文件夹';
+        return '已保存到 VibeDrop 收件箱';
     }
     return '';
 }
@@ -5245,6 +7200,17 @@ function getHistoryStatusLabel(entry) {
     if (entry.status === 'partial') return '部分成功';
     if (entry.status === 'failed') return '失败';
     return '发送中';
+}
+
+function getHistoryKindLabel(kind = 'text') {
+    const labels = {
+        text: '文字',
+        image: '图片',
+        video: '视频',
+        media: '媒体',
+        file: '文件',
+    };
+    return labels[kind] || kind || '文字';
 }
 
 function renderHistoryEntryContent(entry) {
@@ -5366,6 +7332,10 @@ function filterHistoryEntries(history, filters = currentHistoryFilters) {
             return false;
         }
 
+        if (!matchesHistorySearch(hydratedEntry, filters)) {
+            return false;
+        }
+
         return true;
     });
 }
@@ -5441,6 +7411,44 @@ function parseClockMinutes(value) {
     return Number(hour) * 60 + Number(minute);
 }
 
+function normalizeSearchText(value) {
+    return String(value || '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function tokenizeSearchQuery(query) {
+    const normalized = normalizeSearchText(query);
+    return normalized ? normalized.split(' ') : [];
+}
+
+function buildHistorySearchIndex(entry) {
+    const items = getHistoryEntryItems(entry);
+    return normalizeSearchText([
+        entry.text,
+        entry.targetAlias,
+        entry.targetName,
+        entry.targetDeviceName,
+        entry.fileName,
+        entry.kind,
+        entry.status,
+        getHistoryKindLabel(entry.kind),
+        getHistoryStatusLabel(entry),
+        ...items.map((item) => item.fileName),
+    ].join(' '));
+}
+
+function matchesHistorySearch(entry, filters = currentHistoryFilters) {
+    const tokens = tokenizeSearchQuery(filters.query);
+    if (!tokens.length) {
+        return true;
+    }
+
+    const searchIndex = buildHistorySearchIndex(entry);
+    return tokens.every((token) => searchIndex.includes(token));
+}
+
 function matchesKind(entry, filters = currentHistoryFilters) {
     if (filters.kind === 'all') {
         return true;
@@ -5462,6 +7470,10 @@ function renderHistoryFilterSummary(baseEntries = filterHistoryEntries(getHistor
     if (!summary) return;
 
     const labels = [];
+    const queryLabel = String(currentHistoryFilters.query || '').trim();
+    if (queryLabel) {
+        labels.push(`搜索：${queryLabel}`);
+    }
     const deviceLabel = getHistoryDeviceLabel(currentHistoryFilters.device);
     if (deviceLabel) labels.push(deviceLabel);
 
@@ -5569,6 +7581,43 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ---- 剪贴板读取（Android 原生桥优先 → Tauri 原生 → 浏览器 API）----
+async function readClipboardText() {
+    const readers = [
+        () => {
+            if (window.NativeClipboard && typeof window.NativeClipboard.readText === 'function') {
+                return window.NativeClipboard.readText();
+            }
+            return null;
+        },
+        () => {
+            if (window.__TAURI__ && window.__TAURI__.clipboardManager && typeof window.__TAURI__.clipboardManager.readText === 'function') {
+                return window.__TAURI__.clipboardManager.readText();
+            }
+            return null;
+        },
+        () => {
+            if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+                return navigator.clipboard.readText();
+            }
+            return null;
+        },
+    ];
+
+    for (const read of readers) {
+        try {
+            const text = await read();
+            if (typeof text === 'string' && text.trim()) {
+                return text.trim();
+            }
+        } catch (e) {
+            console.warn('读取剪贴板失败，尝试下一个 API', e);
+        }
+    }
+
+    return '';
 }
 
 // ---- 剪贴板写入（透明 Activity 优先 → Tauri 原生 → 浏览器 API）----

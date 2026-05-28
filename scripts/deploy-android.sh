@@ -31,7 +31,7 @@ Regenerates app icon assets, builds, signs, installs, and restarts the Android a
 
 Options:
   --device <serial>   Use the specified ADB device serial
-  --skip-icons        Skip regenerating icons from 图标.jpg
+  --skip-icons        Skip regenerating icons from APP_ICON_SOURCE or the default purple app icon source
   --sync-static       Sync mobile/src shared frontend files into desktop/static first
   --skip-build        Reuse the existing unsigned APK and only sign/install
   --skip-install      Stop after signing the APK
@@ -63,7 +63,7 @@ require_cmd() {
 
 regenerate_icons() {
   [[ -f "$ICON_GENERATOR" ]] || fail "Icon generator not found: $ICON_GENERATOR"
-  log "Regenerating icon assets from 图标.jpg"
+  log "Regenerating icon assets from APP_ICON_SOURCE or default icon source"
   python3 "$ICON_GENERATOR"
 }
 
