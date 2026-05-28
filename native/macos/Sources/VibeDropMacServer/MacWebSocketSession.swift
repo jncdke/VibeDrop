@@ -58,6 +58,7 @@ public struct MacServerStatusEnvelope: Codable, Equatable, Sendable {
 public enum MacServerOutbound: Equatable, Sendable {
     case status(MacServerStatusEnvelope)
     case action(VibeDropAction)
+    case rawJSON([String: String])
 
     public func jsonData() throws -> Data {
         switch self {
@@ -65,6 +66,8 @@ public enum MacServerOutbound: Equatable, Sendable {
             return try JSONEncoder().encode(envelope)
         case let .action(action):
             return try JSONEncoder().encode(["action": action.rawValue])
+        case let .rawJSON(object):
+            return try JSONSerialization.data(withJSONObject: object, options: [])
         }
     }
 }

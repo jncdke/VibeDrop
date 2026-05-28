@@ -19,10 +19,15 @@ let package = Package(
         .library(
             name: "VibeDropMacServer",
             targets: ["VibeDropMacServer"]
+        ),
+        .executable(
+            name: "VibeDropMacServerPreview",
+            targets: ["VibeDropMacServerPreview"]
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0")
+        .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.70.0")
     ],
     targets: [
         .target(name: "VibeDropNativeCore"),
@@ -35,7 +40,17 @@ let package = Package(
         ),
         .target(
             name: "VibeDropMacServer",
-            dependencies: ["VibeDropNativeCore"]
+            dependencies: [
+                "VibeDropNativeCore",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOWebSocket", package: "swift-nio")
+            ]
+        ),
+        .executableTarget(
+            name: "VibeDropMacServerPreview",
+            dependencies: ["VibeDropMacServer"]
         ),
         .testTarget(
             name: "VibeDropNativeCoreTests",

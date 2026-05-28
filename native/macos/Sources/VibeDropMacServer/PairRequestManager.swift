@@ -72,6 +72,7 @@ public final class PairRequestManager: @unchecked Sendable {
     private var entries: [String: Entry] = [:]
     private var sequence: UInt64 = 1
     private let ttlSeconds: Int
+    private let lock = NSLock()
 
     public init(ttlSeconds: Int = 180) {
         self.ttlSeconds = ttlSeconds
@@ -83,6 +84,9 @@ public final class PairRequestManager: @unchecked Sendable {
         configuration: MacServerConfiguration,
         now: Date = Date()
     ) throws -> PairRequestAccepted {
+        lock.lock()
+        defer { lock.unlock() }
+
         let normalizedClientId = clientId.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedClientName = clientName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedClientId.isEmpty, !normalizedClientName.isEmpty else {
@@ -123,6 +127,8 @@ public final class PairRequestManager: @unchecked Sendable {
     }
 
     public func pendingRequests(now: Date = Date()) -> [PairRequestInfo] {
+        lock.lock()
+        defer { lock.unlock() }
         prune(now: now)
         return entries.values
             .filter { $0.status == .pending }
@@ -131,11 +137,11 @@ public final class PairRequestManager: @unchecked Sendable {
     }
 
     public func approve(_ requestId: String, now: Date = Date()) throws {
-        try setStatus(requestId, status: .approved, now: now)
+        try setStatusLocked(requestId, status: .approved, now: now)
     }
 
     public func reject(_ requestId: String, now: Date = Date()) throws {
-        try setStatus(requestId, status: .rejected, now: now)
+        try setStatusLocked(requestId, status: .rejected, now: now)
     }
 
     public func status(
@@ -144,6 +150,8 @@ public final class PairRequestManager: @unchecked Sendable {
         advertisedIP: String? = nil,
         now: Date = Date()
     ) -> PairRequestStatusResponse {
+        lock.lock()
+        defer { lock.unlock() }
         prune(now: now)
         guard let entry = entries[requestId] else {
             return PairRequestStatusResponse(
@@ -195,7 +203,9 @@ public final class PairRequestManager: @unchecked Sendable {
         }
     }
 
-    private func setStatus(_ requestId: String, status: Status, now: Date) throws {
+    private func setStatusLocked(_ requestId: String, status: Status, now: Date) throws {
+        lock.lock()
+        defer { lock.unlock() }
         prune(now: now)
         guard var entry = entries[requestId] else {
             throw PairError.unknownRequest
