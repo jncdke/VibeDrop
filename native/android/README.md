@@ -11,6 +11,7 @@
 5. 当前已接入手动 Mac 配置、Room 历史列表、旧 `history.json` 一次性迁移、v1 文本发送和剪贴板直发兜底。
 6. 当前已接入 UDP 广播发现、已知设备 `/discover` 校验、Mac 端配对请求和状态轮询。
 7. 当前已接入前台服务版后台剪贴板同步，使用 v1 `clipboard_sync` 角色接收 Mac 剪贴板。
+8. 当前已接入 Home Vault 直同步，从 Room 历史导出 payload 并 POST 到 `/api/android-history`。
 
 ## 当前可用闭环
 
@@ -21,6 +22,7 @@
 5. release 包首次覆盖安装时会尝试读取旧 Tauri 私有目录里的 `history.json` 并导入 Room；debug 预览包因为 applicationId suffix 不会读到旧正式包私有目录。
 6. 设置页点击“扫描”会寻找当前局域网里的旧 Mac Tauri 服务；点击“配对”后 Mac 会弹出确认码，批准后原生 Android 自动保存 PIN 和连接信息。
 7. App 运行后会启动 `ClipboardSyncService`，从 Room 读取已保存 Mac，建立后台 WebSocket，收到 `clipboard` 消息后写入 Android 剪贴板。透明 Activity 兜底和详细诊断仍属于后续补齐项。
+8. 设置页可以配置 Home Vault 地址，点击“同步到 Mac mini”会上传原生 Room 历史；当前同步范围是历史主表，媒体 item/缩略图后续随文件传输和媒体历史一起补齐。
 
 ## 构建
 

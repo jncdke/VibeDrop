@@ -73,6 +73,9 @@ fun VibeDropApp(container: AppContainer) {
     var discoveryStatus by remember { mutableStateOf("还未扫描附近 Mac") }
     var discoveryBusy by remember { mutableStateOf(false) }
     var pairingDesktopKey by remember { mutableStateOf<String?>(null) }
+    var homeVaultUrl by rememberSaveable { mutableStateOf(container.homeVaultRepository.loadEndpoint()) }
+    var homeVaultStatus by remember { mutableStateOf("还未同步") }
+    var homeVaultBusy by remember { mutableStateOf(false) }
     val devices by container.deviceRepository.observeDevices().collectAsState(initial = emptyList())
     val history by container.historyRepository.observeRecent().collectAsState(initial = emptyList())
     val controllers = remember(devices) {
@@ -137,6 +140,10 @@ fun VibeDropApp(container: AppContainer) {
                     discoveryStatus = discoveryStatus,
                     discoveryBusy = discoveryBusy,
                     pairingDesktopKey = pairingDesktopKey,
+                    homeVaultUrl = homeVaultUrl,
+                    homeVaultStatus = homeVaultStatus,
+                    homeVaultBusy = homeVaultBusy,
+                    onHomeVaultUrlChange = { homeVaultUrl = it },
                     onDiscover = {
                         if (discoveryBusy) return@SettingsScreen
                         scope.launch {
@@ -213,6 +220,28 @@ fun VibeDropApp(container: AppContainer) {
                                 discoveryStatus = status?.error ?: "配对未完成，请重新发起"
                             }
                             pairingDesktopKey = null
+                        }
+                    },
+                    onSyncHomeVault = {
+                        if (homeVaultBusy) return@SettingsScreen
+                        scope.launch {
+                            homeVaultBusy = true
+                            homeVaultStatus = "正在同步..."
+                            val result = runCatching {
+                                withContext(Dispatchers.IO) {
+                                    container.homeVaultRepository.saveEndpoint(homeVaultUrl)
+                                    val entries = container.historyRepository.loadAllEntries()
+                                    container.homeVaultRepository.syncHistory(homeVaultUrl, entries)
+                                }
+                            }
+                            result
+                                .onSuccess { sync ->
+                                    homeVaultStatus = "已同步 ${sync.uploaded} 条，Vault 当前 ${sync.vaultTotal} 条"
+                                }
+                                .onFailure { error ->
+                                    homeVaultStatus = "同步失败：${error.message ?: "未知错误"}"
+                                }
+                            homeVaultBusy = false
                         }
                     },
                     onSaveDevice = { name, host, port, pin ->
@@ -571,8 +600,13 @@ private fun SettingsScreen(
     discoveryStatus: String,
     discoveryBusy: Boolean,
     pairingDesktopKey: String?,
+    homeVaultUrl: String,
+    homeVaultStatus: String,
+    homeVaultBusy: Boolean,
+    onHomeVaultUrlChange: (String) -> Unit,
     onDiscover: () -> Unit,
     onPairDesktop: (DiscoveredDesktop) -> Unit,
+    onSyncHomeVault: () -> Unit,
     onSaveDevice: (name: String, host: String, port: Int, pin: String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -641,6 +675,40 @@ private fun SettingsScreen(
                 disabled = discoveryBusy || pairingDesktopKey != null,
                 onPair = { onPairDesktop(desktop) }
             )
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text("家庭服务器", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        text = homeVaultStatus,
+                        color = if (homeVaultStatus.startsWith("同步失败")) Color(0xFFE5484D) else Color(0xFF667085),
+                        fontSize = 14.sp
+                    )
+                    OutlinedTextField(
+                        value = homeVaultUrl,
+                        onValueChange = onHomeVaultUrlChange,
+                        label = { Text("Home Vault 地址") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Button(
+                        onClick = onSyncHomeVault,
+                        enabled = !homeVaultBusy,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(54.dp)
+                    ) {
+                        Text(if (homeVaultBusy) "同步中" else "同步到 Mac mini", fontWeight = FontWeight.ExtraBold)
+                    }
+                }
+            }
         }
         item {
             Card(

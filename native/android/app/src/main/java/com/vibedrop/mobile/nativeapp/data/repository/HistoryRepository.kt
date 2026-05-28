@@ -13,6 +13,8 @@ class HistoryRepository(
         return historyDao.observeRecent(limit)
     }
 
+    suspend fun loadAllEntries(): List<HistoryEntryEntity> = historyDao.getAllEntries()
+
     suspend fun countEntries(): Int = historyDao.countEntries()
 
     suspend fun recordSentText(
