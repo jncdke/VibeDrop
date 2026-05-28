@@ -54,6 +54,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.vibedrop.mobile.nativeapp.IncomingSharePayload
+import com.vibedrop.mobile.nativeapp.MainActivity
 import com.vibedrop.mobile.nativeapp.core.model.ConnectionSnapshot
 import com.vibedrop.mobile.nativeapp.core.model.ConnectionStatus
 import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
@@ -92,6 +94,9 @@ fun VibeDropApp(container: AppContainer) {
     var pendingExportJson by remember { mutableStateOf<String?>(null) }
     val devices by container.deviceRepository.observeDevices().collectAsState(initial = emptyList())
     val history by container.historyRepository.observeRecent(limit = 1000).collectAsState(initial = emptyList())
+    val hostActivity = context as? MainActivity
+    val sharedPayloadState = hostActivity?.sharedPayload?.collectAsState(initial = null)
+    val sharedPayload = sharedPayloadState?.value
     val importHistoryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
@@ -183,6 +188,8 @@ fun VibeDropApp(container: AppContainer) {
                 0 -> SendScreen(
                     devices = devices,
                     controllers = controllers,
+                    sharedPayload = sharedPayload,
+                    onConsumeSharedPayload = { payloadId -> hostActivity?.clearSharedPayload(payloadId) },
                     onOpenSettings = { selectedTab = 2 },
                     onRecordSentText = { device, text, pressEnter ->
                         scope.launch(Dispatchers.IO) {
@@ -398,6 +405,8 @@ private fun Header(onSettings: () -> Unit) {
 private fun SendScreen(
     devices: List<DesktopDevice>,
     controllers: Map<String, DesktopConnectionController>,
+    sharedPayload: IncomingSharePayload?,
+    onConsumeSharedPayload: (Long) -> Unit,
     onOpenSettings: () -> Unit,
     onRecordSentText: (DesktopDevice, String, Boolean) -> Unit,
     modifier: Modifier = Modifier
@@ -448,6 +457,15 @@ private fun SendScreen(
         }
     }
 
+    LaunchedEffect(sharedPayload?.id, devices) {
+        val payload = sharedPayload ?: return@LaunchedEffect
+        val text = payload.text ?: return@LaunchedEffect
+        val firstDevice = devices.firstOrNull() ?: return@LaunchedEffect
+        drafts[firstDevice.id] = text
+        Toast.makeText(context, "已把分享文本填入 ${firstDevice.displayName}", Toast.LENGTH_SHORT).show()
+        onConsumeSharedPayload(payload.id)
+    }
+
     if (devices.isEmpty()) {
         EmptyDeviceState(
             modifier = modifier,
@@ -461,6 +479,16 @@ private fun SendScreen(
         contentPadding = PaddingValues(18.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
+        sharedPayload?.takeIf { it.uris.isNotEmpty() }?.let { payload ->
+            item(key = "shared-payload") {
+                SharedPayloadCard(
+                    payload = payload,
+                    devices = devices,
+                    controllers = controllers,
+                    onDismiss = { onConsumeSharedPayload(payload.id) }
+                )
+            }
+        }
         items(devices, key = { it.id }) { device ->
             val controller = controllers.getValue(device.id)
             SendDeviceCard(
@@ -496,6 +524,82 @@ private fun SendScreen(
                     filePicker.launch(arrayOf("*/*"))
                 }
             )
+        }
+    }
+}
+
+@Composable
+private fun SharedPayloadCard(
+    payload: IncomingSharePayload,
+    devices: List<DesktopDevice>,
+    controllers: Map<String, DesktopConnectionController>,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val target = devices.firstOrNull { controllers[it.id]?.connection?.status == ConnectionStatus.Connected }
+        ?: devices.firstOrNull()
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "系统分享",
+                color = Color(0xFF111827),
+                fontSize = 20.sp,
+                fontWeight = FontWeight.ExtraBold
+            )
+            Text(
+                text = "${payload.uris.size} 个文件待发送到 Mac 收件箱",
+                color = Color(0xFF667085),
+                fontSize = 14.sp
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(
+                    onClick = {
+                        val device = target ?: return@Button
+                        val controller = controllers[device.id] ?: return@Button
+                        scope.launch {
+                            val result = runCatching {
+                                withContext(Dispatchers.IO) {
+                                    payload.uris.forEach { uri ->
+                                        sendUriToDesktopInbox(context, uri, controller)
+                                    }
+                                }
+                            }
+                            result
+                                .onSuccess {
+                                    Toast.makeText(context, "分享文件已发送到 ${device.displayName}", Toast.LENGTH_SHORT).show()
+                                    onDismiss()
+                                }
+                                .onFailure {
+                                    Toast.makeText(context, "分享发送失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                                }
+                        }
+                    },
+                    enabled = target != null && controllers[target.id]?.connection?.status == ConnectionStatus.Connected,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF168DF7))
+                ) {
+                    Text(
+                        text = target?.let { "发送到 ${it.displayName}" } ?: "无可用 Mac",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+                OutlinedButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.weight(0.55f)
+                ) {
+                    Text("取消", fontWeight = FontWeight.Bold)
+                }
+            }
         }
     }
 }
