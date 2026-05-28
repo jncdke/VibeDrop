@@ -50,7 +50,9 @@ class DesktopConnectionController(
     private var socket: WebSocket? = null
     @Volatile private var manuallyClosed = false
     @Volatile private var connectionToken = 0L
+    @Volatile private var activeHost: String = device.host
     private var reconnectAttempt = 0
+    private var endpointIndex = 0
     private var reconnectRunnable: Runnable? = null
     private val pendingIncomingFileAcks = ConcurrentHashMap<String, CompletableDeferred<IncomingFileAck>>()
     private val commandAckLock = Any()
@@ -76,10 +78,12 @@ class DesktopConnectionController(
             return
         }
 
+        val endpointHost = nextEndpointHost()
+        activeHost = endpointHost
         log("connect_start", endpointDetail())
         update(ConnectionSnapshot(ConnectionStatus.Connecting))
         val request = Request.Builder()
-            .url("ws://${device.host}:${device.port}/ws")
+            .url("ws://$endpointHost:${device.port}/ws")
             .build()
 
         val token = ++connectionToken
@@ -425,6 +429,7 @@ class DesktopConnectionController(
             update(ConnectionSnapshot(ConnectionStatus.Disconnected, reason))
             return
         }
+        rotateEndpoint()
         failPendingIncomingFileAcks(reason)
         failPendingCommandAcks(reason)
         reconnectAttempt += 1
@@ -497,8 +502,31 @@ class DesktopConnectionController(
         return JSONObject()
             .put("deviceId", device.id)
             .put("deviceName", device.displayName)
-            .put("host", device.host ?: JSONObject.NULL)
+            .put("host", activeHost.ifBlank { device.host })
+            .put("configuredHost", device.host)
+            .put("fallbackIp", device.ip ?: JSONObject.NULL)
             .put("port", device.port ?: JSONObject.NULL)
+    }
+
+    private fun endpointCandidates(): List<String> {
+        return listOfNotNull(device.host, device.ip)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .ifEmpty { listOf(device.host) }
+    }
+
+    private fun nextEndpointHost(): String {
+        val candidates = endpointCandidates()
+        endpointIndex %= candidates.size
+        return candidates[endpointIndex]
+    }
+
+    private fun rotateEndpoint() {
+        val candidates = endpointCandidates()
+        if (candidates.size > 1) {
+            endpointIndex = (endpointIndex + 1) % candidates.size
+        }
     }
 
     private fun log(event: String, detail: JSONObject = JSONObject()) {

@@ -132,17 +132,24 @@ class ClipboardSyncService : Service() {
         private var socket: WebSocket? = null
         private var reconnectAttempt = 0
         private var reconnectRunnable: Runnable? = null
+        private var endpointIndex = 0
+        @Volatile
+        private var activeHost: String = device.host.orEmpty()
         private var closed = false
 
         fun matches(other: DeviceEntity): Boolean {
-            return device.host == other.host && device.port == other.port && device.pin == other.pin
+            return device.host == other.host &&
+                device.ip == other.ip &&
+                device.port == other.port &&
+                device.pin == other.pin
         }
 
         fun connect() {
             if (closed) return
             cancelScheduledReconnect()
-            val host = device.host ?: return
+            val host = nextEndpointHost() ?: return
             val port = device.port ?: return
+            activeHost = host
             log("connect_start")
             val request = Request.Builder()
                 .url("ws://$host:$port/ws")
@@ -216,6 +223,7 @@ class ClipboardSyncService : Service() {
         private fun scheduleReconnect() {
             if (closed) return
             cancelScheduledReconnect()
+            rotateEndpoint()
             reconnectAttempt += 1
             val cappedAttempt = min(reconnectAttempt, 6)
             val delayMs = min(60_000L, 1_000L shl (cappedAttempt - 1))
@@ -237,6 +245,27 @@ class ClipboardSyncService : Service() {
             return !closed && socket === webSocket
         }
 
+        private fun endpointCandidates(): List<String> {
+            return listOfNotNull(device.host, device.ip)
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+        }
+
+        private fun nextEndpointHost(): String? {
+            val candidates = endpointCandidates()
+            if (candidates.isEmpty()) return null
+            endpointIndex %= candidates.size
+            return candidates[endpointIndex]
+        }
+
+        private fun rotateEndpoint() {
+            val candidates = endpointCandidates()
+            if (candidates.size > 1) {
+                endpointIndex = (endpointIndex + 1) % candidates.size
+            }
+        }
+
         private fun log(event: String, detail: JSONObject = JSONObject()) {
             diagnosticLogStore.append(
                 "clipboard-sync",
@@ -244,7 +273,9 @@ class ClipboardSyncService : Service() {
                 detail
                     .put("deviceId", device.id)
                     .put("deviceName", device.displayName)
-                    .put("host", device.host ?: JSONObject.NULL)
+                    .put("host", activeHost.ifBlank { device.host ?: "" })
+                    .put("configuredHost", device.host ?: JSONObject.NULL)
+                    .put("fallbackIp", device.ip ?: JSONObject.NULL)
                     .put("port", device.port ?: JSONObject.NULL)
             )
         }

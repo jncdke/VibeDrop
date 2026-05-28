@@ -93,7 +93,7 @@ class DeviceRepository(
             stableId = serverId,
             displayName = hostname,
             role = "desktop",
-            host = ip,
+            host = hostname.ifBlank { ip },
             ip = ip,
             port = port,
             pin = pin,
