@@ -53,4 +53,18 @@ JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
 ./scripts/deploy-native-android.sh --device <serial>
 ```
 
-这个脚本安装的是 `com.vibedrop.mobile.nativepreview`，可以和当前 Tauri 正式包并排存在，便于逐项对照功能等价；真正覆盖 `com.vibedrop.mobile` 的 release 签名升级路径单独处理。
+这个脚本安装的是 `com.vibedrop.mobile.nativepreview`，可以和当前 Tauri 正式包并排存在，便于逐项对照功能等价。
+
+构建并签名原生 release 覆盖包：
+
+```sh
+./scripts/deploy-native-android-release.sh
+```
+
+这个命令默认只产出 `native/android/app/build/outputs/apk/release/VibeDrop-native-release-signed.apk`，不会自动替换手机上的当前正式包。确认要覆盖 `com.vibedrop.mobile` 并触发旧 `history.json` 迁移时，再显式执行：
+
+```sh
+./scripts/deploy-native-android-release.sh --install --device <serial>
+```
+
+release 覆盖安装依赖同一把 `~/.android/vibedrop.keystore`；如果签名不同，Android 会拒绝覆盖安装，这是系统用来保护 app 私有数据的机制。
