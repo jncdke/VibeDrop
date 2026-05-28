@@ -45,6 +45,7 @@ class ClipboardSyncService : Service() {
 
     private lateinit var database: VibeDropDatabase
     private lateinit var identity: AndroidDeviceIdentity
+    private lateinit var diagnosticLogStore: DiagnosticLogStore
     private var lastAppliedClipboardText: String? = null
     private var lastAppliedClipboardAt = 0L
 
@@ -53,6 +54,8 @@ class ClipboardSyncService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
         identity = loadAndroidDeviceIdentity(applicationContext)
+        diagnosticLogStore = DiagnosticLogStore(applicationContext)
+        diagnosticLogStore.append("clipboard-sync", "service_start")
         database = Room.databaseBuilder(
             applicationContext,
             VibeDropDatabase::class.java,
@@ -69,6 +72,7 @@ class ClipboardSyncService : Service() {
     }
 
     override fun onDestroy() {
+        diagnosticLogStore.append("clipboard-sync", "service_stop")
         connections.values.forEach { it.close() }
         connections.clear()
         serviceScope.cancel()
@@ -80,6 +84,7 @@ class ClipboardSyncService : Service() {
     private fun reloadConnections() {
         serviceScope.launch {
             val devices = database.deviceDao().getClipboardSyncDevices()
+            diagnosticLogStore.append("clipboard-sync", "reload_devices", JSONObject().put("count", devices.size))
             mainHandler.post {
                 val activeIds = devices.map { it.id }.toSet()
                 connections.keys
@@ -106,11 +111,14 @@ class ClipboardSyncService : Service() {
             runCatching {
                 val manager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 manager.setPrimaryClip(ClipData.newPlainText("VibeDrop", text))
+                diagnosticLogStore.append("clipboard-sync", "clipboard_applied", JSONObject().put("length", text.length).put("method", "direct"))
             }.onFailure { error ->
+                diagnosticLogStore.append("clipboard-sync", "direct_clipboard_failed", JSONObject().put("error", error.message ?: error.javaClass.simpleName))
                 Log.w(TAG, "后台直接写剪贴板失败，尝试透明 Activity", error)
                 runCatching {
                     ClipboardFloatingActivity.launchWrite(applicationContext, text)
                 }.onFailure { fallbackError ->
+                    diagnosticLogStore.append("clipboard-sync", "floating_clipboard_failed", JSONObject().put("error", fallbackError.message ?: fallbackError.javaClass.simpleName))
                     Log.e(TAG, "透明 Activity 写剪贴板也失败", fallbackError)
                 }
             }
@@ -132,6 +140,7 @@ class ClipboardSyncService : Service() {
             if (closed) return
             val host = device.host ?: return
             val port = device.port ?: return
+            log("connect_start")
             val request = Request.Builder()
                 .url("ws://$host:$port/ws")
                 .build()
@@ -140,12 +149,14 @@ class ClipboardSyncService : Service() {
 
         fun close() {
             closed = true
+            log("connection_close_requested")
             socket?.close(1000, "clipboard sync stop")
             socket = null
         }
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
             reconnectAttempt = 0
+            log("socket_open", JSONObject().put("httpCode", response.code))
             webSocket.send(
                 AuthPayload(
                     pin = device.pin.orEmpty(),
@@ -157,20 +168,29 @@ class ClipboardSyncService : Service() {
                     deviceRole = "clipboard_sync"
                 ).toJson().toString()
             )
+            log("auth_sent")
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
             val json = runCatching { JSONObject(text) }.getOrNull() ?: return
             if (json.optString("action") == VibeDropActions.Clipboard) {
+                log("clipboard_received", JSONObject().put("length", json.optString("text").length))
                 applyClipboard(json.optString("text"))
             }
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            log("socket_closed", JSONObject().put("code", code).put("reason", reason))
             scheduleReconnect()
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            log(
+                "socket_failure",
+                JSONObject()
+                    .put("error", t.message ?: t.javaClass.simpleName)
+                    .put("httpCode", response?.code ?: JSONObject.NULL)
+            )
             scheduleReconnect()
         }
 
@@ -178,7 +198,20 @@ class ClipboardSyncService : Service() {
             if (closed) return
             reconnectAttempt += 1
             val delayMs = min(60_000L, 3_000L * reconnectAttempt)
+            log("schedule_reconnect", JSONObject().put("attempt", reconnectAttempt).put("delayMillis", delayMs))
             mainHandler.postDelayed({ connect() }, delayMs)
+        }
+
+        private fun log(event: String, detail: JSONObject = JSONObject()) {
+            diagnosticLogStore.append(
+                "clipboard-sync",
+                event,
+                detail
+                    .put("deviceId", device.id)
+                    .put("deviceName", device.displayName)
+                    .put("host", device.host ?: JSONObject.NULL)
+                    .put("port", device.port ?: JSONObject.NULL)
+            )
         }
     }
 

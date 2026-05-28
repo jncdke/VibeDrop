@@ -8,6 +8,7 @@ import com.vibedrop.mobile.nativeapp.data.repository.DeviceRepository
 import com.vibedrop.mobile.nativeapp.data.repository.DiscoveryRepository
 import com.vibedrop.mobile.nativeapp.data.repository.HomeVaultRepository
 import com.vibedrop.mobile.nativeapp.data.repository.HistoryRepository
+import com.vibedrop.mobile.nativeapp.platform.DiagnosticLogStore
 import com.vibedrop.mobile.nativeapp.platform.MediaOpenPreferences
 import com.vibedrop.mobile.nativeapp.platform.loadAndroidDeviceIdentity
 
@@ -26,6 +27,7 @@ class AppContainer(context: Context) {
     val discoveryRepository = DiscoveryRepository(appContext)
     val homeVaultRepository = HomeVaultRepository(appContext, androidIdentity)
     val mediaOpenPreferences = MediaOpenPreferences(appContext)
+    val diagnosticLogStore = DiagnosticLogStore(appContext)
     val legacyHistoryImporter = LegacyHistoryImporter(
         context = appContext,
         deviceRepository = deviceRepository,

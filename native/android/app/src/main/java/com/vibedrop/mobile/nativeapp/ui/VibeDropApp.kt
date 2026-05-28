@@ -78,6 +78,8 @@ import com.vibedrop.mobile.nativeapp.platform.AndroidDeviceIdentity
 import com.vibedrop.mobile.nativeapp.platform.AndroidNetworkDiagnosticsSnapshot
 import com.vibedrop.mobile.nativeapp.platform.BackgroundRunDiagnosticsSnapshot
 import com.vibedrop.mobile.nativeapp.platform.ContentTransferResult
+import com.vibedrop.mobile.nativeapp.platform.DiagnosticLogEvent
+import com.vibedrop.mobile.nativeapp.platform.DiagnosticLogStore
 import com.vibedrop.mobile.nativeapp.platform.MediaOpenMode
 import com.vibedrop.mobile.nativeapp.platform.loadAndroidNetworkDiagnostics
 import com.vibedrop.mobile.nativeapp.platform.loadBackgroundRunDiagnostics
@@ -89,12 +91,14 @@ import com.vibedrop.mobile.nativeapp.platform.readClipboardText
 import com.vibedrop.mobile.nativeapp.platform.sendImageUriToMacClipboard
 import com.vibedrop.mobile.nativeapp.platform.sendUriToDesktopInbox
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileReceiver
+import com.vibedrop.mobile.nativeapp.platform.shareJsonFile
 import com.vibedrop.mobile.nativeapp.platform.shareHistoryJson
 import com.vibedrop.mobile.nativeapp.platform.startClipboardSyncService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.util.Calendar
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -170,6 +174,7 @@ fun VibeDropApp(container: AppContainer) {
                     clientId = container.androidIdentity.deviceId,
                     clientName = container.androidIdentity.deviceName,
                     incomingFileReceiver = IncomingFileReceiver(appContext),
+                    diagnosticLogStore = container.diagnosticLogStore,
                     onIncomingHistorySession = { rawJson ->
                         scope.launch(Dispatchers.IO) {
                             container.historyRepository.recordIncomingHistorySession(device, rawJson)
@@ -259,6 +264,7 @@ fun VibeDropApp(container: AppContainer) {
                     homeVaultBusy = homeVaultBusy,
                     imageOpenMode = imageOpenMode,
                     videoOpenMode = videoOpenMode,
+                    diagnosticLogStore = container.diagnosticLogStore,
                     onHomeVaultUrlChange = { homeVaultUrl = it },
                     onImageOpenModeChange = { mode ->
                         imageOpenMode = mode
@@ -273,6 +279,7 @@ fun VibeDropApp(container: AppContainer) {
                         scope.launch {
                             discoveryBusy = true
                             discoveryStatus = "正在扫描局域网..."
+                            container.diagnosticLogStore.append("discovery", "start", JSONObject().put("savedDevices", devices.size))
                             val result = runCatching {
                                 withContext(Dispatchers.IO) {
                                     container.discoveryRepository.discoverDesktops(devices)
@@ -280,6 +287,7 @@ fun VibeDropApp(container: AppContainer) {
                             }
                             result
                                 .onSuccess { desktops ->
+                                    container.diagnosticLogStore.append("discovery", "success", JSONObject().put("count", desktops.size))
                                     discoveredDesktops = desktops
                                     discoveryStatus = if (desktops.isEmpty()) {
                                         "没有发现附近 Mac"
@@ -288,6 +296,7 @@ fun VibeDropApp(container: AppContainer) {
                                     }
                                 }
                                 .onFailure { error ->
+                                    container.diagnosticLogStore.append("discovery", "failure", JSONObject().put("error", error.message ?: "未知错误"))
                                     discoveryStatus = "扫描失败：${error.message ?: "未知错误"}"
                                 }
                             discoveryBusy = false
@@ -297,6 +306,7 @@ fun VibeDropApp(container: AppContainer) {
                         if (pairingDesktopKey != null) return@SettingsScreen
                         scope.launch {
                             pairingDesktopKey = desktop.key
+                            container.diagnosticLogStore.append("pairing", "request_start", JSONObject().put("host", desktop.hostname).put("port", desktop.port))
                             val accepted = runCatching {
                                 withContext(Dispatchers.IO) {
                                     container.discoveryRepository.requestPairing(
@@ -306,6 +316,7 @@ fun VibeDropApp(container: AppContainer) {
                                     )
                                 }
                             }.getOrElse { error ->
+                                container.diagnosticLogStore.append("pairing", "request_failure", JSONObject().put("error", error.message ?: "未知错误"))
                                 discoveryStatus = "配对请求失败：${error.message ?: "未知错误"}"
                                 pairingDesktopKey = null
                                 return@launch
@@ -335,12 +346,14 @@ fun VibeDropApp(container: AppContainer) {
 
                             val status = terminalStatus
                             if (status?.approved == true) {
+                                container.diagnosticLogStore.append("pairing", "approved", JSONObject().put("hostname", status.hostname ?: desktop.hostname))
                                 withContext(Dispatchers.IO) {
                                     container.deviceRepository.savePairedDesktop(desktop, status)
                                 }
                                 discoveryStatus = "已配对 ${status.hostname ?: desktop.hostname}"
                                 selectedTab = 0
                             } else {
+                                container.diagnosticLogStore.append("pairing", "not_approved", JSONObject().put("error", status?.error ?: "timeout"))
                                 discoveryStatus = status?.error ?: "配对未完成，请重新发起"
                             }
                             pairingDesktopKey = null
@@ -351,6 +364,7 @@ fun VibeDropApp(container: AppContainer) {
                         scope.launch {
                             homeVaultBusy = true
                             homeVaultStatus = "正在同步..."
+                            container.diagnosticLogStore.append("home-vault", "sync_start", JSONObject().put("endpoint", homeVaultUrl))
                             val result = runCatching {
                                 withContext(Dispatchers.IO) {
                                     container.homeVaultRepository.saveEndpoint(homeVaultUrl)
@@ -360,9 +374,11 @@ fun VibeDropApp(container: AppContainer) {
                             }
                             result
                                 .onSuccess { sync ->
+                                    container.diagnosticLogStore.append("home-vault", "sync_success", JSONObject().put("uploaded", sync.uploaded).put("vaultTotal", sync.vaultTotal))
                                     homeVaultStatus = "已同步 ${sync.uploaded} 条，Vault 当前 ${sync.vaultTotal} 条"
                                 }
                                 .onFailure { error ->
+                                    container.diagnosticLogStore.append("home-vault", "sync_failure", JSONObject().put("error", error.message ?: "未知错误"))
                                     homeVaultStatus = "同步失败：${error.message ?: "未知错误"}"
                                 }
                             homeVaultBusy = false
@@ -1646,6 +1662,7 @@ private fun SettingsScreen(
     homeVaultBusy: Boolean,
     imageOpenMode: MediaOpenMode,
     videoOpenMode: MediaOpenMode,
+    diagnosticLogStore: DiagnosticLogStore,
     onHomeVaultUrlChange: (String) -> Unit,
     onImageOpenModeChange: (MediaOpenMode) -> Unit,
     onVideoOpenModeChange: (MediaOpenMode) -> Unit,
@@ -1666,6 +1683,7 @@ private fun SettingsScreen(
     var clearArmed by rememberSaveable { mutableStateOf(false) }
     var networkDiagnostics by remember { mutableStateOf<AndroidNetworkDiagnosticsSnapshot?>(null) }
     var backgroundDiagnostics by remember { mutableStateOf<BackgroundRunDiagnosticsSnapshot?>(null) }
+    var diagnosticEvents by remember { mutableStateOf<List<DiagnosticLogEvent>>(emptyList()) }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -1684,6 +1702,9 @@ private fun SettingsScreen(
         }
         backgroundDiagnostics = withContext(Dispatchers.IO) {
             loadBackgroundRunDiagnostics(context)
+        }
+        diagnosticEvents = withContext(Dispatchers.IO) {
+            diagnosticLogStore.recent()
         }
     }
 
@@ -1740,6 +1761,42 @@ private fun SettingsScreen(
                 },
                 onOpenBatterySettings = { openBatteryOptimizationSettings(context) },
                 onOpenAutoRevokeSettings = { openAutoRevokeSettings(context) }
+            )
+        }
+        item {
+            DiagnosticLogCard(
+                events = diagnosticEvents,
+                onRefresh = {
+                    scope.launch {
+                        diagnosticEvents = withContext(Dispatchers.IO) {
+                            diagnosticLogStore.recent()
+                        }
+                    }
+                },
+                onShare = {
+                    scope.launch {
+                        val result = runCatching {
+                            val network = networkDiagnostics ?: withContext(Dispatchers.IO) {
+                                loadAndroidNetworkDiagnostics(context)
+                            }
+                            val background = backgroundDiagnostics ?: withContext(Dispatchers.IO) {
+                                loadBackgroundRunDiagnostics(context)
+                            }
+                            val json = withContext(Dispatchers.IO) {
+                                diagnosticLogStore.exportSnapshot(
+                                    deviceName = identity.deviceName,
+                                    deviceId = identity.deviceId,
+                                    network = network,
+                                    background = background
+                                )
+                            }
+                            shareJsonFile(context, diagnosticArchiveFileName(), json, "分享诊断")
+                        }
+                        result.onFailure { error ->
+                            Toast.makeText(context, "分享诊断失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
             )
         }
         item {
@@ -1956,6 +2013,69 @@ private fun SettingsScreen(
                         Text("保存 Mac", fontWeight = FontWeight.ExtraBold)
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiagnosticLogCard(
+    events: List<DiagnosticLogEvent>,
+    onRefresh: () -> Unit,
+    onShare: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White)
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("诊断日志", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        text = "记录连接、重连、文件传输和后台剪贴板事件，不记录正文和剪贴板内容。",
+                        color = Color(0xFF667085),
+                        fontSize = 13.sp
+                    )
+                }
+                OutlinedButton(onClick = onRefresh) {
+                    Text("刷新")
+                }
+            }
+            if (events.isEmpty()) {
+                Text("暂无诊断事件。连接或同步发生后会显示在这里。", color = Color(0xFF98A2B3), fontSize = 13.sp)
+            } else {
+                events.take(8).forEach { event ->
+                    Column(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color(0xFFF8FAFC))
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(event.label, color = Color(0xFF111827), fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                        Text(
+                            text = event.detail,
+                            color = Color(0xFF667085),
+                            fontSize = 11.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+            Button(
+                onClick = onShare,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF168DF7))
+            ) {
+                Text("分享诊断包", fontWeight = FontWeight.ExtraBold)
             }
         }
     }
@@ -2384,6 +2504,11 @@ private fun formatTime(timestampMillis: Long): String {
 private fun historyArchiveFileName(): String {
     val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
     return "vibedrop_history_$stamp.json"
+}
+
+private fun diagnosticArchiveFileName(): String {
+    val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+    return "vibedrop_diagnostics_$stamp.json"
 }
 
 private enum class HistoryTimeFilter {

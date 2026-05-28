@@ -10,6 +10,15 @@ fun shareHistoryJson(
     fileName: String,
     json: String
 ) {
+    shareJsonFile(context, fileName, json, "分享历史")
+}
+
+fun shareJsonFile(
+    context: Context,
+    fileName: String,
+    json: String,
+    chooserTitle: String
+) {
     val dir = File(context.cacheDir, "history-share")
     dir.mkdirs()
     dir.listFiles()?.forEach { it.delete() }
@@ -25,7 +34,7 @@ fun shareHistoryJson(
         .putExtra(Intent.EXTRA_STREAM, uri)
         .putExtra(Intent.EXTRA_SUBJECT, file.name)
         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    context.startActivity(Intent.createChooser(intent, "分享历史"))
+    context.startActivity(Intent.createChooser(intent, chooserTitle))
 }
 
 private fun sanitizeFileName(value: String): String {

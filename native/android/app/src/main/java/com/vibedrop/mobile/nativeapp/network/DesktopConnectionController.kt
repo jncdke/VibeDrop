@@ -11,6 +11,7 @@ import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
 import com.vibedrop.mobile.nativeapp.protocol.AuthPayload
 import com.vibedrop.mobile.nativeapp.protocol.TextPayload
 import com.vibedrop.mobile.nativeapp.protocol.VibeDropActions
+import com.vibedrop.mobile.nativeapp.platform.DiagnosticLogStore
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileReceiver
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileResult
 import okhttp3.OkHttpClient
@@ -27,6 +28,7 @@ class DesktopConnectionController(
     private val clientId: String,
     private val clientName: String,
     private val incomingFileReceiver: IncomingFileReceiver? = null,
+    private val diagnosticLogStore: DiagnosticLogStore? = null,
     private val onIncomingHistorySession: (String) -> Unit = {},
     private val onIncomingFileSaved: (IncomingFileResult) -> Unit = {}
 ) {
@@ -56,10 +58,12 @@ class DesktopConnectionController(
         cancelScheduledReconnect()
         val pin = device.pin
         if (pin.isNullOrBlank()) {
+            log("missing_pin")
             update(ConnectionSnapshot(ConnectionStatus.Error, "缺少 PIN"))
             return
         }
 
+        log("connect_start", endpointDetail())
         update(ConnectionSnapshot(ConnectionStatus.Connecting))
         val request = Request.Builder()
             .url("ws://${device.host}:${device.port}/ws")
@@ -71,6 +75,7 @@ class DesktopConnectionController(
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     if (!isCurrent(webSocket, token)) return
+                    log("socket_open", endpointDetail().put("httpCode", response.code))
                     webSocket.send(
                         AuthPayload(
                             pin = pin,
@@ -82,6 +87,7 @@ class DesktopConnectionController(
                             deviceRole = "primary"
                         ).toJson().toString()
                     )
+                    log("auth_sent", endpointDetail())
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
@@ -91,6 +97,7 @@ class DesktopConnectionController(
 
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                     if (!isCurrent(webSocket, token)) return
+                    log("socket_closing", endpointDetail().put("code", code).put("reason", reason))
                     webSocket.close(code, reason)
                     update(
                         ConnectionSnapshot(
@@ -103,11 +110,18 @@ class DesktopConnectionController(
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     if (!isCurrent(webSocket, token)) return
+                    log("socket_closed", endpointDetail().put("code", code).put("reason", reason))
                     scheduleReconnect(reason.takeIf { it.isNotBlank() } ?: "连接断开")
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     if (!isCurrent(webSocket, token)) return
+                    log(
+                        "socket_failure",
+                        endpointDetail()
+                            .put("message", t.message ?: t.javaClass.simpleName)
+                            .put("httpCode", response?.code ?: JSONObject.NULL)
+                    )
                     scheduleReconnect(t.message ?: "连接失败")
                 }
             }
@@ -117,12 +131,16 @@ class DesktopConnectionController(
     fun sendText(text: String, pressEnter: Boolean): Boolean {
         if (!connection.canSend) return false
         val action = if (pressEnter) VibeDropActions.TypeEnter else VibeDropActions.Type
-        return socket?.send(TextPayload(action, text).toJson().toString()) == true
+        val accepted = socket?.send(TextPayload(action, text).toJson().toString()) == true
+        log("send_text", endpointDetail().put("action", action).put("length", text.length).put("accepted", accepted))
+        return accepted
     }
 
     fun sendEnter(): Boolean {
         if (!connection.canSend) return false
-        return socket?.send(JSONObject().put("action", VibeDropActions.Enter).toString()) == true
+        val accepted = socket?.send(JSONObject().put("action", VibeDropActions.Enter).toString()) == true
+        log("send_enter", endpointDetail().put("accepted", accepted))
+        return accepted
     }
 
     fun sendImageClipboard(
@@ -131,7 +149,7 @@ class DesktopConnectionController(
         imageBase64: String
     ): Boolean {
         if (!connection.canSend) return false
-        return socket?.send(
+        val accepted = socket?.send(
             JSONObject()
                 .put("action", VibeDropActions.ImageClipboard)
                 .put("file_name", fileName)
@@ -139,6 +157,8 @@ class DesktopConnectionController(
                 .put("image_base64", imageBase64)
                 .toString()
         ) == true
+        log("send_image_clipboard", endpointDetail().put("fileName", fileName).put("mimeType", mimeType).put("accepted", accepted))
+        return accepted
     }
 
     fun sendIncomingFileStart(
@@ -148,7 +168,7 @@ class DesktopConnectionController(
         sizeBytes: Long
     ): Boolean {
         if (!connection.canSend) return false
-        return socket?.send(
+        val accepted = socket?.send(
             JSONObject()
                 .put("action", VibeDropActions.IncomingFileStart)
                 .put("transfer_id", transferId)
@@ -157,6 +177,8 @@ class DesktopConnectionController(
                 .put("size_bytes", sizeBytes)
                 .toString()
         ) == true
+        log("send_file_start", endpointDetail().put("transferId", transferId).put("fileName", fileName).put("sizeBytes", sizeBytes).put("accepted", accepted))
+        return accepted
     }
 
     fun sendIncomingFileChunk(
@@ -164,27 +186,32 @@ class DesktopConnectionController(
         chunkBase64: String
     ): Boolean {
         if (!connection.canSend) return false
-        return socket?.send(
+        val accepted = socket?.send(
             JSONObject()
                 .put("action", VibeDropActions.IncomingFileChunk)
                 .put("transfer_id", transferId)
                 .put("chunk_base64", chunkBase64)
                 .toString()
         ) == true
+        if (!accepted) log("send_file_chunk_rejected", endpointDetail().put("transferId", transferId))
+        return accepted
     }
 
     fun sendIncomingFileComplete(transferId: String): Boolean {
         if (!connection.canSend) return false
-        return socket?.send(
+        val accepted = socket?.send(
             JSONObject()
                 .put("action", VibeDropActions.IncomingFileComplete)
                 .put("transfer_id", transferId)
                 .toString()
         ) == true
+        log("send_file_complete", endpointDetail().put("transferId", transferId).put("accepted", accepted))
+        return accepted
     }
 
     fun close() {
         manuallyClosed = true
+        log("manual_close", endpointDetail())
         connectionToken += 1
         cancelScheduledReconnect()
         socket?.close(1000, "dispose")
@@ -199,14 +226,19 @@ class DesktopConnectionController(
         when {
             status == "ok" -> {
                 reconnectAttempt = 0
+                log("auth_ok", endpointDetail())
                 update(ConnectionSnapshot(ConnectionStatus.Connected))
             }
-            status == "error" -> update(
-                ConnectionSnapshot(
-                    ConnectionStatus.Error,
-                    objectValue.optString("error", "认证或发送失败")
+            status == "error" -> {
+                val error = objectValue.optString("error", "认证或发送失败")
+                log("server_error", endpointDetail().put("error", error))
+                update(
+                    ConnectionSnapshot(
+                        ConnectionStatus.Error,
+                        error
+                    )
                 )
-            )
+            }
             action == VibeDropActions.Pong -> Unit
             action == VibeDropActions.IncomingHistorySessionStart -> onIncomingHistorySession(objectValue.toString())
             action == VibeDropActions.IncomingFileStart -> handleIncomingFileMessage(webSocket, objectValue)
@@ -224,6 +256,7 @@ class DesktopConnectionController(
                 VibeDropActions.IncomingFileChunk -> receiver.append(payload)
                 VibeDropActions.IncomingFileComplete -> {
                     val result = receiver.complete(payload)
+                    log("incoming_file_saved", endpointDetail().put("transferId", result.transferId).put("savedPath", result.savedPath))
                     webSocket.send(
                         JSONObject()
                             .put("action", VibeDropActions.IncomingFileSaved)
@@ -235,6 +268,7 @@ class DesktopConnectionController(
                 }
             }
         } catch (error: Exception) {
+            log("incoming_file_error", endpointDetail().put("transferId", transferId).put("error", error.message ?: "接收失败"))
             receiver.cancel(transferId)
             if (transferId.isNotBlank()) {
                 webSocket.send(
@@ -255,6 +289,13 @@ class DesktopConnectionController(
         }
         reconnectAttempt += 1
         val delayMillis = reconnectDelayMillis(reconnectAttempt)
+        log(
+            "schedule_reconnect",
+            endpointDetail()
+                .put("reason", reason)
+                .put("attempt", reconnectAttempt)
+                .put("delayMillis", delayMillis)
+        )
         update(
             ConnectionSnapshot(
                 status = ConnectionStatus.Connecting,
@@ -290,5 +331,17 @@ class DesktopConnectionController(
         mainHandler.post {
             connection = snapshot
         }
+    }
+
+    private fun endpointDetail(): JSONObject {
+        return JSONObject()
+            .put("deviceId", device.id)
+            .put("deviceName", device.displayName)
+            .put("host", device.host ?: JSONObject.NULL)
+            .put("port", device.port ?: JSONObject.NULL)
+    }
+
+    private fun log(event: String, detail: JSONObject = JSONObject()) {
+        diagnosticLogStore?.append("foreground-ws", event, detail)
     }
 }
