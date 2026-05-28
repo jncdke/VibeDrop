@@ -805,10 +805,13 @@ private fun HistoryScreen(
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var selectedType by rememberSaveable { mutableStateOf("all") }
+    var selectedStatus by rememberSaveable { mutableStateOf("all") }
+    var selectedParticipant by rememberSaveable { mutableStateOf("all") }
     var selectedTime by rememberSaveable { mutableStateOf(HistoryTimeFilter.All) }
     var selectedHour by remember { mutableStateOf<HeatmapSelection?>(null) }
     val now = remember(entries.size) { System.currentTimeMillis() }
-    val baseFiltered = remember(entries, query, selectedType, selectedTime, now) {
+    val participantFilters = remember(entries) { buildHistoryParticipantFilters(entries) }
+    val baseFiltered = remember(entries, query, selectedType, selectedStatus, selectedParticipant, selectedTime, now) {
         entries
             .asSequence()
             .filter { it.matchesQuery(query) }
@@ -816,6 +819,14 @@ private fun HistoryScreen(
                 selectedType == "all" ||
                     record.entry.kind == selectedType ||
                     record.items.any { it.kind == selectedType }
+            }
+            .filter { record ->
+                selectedStatus == "all" ||
+                    record.entry.status == selectedStatus ||
+                    record.items.any { it.status == selectedStatus }
+            }
+            .filter { record ->
+                selectedParticipant == "all" || record.matchesParticipantFilter(selectedParticipant)
             }
             .filter { it.entry.matchesTimeFilter(selectedTime, now) }
             .toList()
@@ -873,7 +884,19 @@ private fun HistoryScreen(
                         placeholder = { Text("搜索文本、文件名、设备、状态") },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
-                        shape = RoundedCornerShape(18.dp)
+                        shape = RoundedCornerShape(18.dp),
+                        trailingIcon = {
+                            if (query.isNotBlank()) {
+                                TextButton(
+                                    onClick = {
+                                        query = ""
+                                        selectedHour = null
+                                    }
+                                ) {
+                                    Text("清空")
+                                }
+                            }
+                        }
                     )
                     Row(
                         modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -903,6 +926,28 @@ private fun HistoryScreen(
                         historyTypeFilters.forEach { filter ->
                             HistoryFilterButton(filter.label, selectedType == filter.kind) {
                                 selectedType = filter.kind
+                                selectedHour = null
+                            }
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        historyStatusFilters.forEach { filter ->
+                            HistoryFilterButton(filter.label, selectedStatus == filter.status) {
+                                selectedStatus = filter.status
+                                selectedHour = null
+                            }
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        participantFilters.forEach { filter ->
+                            HistoryFilterButton(filter.label, selectedParticipant == filter.key) {
+                                selectedParticipant = filter.key
                                 selectedHour = null
                             }
                         }
@@ -1823,6 +1868,10 @@ private enum class HistoryTimeFilter {
 
 private data class HistoryTypeFilter(val kind: String, val label: String)
 
+private data class HistoryStatusFilter(val status: String, val label: String)
+
+private data class HistoryParticipantFilter(val key: String, val label: String)
+
 private data class HeatmapSelection(
     val dayStartMillis: Long,
     val hour: Int
@@ -1837,7 +1886,46 @@ private val historyTypeFilters = listOf(
     HistoryTypeFilter("file", "文件")
 )
 
+private val historyStatusFilters = listOf(
+    HistoryStatusFilter("all", "全部状态"),
+    HistoryStatusFilter("success", "成功"),
+    HistoryStatusFilter("pending", "进行中"),
+    HistoryStatusFilter("partial", "部分完成"),
+    HistoryStatusFilter("failed", "失败")
+)
+
 private const val DAY_MILLIS = 24L * 60L * 60L * 1000L
+
+private fun buildHistoryParticipantFilters(entries: List<HistoryEntryWithItems>): List<HistoryParticipantFilter> {
+    val counts = linkedMapOf<String, Pair<String, Int>>()
+    entries.forEach { record ->
+        listOf(
+            record.entry.senderDeviceId to record.entry.senderName,
+            record.entry.receiverDeviceId to record.entry.receiverName
+        ).forEach { (id, name) ->
+            val label = name?.takeIf { it.isNotBlank() } ?: id?.takeIf { it.isNotBlank() } ?: return@forEach
+            val key = historyParticipantKey(id, label)
+            val current = counts[key]
+            counts[key] = label to ((current?.second ?: 0) + 1)
+        }
+    }
+    return listOf(HistoryParticipantFilter("all", "全部设备")) +
+        counts.entries
+            .sortedByDescending { it.value.second }
+            .take(12)
+            .map { (key, value) -> HistoryParticipantFilter(key, "${value.first} (${value.second})") }
+}
+
+private fun HistoryEntryWithItems.matchesParticipantFilter(key: String): Boolean {
+    val senderLabel = entry.senderName?.takeIf { it.isNotBlank() } ?: entry.senderDeviceId.orEmpty()
+    val receiverLabel = entry.receiverName?.takeIf { it.isNotBlank() } ?: entry.receiverDeviceId.orEmpty()
+    return historyParticipantKey(entry.senderDeviceId, senderLabel) == key ||
+        historyParticipantKey(entry.receiverDeviceId, receiverLabel) == key
+}
+
+private fun historyParticipantKey(id: String?, fallback: String): String {
+    return (id?.takeIf { it.isNotBlank() } ?: fallback).trim().lowercase(Locale.US)
+}
 
 private fun HistoryEntryWithItems.matchesQuery(query: String): Boolean {
     val trimmed = query.trim()
