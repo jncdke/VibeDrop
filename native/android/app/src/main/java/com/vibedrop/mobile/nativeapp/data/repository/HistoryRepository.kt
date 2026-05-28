@@ -5,6 +5,7 @@ import com.vibedrop.mobile.nativeapp.data.local.HistoryDao
 import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import com.vibedrop.mobile.nativeapp.data.local.HistoryItemEntity
 import com.vibedrop.mobile.nativeapp.platform.AndroidDeviceIdentity
+import com.vibedrop.mobile.nativeapp.platform.ContentTransferResult
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileResult
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
@@ -141,6 +142,71 @@ class HistoryRepository(
         )
         historyDao.upsertEntry(entry)
         historyDao.upsertItems(listOf(item))
+    }
+
+    suspend fun recordSentContentBatch(
+        target: DesktopDevice,
+        results: List<ContentTransferResult>,
+        saveTarget: String,
+        status: String = "success"
+    ) {
+        val normalizedResults = results.filter { it.fileName.isNotBlank() }
+        if (normalizedResults.isEmpty()) return
+        if (normalizedResults.size == 1) {
+            val item = normalizedResults[0]
+            recordSentContent(
+                target = target,
+                fileName = item.fileName,
+                mimeType = item.mimeType,
+                sizeBytes = item.sizeBytes,
+                sourceUri = item.sourceUri,
+                transferId = item.transferId,
+                savedPath = item.savedPath,
+                saveTarget = saveTarget,
+                status = status
+            )
+            return
+        }
+
+        val entryId = "native-outbound-batch:${UUID.randomUUID()}"
+        val sessionId = "native-batch:${UUID.randomUUID()}"
+        val items = normalizedResults.mapIndexed { index, result ->
+            val kind = kindFromMime(result.mimeType)
+            HistoryItemEntity(
+                id = "$entryId:item:$index",
+                entryId = entryId,
+                itemIndex = index,
+                kind = kind,
+                fileName = result.fileName,
+                mimeType = result.mimeType,
+                sizeBytes = result.sizeBytes.takeIf { it >= 0L },
+                localPath = result.sourceUri,
+                savedPath = result.savedPath,
+                thumbnailPath = null,
+                thumbnailDataUrl = null,
+                status = status,
+                error = null
+            )
+        }
+        val summary = historyItemsSummary(items)
+        val entry = HistoryEntryEntity(
+            id = entryId,
+            timestampMillis = System.currentTimeMillis(),
+            direction = "mobile_to_desktop",
+            kind = summary.first,
+            status = computeSessionStatus(items),
+            text = summary.second,
+            senderDeviceId = identity.deviceId,
+            senderName = identity.deviceName,
+            receiverDeviceId = target.stableId,
+            receiverName = target.displayName,
+            sessionId = sessionId,
+            itemCount = items.size,
+            saveTarget = saveTarget,
+            rawJson = null
+        )
+        historyDao.upsertEntry(entry)
+        historyDao.upsertItems(items)
     }
 
     suspend fun recordReceivedFile(

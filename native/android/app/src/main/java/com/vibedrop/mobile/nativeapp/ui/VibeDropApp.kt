@@ -248,6 +248,11 @@ fun VibeDropApp(container: AppContainer) {
                             )
                         }
                     },
+                    onRecordSentContentBatch = { device, results, saveTarget ->
+                        scope.launch(Dispatchers.IO) {
+                            container.historyRepository.recordSentContentBatch(device, results, saveTarget)
+                        }
+                    },
                     modifier = Modifier.weight(1f)
                 )
                 1 -> HistoryScreen(
@@ -511,6 +516,7 @@ private fun SendScreen(
     onOpenSettings: () -> Unit,
     onRecordSentText: (DesktopDevice, String, Boolean) -> Unit,
     onRecordSentContent: (DesktopDevice, ContentTransferResult, String) -> Unit,
+    onRecordSentContentBatch: (DesktopDevice, List<ContentTransferResult>, String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -570,8 +576,10 @@ private fun SendScreen(
             result
                 .onSuccess { sentItems ->
                     fileActionLabels[deviceId] = "✓"
-                    sentItems.forEach { item ->
-                        onRecordSentContent(device, item, "inbox")
+                    if (sentItems.size == 1) {
+                        onRecordSentContent(device, sentItems.first(), "inbox")
+                    } else {
+                        onRecordSentContentBatch(device, sentItems, "inbox")
                     }
                     val message = if (sentItems.size == 1) {
                         "已发送到 Mac 收件箱：${sentItems.first().fileName}"
@@ -618,6 +626,7 @@ private fun SendScreen(
                     devices = devices,
                     controllers = controllers,
                     onRecordSentContent = onRecordSentContent,
+                    onRecordSentContentBatch = onRecordSentContentBatch,
                     onDismiss = { onConsumeSharedPayload(payload.id) }
                 )
             }
@@ -685,6 +694,7 @@ private fun SharedPayloadCard(
     devices: List<DesktopDevice>,
     controllers: Map<String, DesktopConnectionController>,
     onRecordSentContent: (DesktopDevice, ContentTransferResult, String) -> Unit,
+    onRecordSentContentBatch: (DesktopDevice, List<ContentTransferResult>, String) -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -721,20 +731,24 @@ private fun SharedPayloadCard(
                             transferLabel = "准备中..."
                             val result = runCatching {
                                 withContext(Dispatchers.IO) {
-                                    payload.uris.forEachIndexed { index, uri ->
-                                        val sent = sendUriToDesktopInbox(context, uri, controller) { progress ->
+                                    payload.uris.mapIndexed { index, uri ->
+                                        sendUriToDesktopInbox(context, uri, controller) { progress ->
                                             val label = transferProgressLabel(progress, index, payload.uris.size)
                                             scope.launch(Dispatchers.Main) {
                                                 transferLabel = label
                                             }
                                         }
-                                        onRecordSentContent(device, sent, "inbox")
                                     }
                                 }
                             }
                             result
-                                .onSuccess {
+                                .onSuccess { sentItems ->
                                     transferLabel = "✓"
+                                    if (sentItems.size == 1) {
+                                        onRecordSentContent(device, sentItems.first(), "inbox")
+                                    } else {
+                                        onRecordSentContentBatch(device, sentItems, "inbox")
+                                    }
                                     Toast.makeText(context, "分享文件已发送到 ${device.displayName}", Toast.LENGTH_SHORT).show()
                                     onDismiss()
                                 }
