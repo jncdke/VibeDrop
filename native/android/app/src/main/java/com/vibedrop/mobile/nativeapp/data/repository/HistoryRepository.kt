@@ -76,6 +76,55 @@ class HistoryRepository(
         historyDao.upsertEntry(entry)
     }
 
+    suspend fun recordSentContent(
+        target: DesktopDevice,
+        fileName: String,
+        mimeType: String,
+        sizeBytes: Long,
+        sourceUri: String?,
+        transferId: String?,
+        saveTarget: String,
+        status: String = "success"
+    ) {
+        val kind = kindFromMime(mimeType)
+        val label = kindLabel(kind)
+        val entryId = transferId?.takeIf { it.isNotBlank() }?.let { "native-outbound:$it" }
+            ?: "native:${UUID.randomUUID()}"
+        val entry = HistoryEntryEntity(
+            id = entryId,
+            timestampMillis = System.currentTimeMillis(),
+            direction = "mobile_to_desktop",
+            kind = kind,
+            status = status,
+            text = "[$label] $fileName",
+            senderDeviceId = "native_android_preview",
+            senderName = "VibeDrop Native Preview",
+            receiverDeviceId = target.stableId,
+            receiverName = target.displayName,
+            sessionId = transferId,
+            itemCount = 1,
+            saveTarget = saveTarget,
+            rawJson = null
+        )
+        val item = HistoryItemEntity(
+            id = "$entryId:item:0",
+            entryId = entryId,
+            itemIndex = 0,
+            kind = kind,
+            fileName = fileName,
+            mimeType = mimeType,
+            sizeBytes = sizeBytes.takeIf { it >= 0L },
+            localPath = sourceUri,
+            savedPath = null,
+            thumbnailPath = null,
+            thumbnailDataUrl = null,
+            status = status,
+            error = null
+        )
+        historyDao.upsertEntry(entry)
+        historyDao.upsertItems(listOf(item))
+    }
+
     suspend fun recordReceivedFile(
         source: DesktopDevice,
         result: IncomingFileResult

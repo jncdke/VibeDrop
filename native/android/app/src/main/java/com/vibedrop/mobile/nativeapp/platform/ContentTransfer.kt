@@ -14,7 +14,9 @@ private const val MAX_IMAGE_CLIPBOARD_BYTES = 10 * 1024 * 1024
 data class ContentTransferResult(
     val fileName: String,
     val mimeType: String,
-    val sizeBytes: Long
+    val sizeBytes: Long,
+    val sourceUri: String?,
+    val transferId: String?
 )
 
 fun sendImageUriToMacClipboard(
@@ -46,7 +48,10 @@ fun sendImageUriToMacClipboard(
         imageBase64 = base64
     )
     if (!sent) throw IllegalStateException("连接不可用")
-    return meta.copy(sizeBytes = bytes.size.toLong())
+    return meta.copy(
+        sizeBytes = bytes.size.toLong(),
+        sourceUri = uri.toString()
+    )
 }
 
 fun sendUriToDesktopInbox(
@@ -80,7 +85,10 @@ fun sendUriToDesktopInbox(
     if (!controller.sendIncomingFileComplete(transferId)) {
         throw IllegalStateException("发送完成消息失败")
     }
-    return meta
+    return meta.copy(
+        sourceUri = uri.toString(),
+        transferId = transferId
+    )
 }
 
 private fun Context.queryContentMeta(
@@ -105,6 +113,8 @@ private fun Context.queryContentMeta(
     return ContentTransferResult(
         fileName = fileName,
         mimeType = mimeType,
-        sizeBytes = sizeBytes
+        sizeBytes = sizeBytes,
+        sourceUri = uri.toString(),
+        transferId = null
     )
 }

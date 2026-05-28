@@ -71,6 +71,7 @@ import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import com.vibedrop.mobile.nativeapp.data.local.HistoryItemEntity
 import com.vibedrop.mobile.nativeapp.data.repository.HistoryEntryWithItems
 import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
+import com.vibedrop.mobile.nativeapp.platform.ContentTransferResult
 import com.vibedrop.mobile.nativeapp.platform.readClipboardText
 import com.vibedrop.mobile.nativeapp.platform.sendImageUriToMacClipboard
 import com.vibedrop.mobile.nativeapp.platform.sendUriToDesktopInbox
@@ -207,6 +208,19 @@ fun VibeDropApp(container: AppContainer) {
                     onRecordSentText = { device, text, pressEnter ->
                         scope.launch(Dispatchers.IO) {
                             container.historyRepository.recordSentText(device, text, pressEnter)
+                        }
+                    },
+                    onRecordSentContent = { device, result, saveTarget ->
+                        scope.launch(Dispatchers.IO) {
+                            container.historyRepository.recordSentContent(
+                                target = device,
+                                fileName = result.fileName,
+                                mimeType = result.mimeType,
+                                sizeBytes = result.sizeBytes,
+                                sourceUri = result.sourceUri,
+                                transferId = result.transferId,
+                                saveTarget = saveTarget
+                            )
                         }
                     },
                     modifier = Modifier.weight(1f)
@@ -422,6 +436,7 @@ private fun SendScreen(
     onConsumeSharedPayload: (Long) -> Unit,
     onOpenSettings: () -> Unit,
     onRecordSentText: (DesktopDevice, String, Boolean) -> Unit,
+    onRecordSentContent: (DesktopDevice, ContentTransferResult, String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -434,6 +449,7 @@ private fun SendScreen(
         pendingImageDeviceId = null
         if (uri == null || deviceId == null) return@rememberLauncherForActivityResult
         val controller = controllers[deviceId] ?: return@rememberLauncherForActivityResult
+        val device = devices.firstOrNull { it.id == deviceId } ?: return@rememberLauncherForActivityResult
         scope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
@@ -442,6 +458,7 @@ private fun SendScreen(
             }
             result
                 .onSuccess {
+                    onRecordSentContent(device, it, "clipboard")
                     Toast.makeText(context, "已发送图片到 Mac 剪贴板：${it.fileName}", Toast.LENGTH_SHORT).show()
                 }
                 .onFailure {
@@ -454,6 +471,7 @@ private fun SendScreen(
         pendingFileDeviceId = null
         if (uri == null || deviceId == null) return@rememberLauncherForActivityResult
         val controller = controllers[deviceId] ?: return@rememberLauncherForActivityResult
+        val device = devices.firstOrNull { it.id == deviceId } ?: return@rememberLauncherForActivityResult
         scope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
@@ -462,6 +480,7 @@ private fun SendScreen(
             }
             result
                 .onSuccess {
+                    onRecordSentContent(device, it, "inbox")
                     Toast.makeText(context, "已发送到 Mac 收件箱：${it.fileName}", Toast.LENGTH_SHORT).show()
                 }
                 .onFailure {
@@ -498,6 +517,7 @@ private fun SendScreen(
                     payload = payload,
                     devices = devices,
                     controllers = controllers,
+                    onRecordSentContent = onRecordSentContent,
                     onDismiss = { onConsumeSharedPayload(payload.id) }
                 )
             }
@@ -546,6 +566,7 @@ private fun SharedPayloadCard(
     payload: IncomingSharePayload,
     devices: List<DesktopDevice>,
     controllers: Map<String, DesktopConnectionController>,
+    onRecordSentContent: (DesktopDevice, ContentTransferResult, String) -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -581,7 +602,8 @@ private fun SharedPayloadCard(
                             val result = runCatching {
                                 withContext(Dispatchers.IO) {
                                     payload.uris.forEach { uri ->
-                                        sendUriToDesktopInbox(context, uri, controller)
+                                        val sent = sendUriToDesktopInbox(context, uri, controller)
+                                        onRecordSentContent(device, sent, "inbox")
                                     }
                                 }
                             }
