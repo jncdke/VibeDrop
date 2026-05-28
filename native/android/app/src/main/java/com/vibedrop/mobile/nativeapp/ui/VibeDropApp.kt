@@ -55,6 +55,7 @@ import com.vibedrop.mobile.nativeapp.data.AppContainer
 import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import com.vibedrop.mobile.nativeapp.platform.readClipboardText
+import com.vibedrop.mobile.nativeapp.platform.startClipboardSyncService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -96,6 +97,10 @@ fun VibeDropApp(container: AppContainer) {
         } else if (result.imported > 0) {
             Toast.makeText(context, "已迁移旧历史 ${result.imported} 条", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    LaunchedEffect(devices) {
+        startClipboardSyncService(context)
     }
 
     DisposableEffect(controllers) {

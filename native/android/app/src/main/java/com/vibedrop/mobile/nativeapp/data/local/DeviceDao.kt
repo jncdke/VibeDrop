@@ -16,6 +16,9 @@ interface DeviceDao {
     @Query("SELECT COUNT(*) FROM devices")
     suspend fun countDevices(): Int
 
+    @Query("SELECT * FROM devices WHERE host IS NOT NULL AND port IS NOT NULL AND pin IS NOT NULL AND pin != ''")
+    suspend fun getClipboardSyncDevices(): List<DeviceEntity>
+
     @Upsert
     suspend fun upsert(device: DeviceEntity)
 }
