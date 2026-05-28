@@ -4,6 +4,9 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -15,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -37,6 +41,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -65,6 +70,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Calendar
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -83,7 +89,7 @@ fun VibeDropApp(container: AppContainer) {
     var homeVaultStatus by remember { mutableStateOf("还未同步") }
     var homeVaultBusy by remember { mutableStateOf(false) }
     val devices by container.deviceRepository.observeDevices().collectAsState(initial = emptyList())
-    val history by container.historyRepository.observeRecent().collectAsState(initial = emptyList())
+    val history by container.historyRepository.observeRecent(limit = 1000).collectAsState(initial = emptyList())
     val controllers = remember(devices, appContext) {
         devices.associateBy(
             keySelector = { it.id },
@@ -572,6 +578,34 @@ private fun HistoryScreen(
     entries: List<HistoryEntryEntity>,
     modifier: Modifier = Modifier
 ) {
+    var query by rememberSaveable { mutableStateOf("") }
+    var selectedType by rememberSaveable { mutableStateOf("all") }
+    var selectedTime by rememberSaveable { mutableStateOf(HistoryTimeFilter.All) }
+    var selectedHour by remember { mutableStateOf<HeatmapSelection?>(null) }
+    val now = remember(entries.size) { System.currentTimeMillis() }
+    val baseFiltered = remember(entries, query, selectedType, selectedTime, now) {
+        entries
+            .asSequence()
+            .filter { it.matchesQuery(query) }
+            .filter { selectedType == "all" || it.kind == selectedType }
+            .filter { it.matchesTimeFilter(selectedTime, now) }
+            .toList()
+    }
+    val visibleDays = remember(baseFiltered, now) { buildVisibleDays(baseFiltered, now) }
+    val heatmapCounts = remember(baseFiltered, visibleDays) {
+        buildHeatmapCounts(baseFiltered, visibleDays)
+    }
+    val visibleMax = heatmapCounts.values.maxOrNull() ?: 0
+    val filteredEntries = remember(baseFiltered, selectedHour) {
+        selectedHour?.let { selection ->
+            baseFiltered.filter { entry ->
+                startOfDay(entry.timestampMillis) == selection.dayStartMillis &&
+                    hourOfDay(entry.timestampMillis) == selection.hour
+            }
+        } ?: baseFiltered
+    }
+    val peak = heatmapCounts.maxByOrNull { it.value }
+
     LazyColumn(
         modifier = modifier.fillMaxWidth(),
         contentPadding = PaddingValues(18.dp),
@@ -586,10 +620,134 @@ private fun HistoryScreen(
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "当前原生库 ${entries.size} 条最近记录",
+                text = "显示 ${filteredEntries.size} / ${entries.size} 条最近记录",
                 fontSize = 15.sp,
                 color = Color(0xFF667085)
             )
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OutlinedTextField(
+                        value = query,
+                        onValueChange = {
+                            query = it
+                            selectedHour = null
+                        },
+                        placeholder = { Text("搜索文本、文件名、设备、状态") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        shape = RoundedCornerShape(18.dp)
+                    )
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        HistoryFilterButton("全部时间", selectedTime == HistoryTimeFilter.All) {
+                            selectedTime = HistoryTimeFilter.All
+                            selectedHour = null
+                        }
+                        HistoryFilterButton("今天", selectedTime == HistoryTimeFilter.Today) {
+                            selectedTime = HistoryTimeFilter.Today
+                            selectedHour = null
+                        }
+                        HistoryFilterButton("近7天", selectedTime == HistoryTimeFilter.Last7Days) {
+                            selectedTime = HistoryTimeFilter.Last7Days
+                            selectedHour = null
+                        }
+                        HistoryFilterButton("近30天", selectedTime == HistoryTimeFilter.Last30Days) {
+                            selectedTime = HistoryTimeFilter.Last30Days
+                            selectedHour = null
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        historyTypeFilters.forEach { filter ->
+                            HistoryFilterButton(filter.label, selectedType == filter.kind) {
+                                selectedType = filter.kind
+                                selectedHour = null
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "活跃热力图",
+                                color = Color(0xFF111827),
+                                fontSize = 22.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                            Text(
+                                text = "${formatMonthDay(visibleDays.first())} - ${formatMonthDay(visibleDays.last())} · 当前窗口独立对比",
+                                color = Color(0xFF667085),
+                                fontSize = 14.sp
+                            )
+                        }
+                        if (selectedHour != null) {
+                            OutlinedButton(onClick = { selectedHour = null }) {
+                                Text("清除小时")
+                            }
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        HistoryStatCard("发送", "${baseFiltered.size} 条", Modifier.weight(1f))
+                        HistoryStatCard("峰值", peak?.let { "${it.key.second}:00 · ${it.value}" } ?: "无", Modifier.weight(1f))
+                        HistoryStatCard("类型", historyTypeLabel(selectedType), Modifier.weight(1f))
+                    }
+                    HistoryHeatmap(
+                        days = visibleDays,
+                        counts = heatmapCounts,
+                        maxCount = visibleMax,
+                        selected = selectedHour,
+                        onSelect = { selectedHour = it }
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("少", color = Color(0xFF667085), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Box(
+                            modifier = Modifier
+                                .padding(horizontal = 8.dp)
+                                .weight(1f)
+                                .height(10.dp)
+                                .clip(RoundedCornerShape(999.dp))
+                                .background(Color(0xFFEFF4F2))
+                        ) {
+                            Row(Modifier.fillMaxSize()) {
+                                repeat(24) { index ->
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxSize()
+                                            .background(heatColor(index + 1, 24))
+                                    )
+                                }
+                            }
+                        }
+                        Text("多", color = Color(0xFF667085), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
         }
         if (entries.isEmpty()) {
             item {
@@ -606,8 +764,124 @@ private fun HistoryScreen(
                 }
             }
         }
-        items(entries, key = { it.id }) { entry ->
+        items(filteredEntries, key = { it.id }) { entry ->
             HistoryCard(entry)
+        }
+    }
+}
+
+@Composable
+private fun HistoryFilterButton(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Text(
+        text = text,
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(if (selected) Color(0xFF111827) else Color(0xFFEFF4FA))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 9.dp),
+        color = if (selected) Color.White else Color(0xFF526174),
+        fontWeight = FontWeight.ExtraBold,
+        fontSize = 13.sp,
+        maxLines = 1
+    )
+}
+
+@Composable
+private fun HistoryStatCard(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color(0xFFF8FAFC))
+            .padding(10.dp)
+    ) {
+        Text(label, color = Color(0xFF98A2B3), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text(
+            text = value,
+            color = Color(0xFF111827),
+            fontSize = 15.sp,
+            fontWeight = FontWeight.ExtraBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun HistoryHeatmap(
+    days: List<Long>,
+    counts: Map<Pair<Long, Int>, Int>,
+    maxCount: Int,
+    selected: HeatmapSelection?,
+    onSelect: (HeatmapSelection) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row {
+            Spacer(Modifier.width(40.dp))
+            days.forEach { dayStart ->
+                Column(
+                    modifier = Modifier.weight(1f),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = weekdayLabel(dayStart),
+                        color = Color(0xFF667085),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = formatMonthDay(dayStart),
+                        color = Color(0xFF111827),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+            }
+        }
+        listOf(0, 6, 12, 18).forEach { blockStart ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "%02d:00".format(blockStart),
+                    modifier = Modifier.width(40.dp),
+                    color = Color(0xFF98A2B3),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                days.forEach { dayStart ->
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        repeat(6) { offset ->
+                            val hour = blockStart + offset
+                            val selection = HeatmapSelection(dayStart, hour)
+                            val count = counts[dayStart to hour] ?: 0
+                            val isSelected = selected == selection
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(10.dp)
+                                    .padding(horizontal = 3.dp)
+                                    .clip(RoundedCornerShape(999.dp))
+                                    .background(heatColor(count, maxCount))
+                                    .border(
+                                        width = if (isSelected) 2.dp else 0.dp,
+                                        color = if (isSelected) Color(0xFF168DF7) else Color.Transparent,
+                                        shape = RoundedCornerShape(999.dp)
+                                    )
+                                    .clickable { if (count > 0) onSelect(selection) }
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -637,6 +911,7 @@ private fun HistoryCard(entry: HistoryEntryEntity) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 HistoryChip(kindLabel(entry.kind))
                 HistoryChip(entry.status)
+                entry.senderName?.takeIf { it.isNotBlank() }?.let { HistoryChip(it) }
                 entry.receiverName?.takeIf { it.isNotBlank() }?.let { HistoryChip(it) }
             }
         }
@@ -929,9 +1204,131 @@ private fun kindLabel(kind: String): String = when (kind) {
     "video" -> "视频"
     "file" -> "文件"
     "media" -> "媒体"
-    else -> "text"
+    "text" -> "文本"
+    else -> kind
 }
 
 private fun formatTime(timestampMillis: Long): String {
     return SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.CHINA).format(Date(timestampMillis))
+}
+
+private enum class HistoryTimeFilter {
+    All,
+    Today,
+    Last7Days,
+    Last30Days
+}
+
+private data class HistoryTypeFilter(val kind: String, val label: String)
+
+private data class HeatmapSelection(
+    val dayStartMillis: Long,
+    val hour: Int
+)
+
+private val historyTypeFilters = listOf(
+    HistoryTypeFilter("all", "全部类型"),
+    HistoryTypeFilter("text", "文本"),
+    HistoryTypeFilter("image", "图片"),
+    HistoryTypeFilter("video", "视频"),
+    HistoryTypeFilter("file", "文件")
+)
+
+private const val DAY_MILLIS = 24L * 60L * 60L * 1000L
+
+private fun HistoryEntryEntity.matchesQuery(query: String): Boolean {
+    val trimmed = query.trim()
+    if (trimmed.isBlank()) return true
+    val haystack = listOfNotNull(
+        text,
+        senderName,
+        receiverName,
+        kindLabel(kind),
+        status,
+        saveTarget,
+        direction
+    ).joinToString(" ")
+    return haystack.contains(trimmed, ignoreCase = true)
+}
+
+private fun HistoryEntryEntity.matchesTimeFilter(
+    filter: HistoryTimeFilter,
+    now: Long
+): Boolean {
+    val todayStart = startOfDay(now)
+    return when (filter) {
+        HistoryTimeFilter.All -> true
+        HistoryTimeFilter.Today -> timestampMillis >= todayStart
+        HistoryTimeFilter.Last7Days -> timestampMillis >= todayStart - 6L * DAY_MILLIS
+        HistoryTimeFilter.Last30Days -> timestampMillis >= todayStart - 29L * DAY_MILLIS
+    }
+}
+
+private fun buildVisibleDays(
+    entries: List<HistoryEntryEntity>,
+    now: Long
+): List<Long> {
+    val anchor = entries.maxOfOrNull { it.timestampMillis } ?: now
+    val end = startOfDay(anchor)
+    return (4 downTo 0).map { end - it * DAY_MILLIS }
+}
+
+private fun buildHeatmapCounts(
+    entries: List<HistoryEntryEntity>,
+    days: List<Long>
+): Map<Pair<Long, Int>, Int> {
+    val visibleDays = days.toSet()
+    return entries
+        .map { startOfDay(it.timestampMillis) to hourOfDay(it.timestampMillis) }
+        .filter { it.first in visibleDays }
+        .groupingBy { it }
+        .eachCount()
+}
+
+private fun startOfDay(timestampMillis: Long): Long {
+    val calendar = Calendar.getInstance(Locale.CHINA)
+    calendar.timeInMillis = timestampMillis
+    calendar.set(Calendar.HOUR_OF_DAY, 0)
+    calendar.set(Calendar.MINUTE, 0)
+    calendar.set(Calendar.SECOND, 0)
+    calendar.set(Calendar.MILLISECOND, 0)
+    return calendar.timeInMillis
+}
+
+private fun hourOfDay(timestampMillis: Long): Int {
+    val calendar = Calendar.getInstance(Locale.CHINA)
+    calendar.timeInMillis = timestampMillis
+    return calendar.get(Calendar.HOUR_OF_DAY)
+}
+
+private fun heatColor(count: Int, maxCount: Int): Color {
+    if (count <= 0 || maxCount <= 0) return Color(0xFFF1F4F7)
+    val t = kotlin.math.sqrt((count.toFloat() / maxCount.toFloat()).coerceIn(0f, 1f))
+    return if (t < 0.58f) {
+        lerpColor(Color.White, Color(0xFF5DDD8A), t / 0.58f)
+    } else {
+        lerpColor(Color(0xFF5DDD8A), Color(0xFF08130D), (t - 0.58f) / 0.42f)
+    }
+}
+
+private fun lerpColor(from: Color, to: Color, t: Float): Color {
+    val clamped = t.coerceIn(0f, 1f)
+    return Color(
+        red = from.red + (to.red - from.red) * clamped,
+        green = from.green + (to.green - from.green) * clamped,
+        blue = from.blue + (to.blue - from.blue) * clamped,
+        alpha = 1f
+    )
+}
+
+private fun formatMonthDay(timestampMillis: Long): String {
+    return SimpleDateFormat("M/d", Locale.CHINA).format(Date(timestampMillis))
+}
+
+private fun weekdayLabel(timestampMillis: Long): String {
+    return SimpleDateFormat("E", Locale.CHINA).format(Date(timestampMillis))
+}
+
+private fun historyTypeLabel(kind: String): String {
+    return historyTypeFilters.firstOrNull { it.kind == kind }?.label ?: kindLabel(kind)
 }
