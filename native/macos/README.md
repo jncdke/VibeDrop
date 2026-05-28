@@ -31,4 +31,4 @@ swift run VibeDropMacApp
 2. `VibeDropMacStorage`：GRDB 历史库和 JSONL 迁移，后续承接历史查询、热力图聚合和 Home Vault 导出。
 3. `VibeDropMacServer`：discover/pair/WebSocket v1 路由和消息效果分流，后续接 SwiftNIO HTTP/WebSocket 与 UDP discovery。
 4. `VibeDropMacRuntime`：把 server effect 接到 CGEvent 输入模拟和 SQLite 历史写入。
-5. `VibeDropMacApp`：SwiftUI/AppKit app shell，当前已覆盖服务状态、连接信息、配对、连接设备、拖拽普通文件/文件夹/多文件发送和最近历史。
+5. `VibeDropMacApp`：SwiftUI/AppKit app shell，当前已覆盖服务状态、连接信息、配对、连接设备、拖拽普通文件/文件夹/多文件发送和最近历史；历史页已支持发送端、接收端、类型、状态、时间和时段筛选。

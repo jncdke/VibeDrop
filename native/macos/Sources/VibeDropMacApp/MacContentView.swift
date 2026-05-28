@@ -370,15 +370,20 @@ private struct HistoryView: View {
     @State private var timeFilter = "all"
     @State private var kindFilter = "all"
     @State private var statusFilter = "all"
-    @State private var participantFilter = "all"
+    @State private var senderFilter = "all"
+    @State private var receiverFilter = "all"
     @State private var hourFilter = "all"
     @State private var customStartDate = ""
     @State private var customEndDate = ""
     @State private var customStartTime = ""
     @State private var customEndTime = ""
 
-    private var participantFilters: [HistoryParticipantFilter] {
-        buildHistoryParticipantFilters(entries: model.recentHistory)
+    private var senderFilters: [HistoryEndpointFilter] {
+        buildHistoryEndpointFilters(entries: model.recentHistory, endpoint: .sender)
+    }
+
+    private var receiverFilters: [HistoryEndpointFilter] {
+        buildHistoryEndpointFilters(entries: model.recentHistory, endpoint: .receiver)
     }
 
     private var filteredEntries: [HistoryEntry] {
@@ -398,7 +403,10 @@ private struct HistoryView: View {
                 !entry.items.contains(where: { $0.status == statusFilter }) {
                 return false
             }
-            if participantFilter != "all" && !entry.matchesParticipantFilter(participantFilter) {
+            if senderFilter != "all" && !entry.matchesSenderFilter(senderFilter) {
+                return false
+            }
+            if receiverFilter != "all" && !entry.matchesReceiverFilter(receiverFilter) {
                 return false
             }
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -463,13 +471,23 @@ private struct HistoryView: View {
                     }
                     .pickerStyle(.menu)
                     .frame(width: 150)
-                    Picker("", selection: $participantFilter) {
-                        ForEach(participantFilters, id: \.key) { filter in
+                    Picker("", selection: $senderFilter) {
+                        ForEach(senderFilters, id: \.key) { filter in
                             Text(filter.label).tag(filter.key)
                         }
                     }
                     .pickerStyle(.menu)
                     .frame(width: 220)
+                    Picker("", selection: $receiverFilter) {
+                        ForEach(receiverFilters, id: \.key) { filter in
+                            Text(filter.label).tag(filter.key)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 220)
+                    Spacer()
+                }
+                HStack(spacing: 12) {
                     Picker("", selection: $timeFilter) {
                         Text("全部时间").tag("all")
                         Text("今天").tag("today")
@@ -479,8 +497,6 @@ private struct HistoryView: View {
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 440)
-                }
-                HStack(spacing: 12) {
                     Picker("", selection: $hourFilter) {
                         Text("全天").tag("all")
                         Text("上午").tag("morning")
@@ -717,23 +733,31 @@ private struct ExtraItemsTile: View {
     }
 }
 
-private struct HistoryParticipantFilter: Equatable {
+private enum HistoryEndpoint {
+    case sender
+    case receiver
+}
+
+private struct HistoryEndpointFilter: Equatable {
     var key: String
     var label: String
 }
 
-private func buildHistoryParticipantFilters(entries: [HistoryEntry]) -> [HistoryParticipantFilter] {
+private func buildHistoryEndpointFilters(entries: [HistoryEntry], endpoint: HistoryEndpoint) -> [HistoryEndpointFilter] {
     var counts: [String: (label: String, count: Int)] = [:]
     for entry in entries {
-        for participant in [entry.sender, entry.receiver] {
-            guard let participant else { continue }
-            let label = participant.displayName.isEmpty ? participant.deviceId : participant.displayName
-            let key = historyParticipantKey(id: participant.deviceId, fallback: label)
-            let current = counts[key]
-            counts[key] = (label: label, count: (current?.count ?? 0) + 1)
-        }
+        let participant = endpoint == .sender ? entry.sender : entry.receiver
+        guard let participant else { continue }
+        let label = participant.displayName.isEmpty ? participant.deviceId : participant.displayName
+        let key = historyParticipantKey(id: participant.deviceId, fallback: label)
+        let current = counts[key]
+        counts[key] = (label: label, count: (current?.count ?? 0) + 1)
     }
-    return [HistoryParticipantFilter(key: "all", label: "全部设备")] +
+    let allLabel = switch endpoint {
+    case .sender: "全部发送端"
+    case .receiver: "全部接收端"
+    }
+    return [HistoryEndpointFilter(key: "all", label: "\(allLabel) (\(entries.count))")] +
         counts
             .sorted { left, right in
                 if left.value.count == right.value.count {
@@ -743,16 +767,19 @@ private func buildHistoryParticipantFilters(entries: [HistoryEntry]) -> [History
             }
             .prefix(16)
             .map { key, value in
-                HistoryParticipantFilter(key: key, label: "\(value.label) (\(value.count))")
+                HistoryEndpointFilter(key: key, label: "\(value.label) (\(value.count))")
             }
 }
 
 private extension HistoryEntry {
-    func matchesParticipantFilter(_ key: String) -> Bool {
+    func matchesSenderFilter(_ key: String) -> Bool {
         let senderLabel = sender?.displayName.isEmpty == false ? sender?.displayName : sender?.deviceId
+        return historyParticipantKey(id: sender?.deviceId, fallback: senderLabel ?? "") == key
+    }
+
+    func matchesReceiverFilter(_ key: String) -> Bool {
         let receiverLabel = receiver?.displayName.isEmpty == false ? receiver?.displayName : receiver?.deviceId
-        return historyParticipantKey(id: sender?.deviceId, fallback: senderLabel ?? "") == key ||
-            historyParticipantKey(id: receiver?.deviceId, fallback: receiverLabel ?? "") == key
+        return historyParticipantKey(id: receiver?.deviceId, fallback: receiverLabel ?? "") == key
     }
 }
 
