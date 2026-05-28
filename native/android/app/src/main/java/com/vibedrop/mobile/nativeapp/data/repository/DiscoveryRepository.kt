@@ -1,12 +1,16 @@
 package com.vibedrop.mobile.nativeapp.data.repository
 
 import android.content.Context
-import android.net.wifi.WifiManager
 import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
 import com.vibedrop.mobile.nativeapp.core.model.DiscoveredDesktop
 import com.vibedrop.mobile.nativeapp.core.model.PairRequestAccepted
 import com.vibedrop.mobile.nativeapp.core.model.PairStatus
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -15,8 +19,10 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.util.concurrent.TimeUnit
 
 class DiscoveryRepository(
@@ -30,16 +36,21 @@ class DiscoveryRepository(
 
     suspend fun discoverDesktops(knownDevices: List<DesktopDevice>): List<DiscoveredDesktop> {
         return withContext(Dispatchers.IO) {
+            val candidates = discoveryIpv4Candidates()
             val results = linkedMapOf<String, DiscoveredDesktop>()
-            discoverViaUdp().forEach { results[it.key] = it }
+            discoverViaUdp(candidates).forEach { results[it.key] = it }
             knownDevices.forEach { device ->
                 discoverViaHttp(device.host, device.port, "known")?.let { results[it.key] = it }
                 device.ip?.let { ip ->
                     discoverViaHttp(ip, device.port, "known-ip")?.let { results[it.key] = it }
                 }
             }
+            if (results.values.none { it.source == "udp" }) {
+                discoverViaHttpTargets(httpSweepTargets(candidates)).forEach { results[it.key] = it }
+            }
             results.values.sortedWith(
                 compareByDescending<DiscoveredDesktop> { it.source == "udp" }
+                    .thenByDescending { it.source == "known" || it.source == "known-ip" }
                     .thenBy { it.hostname.lowercase() }
                     .thenBy { it.ip }
             )
@@ -97,13 +108,13 @@ class DiscoveryRepository(
         )
     }
 
-    private fun discoverViaUdp(): List<DiscoveredDesktop> {
+    private fun discoverViaUdp(candidates: List<DiscoveryIpv4Candidate>): List<DiscoveredDesktop> {
         val payload = JSONObject()
             .put("kind", "discover_probe")
             .put("protocol_version", 1)
             .toString()
             .toByteArray(Charsets.UTF_8)
-        val targets = udpTargets()
+        val targets = udpTargets(candidates)
         if (targets.isEmpty()) return emptyList()
 
         val results = linkedMapOf<String, DiscoveredDesktop>()
@@ -136,6 +147,20 @@ class DiscoveryRepository(
             }
         }
         return results.values.toList()
+    }
+
+    private suspend fun discoverViaHttpTargets(targets: List<InetAddress>): List<DiscoveredDesktop> {
+        if (targets.isEmpty()) return emptyList()
+        val semaphore = Semaphore(32)
+        return coroutineScope {
+            targets.map { target ->
+                async {
+                    semaphore.withPermit {
+                        discoverViaHttp(target.hostAddress.orEmpty(), DESKTOP_DISCOVERY_PORT, "http-sweep")
+                    }
+                }
+            }.awaitAll().filterNotNull()
+        }
     }
 
     private fun discoverViaHttp(host: String, port: Int, source: String): DiscoveredDesktop? {
@@ -175,21 +200,120 @@ class DiscoveryRepository(
         )
     }
 
-    private fun udpTargets(): List<InetAddress> {
+    private fun udpTargets(candidates: List<DiscoveryIpv4Candidate>): List<InetAddress> {
         val targets = linkedSetOf<InetAddress>()
         runCatching { targets.add(InetAddress.getByName("255.255.255.255")) }
-        runCatching {
-            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            val dhcpInfo = wifiManager?.dhcpInfo ?: return@runCatching
-            val broadcast = (dhcpInfo.ipAddress and dhcpInfo.netmask) or dhcpInfo.netmask.inv()
-            val bytes = byteArrayOf(
-                (broadcast and 0xff).toByte(),
-                (broadcast shr 8 and 0xff).toByte(),
-                (broadcast shr 16 and 0xff).toByte(),
-                (broadcast shr 24 and 0xff).toByte()
-            )
-            targets.add(InetAddress.getByAddress(bytes))
+        val sourceCandidates = candidates
+            .filter { it.allowDirectedBroadcast }
+            .ifEmpty { candidates }
+        sourceCandidates.forEach { candidate ->
+            val octets = candidate.octets
+            runCatching {
+                targets.add(
+                    InetAddress.getByAddress(
+                        byteArrayOf(octets[0], octets[1], octets[2], 255.toByte())
+                    )
+                )
+            }
         }
         return targets.toList()
+    }
+
+    private fun httpSweepTargets(candidates: List<DiscoveryIpv4Candidate>): List<InetAddress> {
+        val localAddresses = candidates.map { it.hostAddress }.toSet()
+        val sourceCandidates = candidates
+            .filter { it.allowHttpSweep }
+            .ifEmpty { candidates }
+            .distinctBy { it.subnetKey }
+            .take(HTTP_SUBNET_LIMIT)
+        val targets = mutableListOf<InetAddress>()
+        val seen = mutableSetOf<String>()
+        for (candidate in sourceCandidates) {
+            val octets = candidate.octets
+            for (host in 1..254) {
+                val address = "${octets[0].toInt() and 0xff}.${octets[1].toInt() and 0xff}.${octets[2].toInt() and 0xff}.$host"
+                if (address in localAddresses || !seen.add(address)) continue
+                runCatching { targets.add(InetAddress.getByName(address)) }
+            }
+        }
+        return targets
+    }
+
+    private fun discoveryIpv4Candidates(): List<DiscoveryIpv4Candidate> {
+        return runCatching {
+            NetworkInterface.getNetworkInterfaces()
+                .toList()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { networkInterface ->
+                    networkInterface.inetAddresses.toList().mapNotNull { address ->
+                        val ipv4 = address as? Inet4Address ?: return@mapNotNull null
+                        if (!isViableDiscoveryAddress(ipv4)) return@mapNotNull null
+                        DiscoveryIpv4Candidate(
+                            interfaceName = networkInterface.name,
+                            address = ipv4
+                        )
+                    }
+                }
+                .distinctBy { it.hostAddress }
+                .sortedWith(
+                    compareBy<DiscoveryIpv4Candidate> { it.priority }
+                        .thenBy { it.interfaceName }
+                        .thenBy { it.hostAddress }
+                )
+        }.getOrDefault(emptyList())
+    }
+
+    private fun isViableDiscoveryAddress(address: Inet4Address): Boolean {
+        if (address.isLoopbackAddress || address.isLinkLocalAddress || address.isAnyLocalAddress) {
+            return false
+        }
+        val octets = address.address
+        val first = octets[0].toInt() and 0xff
+        val second = octets[1].toInt() and 0xff
+        return first == 10 ||
+            (first == 172 && second in 16..31) ||
+            (first == 192 && second == 168)
+    }
+
+    private data class DiscoveryIpv4Candidate(
+        val interfaceName: String,
+        val address: Inet4Address
+    ) {
+        val hostAddress: String = address.hostAddress.orEmpty()
+        val octets: ByteArray = address.address
+        val subnetKey: String = "${octets[0].toInt() and 0xff}.${octets[1].toInt() and 0xff}.${octets[2].toInt() and 0xff}"
+        private val normalizedName = interfaceName.lowercase()
+        private val primaryLan = normalizedName.startsWith("wlan") ||
+            normalizedName.startsWith("ap") ||
+            normalizedName.startsWith("swlan") ||
+            normalizedName.startsWith("softap")
+        private val secondaryLan = normalizedName.startsWith("eth") ||
+            normalizedName.startsWith("en") ||
+            normalizedName.startsWith("bridge") ||
+            normalizedName.startsWith("br") ||
+            normalizedName.startsWith("rndis") ||
+            normalizedName.startsWith("usb")
+        private val pointToPointOrVirtual = normalizedName.startsWith("tun") ||
+            normalizedName.startsWith("ppp") ||
+            normalizedName.startsWith("rmnet") ||
+            normalizedName.startsWith("ccmni") ||
+            normalizedName.startsWith("clat") ||
+            normalizedName.startsWith("dummy") ||
+            normalizedName.startsWith("ifb") ||
+            normalizedName.startsWith("tap") ||
+            normalizedName.startsWith("utun")
+        val allowHttpSweep: Boolean = primaryLan || secondaryLan
+        val allowDirectedBroadcast: Boolean = allowHttpSweep && !pointToPointOrVirtual
+        val priority: Int = when {
+            primaryLan -> 0
+            secondaryLan -> 1
+            pointToPointOrVirtual -> 3
+            else -> 2
+        }
+    }
+
+    private companion object {
+        const val DESKTOP_DISCOVERY_PORT = 9001
+        const val HTTP_SUBNET_LIMIT = 2
     }
 }

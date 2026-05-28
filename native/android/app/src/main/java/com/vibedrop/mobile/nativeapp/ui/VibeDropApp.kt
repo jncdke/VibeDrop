@@ -2044,7 +2044,7 @@ private fun SettingsScreen(
 
                     if (discoveredDesktops.isEmpty()) {
                         Text(
-                            text = "扫描会使用 UDP 广播和已知设备 HTTP /discover 校验。Mac 端会继续使用现有 Tauri 服务。",
+                            text = "扫描会使用 UDP 广播、已知设备直连和局域网 /discover 扫描。Mac 端会继续使用现有 Tauri 或原生服务。",
                             color = Color(0xFF98A2B3),
                             fontSize = 13.sp
                         )
