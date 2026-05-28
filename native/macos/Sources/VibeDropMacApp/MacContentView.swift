@@ -94,6 +94,8 @@ private struct OverviewView: View {
                 PairRequestsCard()
                 DropSendCard()
                     .gridCellColumns(2)
+                DiagnosticCard()
+                    .gridCellColumns(2)
             }
             .padding(.horizontal, 24)
             .padding(.bottom, 24)
@@ -290,6 +292,74 @@ private struct DropSendCard: View {
         case "success": return "已发送"
         case "failed": return "失败"
         default: return "发送中"
+        }
+    }
+}
+
+private struct DiagnosticCard: View {
+    @EnvironmentObject private var model: MacNativeAppModel
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("诊断日志").font(.system(size: 22, weight: .bold))
+                        Text("记录服务启动、配对、连接数量变化和文件发送事件；不记录正文、剪贴板内容和文件路径。")
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("刷新") { model.refreshDiagnostics() }
+                        .buttonStyle(.bordered)
+                    Button("导出诊断") { model.exportDiagnostics() }
+                        .buttonStyle(.borderedProminent)
+                }
+                if let path = model.diagnosticExportPath {
+                    Text("最近导出：\((path as NSString).lastPathComponent)")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if model.diagnosticEvents.isEmpty {
+                    EmptyHint("暂无诊断事件。")
+                } else {
+                    VStack(spacing: 8) {
+                        ForEach(model.diagnosticEvents.prefix(8)) { event in
+                            HStack(alignment: .top, spacing: 12) {
+                                Image(systemName: diagnosticIcon(scope: event.scope))
+                                    .font(.system(size: 14, weight: .bold))
+                                    .foregroundStyle(.blue)
+                                    .frame(width: 18)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(event.label)
+                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(.primary)
+                                    Text(event.detailText)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
+                                Spacer()
+                            }
+                            .padding(10)
+                            .background(Color(red: 0.96, green: 0.98, blue: 1.0), in: RoundedRectangle(cornerRadius: 12))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func diagnosticIcon(scope: String) -> String {
+        switch scope {
+        case "service": return "antenna.radiowaves.left.and.right"
+        case "clients": return "iphone.radiowaves.left.and.right"
+        case "pair": return "person.badge.key"
+        case "transfer": return "arrow.up.doc"
+        case "permission": return "hand.raised"
+        case "login-item": return "power"
+        default: return "waveform.path.ecg"
         }
     }
 }

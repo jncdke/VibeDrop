@@ -27,6 +27,8 @@ final class MacNativeAppModel: ObservableObject {
     @Published var transferItems: [MacTransferListItem] = []
     @Published var launchAtLoginEnabled = MacLaunchAtLoginController.isEnabled
     @Published var launchAtLoginStatus = MacLaunchAtLoginController.statusText
+    @Published var diagnosticEvents: [MacDiagnosticLogEvent] = []
+    @Published var diagnosticExportPath: String?
 
     private var started = false
     private var server: VibeDropMacServer?
@@ -36,6 +38,8 @@ final class MacNativeAppModel: ObservableObject {
     private var outboundService: MacOutboundFileTransferService?
     private var clipboardBroadcastService: MacClipboardBroadcastService?
     private var refreshTimer: Timer?
+    private let diagnosticLogStore = try? MacDiagnosticLogStore()
+    private var lastConnectedClientKeys: Set<String> = []
 
     var addressText: String {
         guard let configuration else { return "加载中" }
@@ -54,6 +58,7 @@ final class MacNativeAppModel: ObservableObject {
     func startIfNeeded() {
         guard !started else { return }
         started = true
+        log("app", "start")
 
         do {
             let configuration = try MacRuntimeConfigurationFactory.load()
@@ -92,6 +97,15 @@ final class MacNativeAppModel: ObservableObject {
             self.clipboardBroadcastService = clipboardBroadcastService
             serviceStatus = "服务在线"
             serviceError = nil
+            log(
+                "service",
+                "started",
+                [
+                    "host": configuration.hostname,
+                    "ip": configuration.ip,
+                    "port": "\(configuration.port)"
+                ]
+            )
             refresh()
             refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.refresh() }
@@ -99,6 +113,7 @@ final class MacNativeAppModel: ObservableObject {
         } catch {
             serviceStatus = "启动失败"
             serviceError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            log("service", "start_failed", ["error": serviceError ?? "unknown"])
         }
     }
 
@@ -107,43 +122,59 @@ final class MacNativeAppModel: ObservableObject {
         launchAtLoginEnabled = MacLaunchAtLoginController.isEnabled
         launchAtLoginStatus = MacLaunchAtLoginController.statusText
         connectedClients = server?.connectedClientSnapshots ?? []
+        logClientChanges(connectedClients)
         pendingPairRequests = pairManager?.pendingRequests() ?? []
         if selectedSessionId == nil || !connectedClients.contains(where: { $0.peer.sessionId == selectedSessionId }) {
             selectedSessionId = connectedClients.first(where: { $0.peer.canReceiveFiles })?.peer.sessionId
                 ?? connectedClients.first?.peer.sessionId
         }
         recentHistory = (try? database?.fetchRecent(limit: 80)) ?? []
+        diagnosticEvents = diagnosticLogStore?.recent(limit: 60) ?? []
     }
 
     func approvePairRequest(_ request: PairRequestInfo) {
         do {
             try pairManager?.approve(request.requestId)
+            log("pair", "approved", ["clientName": request.clientName, "requestId": request.requestId])
             refresh()
         } catch {
             serviceError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            log("pair", "approve_failed", ["clientName": request.clientName, "error": serviceError ?? "unknown"])
         }
     }
 
     func rejectPairRequest(_ request: PairRequestInfo) {
         do {
             try pairManager?.reject(request.requestId)
+            log("pair", "rejected", ["clientName": request.clientName, "requestId": request.requestId])
             refresh()
         } catch {
             serviceError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            log("pair", "reject_failed", ["clientName": request.clientName, "error": serviceError ?? "unknown"])
         }
     }
 
     func sendFiles(_ urls: [URL]) {
         guard let outboundService else {
             serviceError = "发送服务还没有启动"
+            log("transfer", "send_blocked", ["reason": "service_not_ready", "itemCount": "\(urls.count)"])
             return
         }
         guard let peer = selectedPeer else {
             serviceError = "当前没有可接收文件的手机"
+            log("transfer", "send_blocked", ["reason": "no_peer", "itemCount": "\(urls.count)"])
             return
         }
 
         let itemId = UUID().uuidString
+        log(
+            "transfer",
+            "send_start",
+            [
+                "peer": peer.deviceName,
+                "itemCount": "\(urls.count)"
+            ]
+        )
         transferItems.insert(
             MacTransferListItem(
                 id: itemId,
@@ -160,12 +191,29 @@ final class MacNativeAppModel: ObservableObject {
                 let failed = reports.first(where: { $0.status != "success" })
                 await MainActor.run {
                     if let failed {
+                        self.log(
+                            "transfer",
+                            "send_failed",
+                            [
+                                "peer": peer.deviceName,
+                                "error": failed.error ?? "unknown",
+                                "itemCount": "\(reports.count)"
+                            ]
+                        )
                         self.updateTransfer(
                             id: itemId,
                             status: "failed",
                             detail: failed.error ?? "发送失败"
                         )
                     } else {
+                        self.log(
+                            "transfer",
+                            "send_success",
+                            [
+                                "peer": peer.deviceName,
+                                "itemCount": "\(reports.count)"
+                            ]
+                        )
                         self.updateTransfer(
                             id: itemId,
                             status: "success",
@@ -177,6 +225,7 @@ final class MacNativeAppModel: ObservableObject {
             } catch {
                 let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 await MainActor.run {
+                    self.log("transfer", "send_failed", ["peer": peer.deviceName, "error": message])
                     self.updateTransfer(id: itemId, status: "failed", detail: message)
                     self.refresh()
                 }
@@ -187,6 +236,7 @@ final class MacNativeAppModel: ObservableObject {
     func requestAccessibilityPermission() {
         _ = MacKeyboardInputService.requestAccessibilityTrust(prompt: true)
         isAccessibilityTrusted = MacKeyboardInputService().isAccessibilityTrusted
+        log("permission", "accessibility_check", ["trusted": "\(isAccessibilityTrusted)"])
     }
 
     func openAccessibilitySettings() {
@@ -194,16 +244,19 @@ final class MacNativeAppModel: ObservableObject {
             return
         }
         NSWorkspace.shared.open(url)
+        log("permission", "open_accessibility_settings")
     }
 
     func setLaunchAtLoginEnabled(_ enabled: Bool) {
         do {
             try MacLaunchAtLoginController.setEnabled(enabled)
+            log("login-item", enabled ? "enable_requested" : "disable_requested")
             refresh()
         } catch {
             launchAtLoginEnabled = MacLaunchAtLoginController.isEnabled
             launchAtLoginStatus = MacLaunchAtLoginController.statusText
             serviceError = "开机启动设置失败：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+            log("login-item", "update_failed", ["enabled": "\(enabled)", "error": serviceError ?? "unknown"])
         }
     }
 
@@ -213,10 +266,42 @@ final class MacNativeAppModel: ObservableObject {
 
     func copyAddress() {
         copy(addressText)
+        log("ui", "copy_address")
     }
 
     func copyPin() {
         copy(pinText)
+        log("ui", "copy_pin")
+    }
+
+    func refreshDiagnostics() {
+        diagnosticEvents = diagnosticLogStore?.recent(limit: 60) ?? []
+    }
+
+    func exportDiagnostics() {
+        do {
+            let url = try diagnosticLogStore?.exportSnapshot(
+                configuration: configuration,
+                serviceStatus: serviceStatus,
+                serviceError: serviceError,
+                isAccessibilityTrusted: isAccessibilityTrusted,
+                launchAtLoginStatus: launchAtLoginStatus,
+                connectedClients: connectedClients,
+                pendingPairRequests: pendingPairRequests,
+                recentHistoryCount: recentHistory.count
+            )
+            guard let url else {
+                serviceError = "诊断日志尚未初始化"
+                return
+            }
+            diagnosticExportPath = url.path
+            log("diagnostics", "exported", ["path": url.lastPathComponent])
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+            refresh()
+        } catch {
+            serviceError = "导出诊断失败：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+            log("diagnostics", "export_failed", ["error": serviceError ?? "unknown"])
+        }
     }
 
     private func updateTransfer(id: String, status: String, detail: String) {
@@ -235,6 +320,28 @@ final class MacNativeAppModel: ObservableObject {
     private func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    private func log(_ scope: String, _ event: String, _ detail: [String: String] = [:]) {
+        diagnosticLogStore?.append(scope: scope, event: event, detail: detail)
+        diagnosticEvents = diagnosticLogStore?.recent(limit: 60) ?? []
+    }
+
+    private func logClientChanges(_ clients: [MacConnectedClientSnapshot]) {
+        let keys = Set(clients.map { "\($0.peer.sessionId):\($0.peer.deviceId):\($0.peer.deviceRole)" })
+        let added = keys.subtracting(lastConnectedClientKeys)
+        let removed = lastConnectedClientKeys.subtracting(keys)
+        guard !added.isEmpty || !removed.isEmpty else { return }
+        log(
+            "clients",
+            "changed",
+            [
+                "connected": "\(clients.count)",
+                "added": "\(added.count)",
+                "removed": "\(removed.count)"
+            ]
+        )
+        lastConnectedClientKeys = keys
     }
 
     private func importLegacyHistoryIfAvailable(
