@@ -411,12 +411,16 @@ private struct HistoryView: View {
     @State private var heatmapSelection: MacHeatmapSelection?
     @State private var previewItem: HistoryItem?
 
+    private var identityContext: MacHistoryIdentityContext {
+        MacHistoryIdentityContext(configuration: model.configuration, connectedClients: model.connectedClients)
+    }
+
     private var senderFilters: [HistoryEndpointFilter] {
-        buildHistoryEndpointFilters(entries: model.recentHistory, endpoint: .sender)
+        buildHistoryEndpointFilters(entries: model.recentHistory, endpoint: .sender, identityContext: identityContext)
     }
 
     private var receiverFilters: [HistoryEndpointFilter] {
-        buildHistoryEndpointFilters(entries: model.recentHistory, endpoint: .receiver)
+        buildHistoryEndpointFilters(entries: model.recentHistory, endpoint: .receiver, identityContext: identityContext)
     }
 
     private var baseFilteredEntries: [HistoryEntry] {
@@ -436,10 +440,10 @@ private struct HistoryView: View {
                 !entry.items.contains(where: { $0.status == statusFilter }) {
                 return false
             }
-            if senderFilter != "all" && !entry.matchesSenderFilter(senderFilter) {
+            if senderFilter != "all" && !entry.matchesSenderFilter(senderFilter, identityContext: identityContext) {
                 return false
             }
-            if receiverFilter != "all" && !entry.matchesReceiverFilter(receiverFilter) {
+            if receiverFilter != "all" && !entry.matchesReceiverFilter(receiverFilter, identityContext: identityContext) {
                 return false
             }
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -989,15 +993,39 @@ private struct HistoryEndpointFilter: Equatable {
     var label: String
 }
 
-private func buildHistoryEndpointFilters(entries: [HistoryEntry], endpoint: HistoryEndpoint) -> [HistoryEndpointFilter] {
+private struct MacHistoryIdentityContext {
+    var configuration: MacServerConfiguration?
+    var connectedClients: [MacConnectedClientSnapshot]
+}
+
+private struct ResolvedMacHistoryEndpoint {
+    var key: String
+    var label: String
+}
+
+private func buildHistoryEndpointFilters(
+    entries: [HistoryEntry],
+    endpoint: HistoryEndpoint,
+    identityContext: MacHistoryIdentityContext
+) -> [HistoryEndpointFilter] {
     var counts: [String: (label: String, count: Int)] = [:]
     for entry in entries {
         let participant = endpoint == .sender ? entry.sender : entry.receiver
         guard let participant else { continue }
         let label = participant.displayName.isEmpty ? participant.deviceId : participant.displayName
-        let key = historyParticipantKey(id: participant.deviceId, fallback: label)
+        let resolved = resolveMacHistoryEndpoint(
+            participant: participant,
+            direction: entry.direction,
+            endpoint: endpoint,
+            identityContext: identityContext
+        )
+        let key = resolved.key
+        guard !key.isEmpty else { continue }
         let current = counts[key]
-        counts[key] = (label: label, count: (current?.count ?? 0) + 1)
+        counts[key] = (
+            label: chooseMacHistoryEndpointLabel(existing: current?.label, candidate: resolved.label.isEmpty ? label : resolved.label),
+            count: (current?.count ?? 0) + 1
+        )
     }
     let allLabel = switch endpoint {
     case .sender: "全部发送端"
@@ -1018,21 +1046,215 @@ private func buildHistoryEndpointFilters(entries: [HistoryEntry], endpoint: Hist
 }
 
 private extension HistoryEntry {
-    func matchesSenderFilter(_ key: String) -> Bool {
-        let senderLabel = sender?.displayName.isEmpty == false ? sender?.displayName : sender?.deviceId
-        return historyParticipantKey(id: sender?.deviceId, fallback: senderLabel ?? "") == key
+    func matchesSenderFilter(_ key: String, identityContext: MacHistoryIdentityContext) -> Bool {
+        guard let sender else { return false }
+        return resolveMacHistoryEndpoint(
+            participant: sender,
+            direction: direction,
+            endpoint: .sender,
+            identityContext: identityContext
+        ).key == key
     }
 
-    func matchesReceiverFilter(_ key: String) -> Bool {
-        let receiverLabel = receiver?.displayName.isEmpty == false ? receiver?.displayName : receiver?.deviceId
-        return historyParticipantKey(id: receiver?.deviceId, fallback: receiverLabel ?? "") == key
+    func matchesReceiverFilter(_ key: String, identityContext: MacHistoryIdentityContext) -> Bool {
+        guard let receiver else { return false }
+        return resolveMacHistoryEndpoint(
+            participant: receiver,
+            direction: direction,
+            endpoint: .receiver,
+            identityContext: identityContext
+        ).key == key
     }
 }
 
-private func historyParticipantKey(id: String?, fallback: String) -> String {
+private func resolveMacHistoryEndpoint(
+    participant: DeviceIdentity,
+    direction: String,
+    endpoint: HistoryEndpoint,
+    identityContext: MacHistoryIdentityContext
+) -> ResolvedMacHistoryEndpoint {
+    let labels = macHistoryLabels(for: participant)
+    if let configuration = identityContext.configuration,
+       labelsMatchMacConfiguration(labels: labels, configuration: configuration) {
+        return ResolvedMacHistoryEndpoint(
+            key: "mac:\(configuration.serverId)",
+            label: configuration.hostname.isEmpty ? configuration.serverId : configuration.hostname
+        )
+    }
+
+    let clients = canonicalMacHistoryClients(identityContext.connectedClients)
+    if let client = clients.first(where: { labelsMatchConnectedClient(labels: labels, client: $0) }) {
+        return ResolvedMacHistoryEndpoint(
+            key: "android:\(client.baseDeviceId)",
+            label: client.displayName
+        )
+    }
+
+    if shouldTreatAsCurrentMacHistoryAndroidSender(
+        labels: labels,
+        direction: direction,
+        endpoint: endpoint,
+        clients: clients
+    ), let onlyClient = clients.first {
+        return ResolvedMacHistoryEndpoint(
+            key: "android:\(onlyClient.baseDeviceId)",
+            label: onlyClient.displayName
+        )
+    }
+
+    let label = participant.displayName.isEmpty ? participant.deviceId : participant.displayName
+    return ResolvedMacHistoryEndpoint(
+        key: macHistoryParticipantFallbackKey(id: participant.deviceId, fallback: label),
+        label: label
+    )
+}
+
+private struct CanonicalMacHistoryClient {
+    var baseDeviceId: String
+    var displayName: String
+    var labels: [String]
+}
+
+private func canonicalMacHistoryClients(_ snapshots: [MacConnectedClientSnapshot]) -> [CanonicalMacHistoryClient] {
+    var result: [CanonicalMacHistoryClient] = []
+    for snapshot in snapshots {
+        let peer = snapshot.peer
+        let base = peer.baseDeviceId.isEmpty ? peer.deviceId : peer.baseDeviceId
+        guard !base.isEmpty else { continue }
+        let cleanName = peer.deviceName.replacingOccurrences(of: " 剪贴板", with: "")
+        if let index = result.firstIndex(where: { normalizeMacHistoryIdentityLabel($0.baseDeviceId) == normalizeMacHistoryIdentityLabel(base) }) {
+            var existing = result[index]
+            existing.labels.append(contentsOf: [peer.deviceId, peer.baseDeviceId, peer.deviceName, cleanName])
+            if !peer.deviceRole.contains("clipboard"), !cleanName.isEmpty {
+                existing.displayName = cleanName
+            }
+            result[index] = existing
+        } else {
+            result.append(
+                CanonicalMacHistoryClient(
+                    baseDeviceId: base,
+                    displayName: cleanName.isEmpty ? base : cleanName,
+                    labels: [peer.deviceId, peer.baseDeviceId, peer.deviceName, cleanName]
+                )
+            )
+        }
+    }
+    return result
+}
+
+private func macHistoryLabels(for participant: DeviceIdentity) -> [String] {
+    [
+        participant.deviceId,
+        participant.baseDeviceId,
+        participant.displayName,
+        participant.host,
+        participant.ip
+    ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+}
+
+private func labelsMatchMacConfiguration(labels: [String], configuration: MacServerConfiguration) -> Bool {
+    let macLabels = [
+        configuration.serverId,
+        configuration.hostname,
+        configuration.ip
+    ]
+    return labels.contains { label in
+        macHistoryLabelsExactlyMatch(label, candidates: macLabels) ||
+            macLabels.contains { macLabel in macHistoryLabelsLookLikeSameMachine(label, macLabel) }
+    }
+}
+
+private func labelsMatchConnectedClient(labels: [String], client: CanonicalMacHistoryClient) -> Bool {
+    labels.contains { label in
+        macHistoryLabelsExactlyMatch(label, candidates: client.labels)
+    }
+}
+
+private func shouldTreatAsCurrentMacHistoryAndroidSender(
+    labels: [String],
+    direction: String,
+    endpoint: HistoryEndpoint,
+    clients: [CanonicalMacHistoryClient]
+) -> Bool {
+    guard endpoint == .sender, direction != "desktop_to_mobile", clients.count == 1 else { return false }
+    return labels.contains(where: isUnknownMacHistorySenderLabel)
+}
+
+private func macHistoryLabelsExactlyMatch(_ label: String, candidates: [String]) -> Bool {
+    let normalized = normalizeMacHistoryIdentityLabel(label)
+    guard !normalized.isEmpty else { return false }
+    return candidates.contains { normalizeMacHistoryIdentityLabel($0) == normalized }
+}
+
+private func macHistoryLabelsLookLikeSameMachine(_ left: String, _ right: String) -> Bool {
+    let leftLooksStable = looksLikeMacHistoryHost(left) || looksLikeMacHistoryDesktopId(left)
+    let rightLooksStable = looksLikeMacHistoryHost(right) || looksLikeMacHistoryDesktopId(right)
+    guard leftLooksStable || rightLooksStable else { return false }
+    let normalizedLeft = normalizeMacMachineHistoryIdentity(left)
+    let normalizedRight = normalizeMacMachineHistoryIdentity(right)
+    guard !normalizedLeft.isEmpty, !normalizedRight.isEmpty else { return false }
+    if normalizedLeft == normalizedRight { return true }
+    let shorter = normalizedLeft.count <= normalizedRight.count ? normalizedLeft : normalizedRight
+    let longer = normalizedLeft.count <= normalizedRight.count ? normalizedRight : normalizedLeft
+    return shorter.count >= 6 && longer.contains(shorter)
+}
+
+private func looksLikeMacHistoryHost(_ value: String) -> Bool {
+    let text = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return text.hasSuffix(".local") ||
+        text.hasSuffix(".lan") ||
+        text.range(of: #"^\d{1,3}(\.\d{1,3}){3}$"#, options: .regularExpression) != nil ||
+        text.contains(":")
+}
+
+private func looksLikeMacHistoryDesktopId(_ value: String) -> Bool {
+    let text = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return text.hasPrefix("desktop") || text.hasPrefix("server:")
+}
+
+private func normalizeMacHistoryIdentityLabel(_ value: String) -> String {
+    value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+}
+
+private func normalizeMacMachineHistoryIdentity(_ value: String) -> String {
+    let cleaned = value
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+        .replacingOccurrences(of: ".local", with: "", options: [.anchored, .backwards])
+    return cleaned.unicodeScalars.reduce(into: "") { result, scalar in
+        let value = scalar.value
+        if (value >= 97 && value <= 122) || (value >= 48 && value <= 57) {
+            result.unicodeScalars.append(scalar)
+        }
+    }
+}
+
+private func macHistoryParticipantFallbackKey(id: String?, fallback: String) -> String {
     (id?.isEmpty == false ? id! : fallback)
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
+}
+
+private func isUnknownMacHistorySenderLabel(_ value: String) -> Bool {
+    switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "未知发送端", "unknown sender", "unknown", "unknown-sender", "legacy-sender:unknown":
+        return true
+    default:
+        return false
+    }
+}
+
+private func chooseMacHistoryEndpointLabel(existing: String?, candidate: String) -> String {
+    let cleanCandidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let existing, !existing.isEmpty else { return cleanCandidate }
+    if cleanCandidate.isEmpty { return existing }
+    if isUnknownMacHistorySenderLabel(existing) { return cleanCandidate }
+    if looksLikeMacHistoryHost(existing), !looksLikeMacHistoryHost(cleanCandidate) {
+        return cleanCandidate
+    }
+    return existing
 }
 
 private func matchesHistoryDateFilter(
