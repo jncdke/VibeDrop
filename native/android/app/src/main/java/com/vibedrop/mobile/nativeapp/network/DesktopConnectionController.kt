@@ -193,18 +193,24 @@ class DesktopConnectionController(
         transferId: String,
         fileName: String,
         mimeType: String,
-        sizeBytes: Long
+        sizeBytes: Long,
+        saveTarget: String? = null,
+        historySessionId: String? = null,
+        historyItemIndex: Int? = null,
+        historyItemCount: Int? = null
     ): Boolean {
         if (!connection.canSend) return false
-        val accepted = socket?.send(
-            JSONObject()
-                .put("action", VibeDropActions.IncomingFileStart)
-                .put("transfer_id", transferId)
-                .put("file_name", fileName)
-                .put("mime_type", mimeType)
-                .put("size_bytes", sizeBytes)
-                .toString()
-        ) == true
+        val payload = JSONObject()
+            .put("action", VibeDropActions.IncomingFileStart)
+            .put("transfer_id", transferId)
+            .put("file_name", fileName)
+            .put("mime_type", mimeType)
+            .put("size_bytes", sizeBytes)
+        saveTarget?.takeIf { it.isNotBlank() }?.let { payload.put("save_target", it) }
+        historySessionId?.takeIf { it.isNotBlank() }?.let { payload.put("history_session_id", it) }
+        historyItemIndex?.let { payload.put("history_item_index", it) }
+        historyItemCount?.let { payload.put("history_item_count", it) }
+        val accepted = socket?.send(payload.toString()) == true
         log("send_file_start", endpointDetail().put("transferId", transferId).put("fileName", fileName).put("sizeBytes", sizeBytes).put("accepted", accepted))
         return accepted
     }

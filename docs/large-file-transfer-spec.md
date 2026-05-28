@@ -131,6 +131,10 @@
 - `mime_type`
 - `size_bytes`
 - `is_archive`
+- `save_target`：可选，发送到桌面收件箱时为 `desktop_inbox`
+- `history_session_id`：可选，多文件批次共享同一个历史 session id
+- `history_item_index`：可选，多文件批次中的 0-based item 位置
+- `history_item_count`：可选，多文件批次总数
 
 接收方如果能建立临时接收状态，立即返回标准 `status: ok`。
 如果失败，立即返回标准 `status: error`。

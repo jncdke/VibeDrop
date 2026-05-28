@@ -22,6 +22,10 @@ public struct VibeDropMessage: Codable, Equatable, Sendable {
     public var sessionId: String?
     public var itemCount: Int?
     public var saveTarget: String?
+    public var isArchive: Bool?
+    public var historySessionId: String?
+    public var historyItemIndex: Int?
+    public var historyItemCount: Int?
 
     public init(
         action: VibeDropAction,
@@ -44,7 +48,11 @@ public struct VibeDropMessage: Codable, Equatable, Sendable {
         error: String? = nil,
         sessionId: String? = nil,
         itemCount: Int? = nil,
-        saveTarget: String? = nil
+        saveTarget: String? = nil,
+        isArchive: Bool? = nil,
+        historySessionId: String? = nil,
+        historyItemIndex: Int? = nil,
+        historyItemCount: Int? = nil
     ) {
         self.action = action
         self.pin = pin
@@ -67,6 +75,10 @@ public struct VibeDropMessage: Codable, Equatable, Sendable {
         self.sessionId = sessionId
         self.itemCount = itemCount
         self.saveTarget = saveTarget
+        self.isArchive = isArchive
+        self.historySessionId = historySessionId
+        self.historyItemIndex = historyItemIndex
+        self.historyItemCount = historyItemCount
     }
 
     enum CodingKeys: String, CodingKey {
@@ -91,5 +103,9 @@ public struct VibeDropMessage: Codable, Equatable, Sendable {
         case sessionId = "session_id"
         case itemCount = "item_count"
         case saveTarget = "save_target"
+        case isArchive = "is_archive"
+        case historySessionId = "history_session_id"
+        case historyItemIndex = "history_item_index"
+        case historyItemCount = "history_item_count"
     }
 }

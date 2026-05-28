@@ -12,6 +12,8 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
     private let outboundTransfers: MacOutboundTransferRegistry?
     private let idGenerator: @Sendable () -> String
     private let now: @Sendable () -> Date
+    private let incomingFileMetadataLock = NSLock()
+    private var incomingFileMetadataByTransferId: [String: IncomingFileHistoryMetadata] = [:]
 
     public init(
         configuration: MacServerConfiguration,
@@ -204,6 +206,7 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
                 mimeType: message.mimeType,
                 sizeBytes: message.sizeBytes
             )
+            storeIncomingFileMetadata(message)
             return [.status(MacServerStatusEnvelope(status: "ok"))]
         } catch {
             return incomingFileError(transferId: message.transferId, error: error)
@@ -222,6 +225,7 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
             return []
         } catch {
             contentStore.cancelIncomingFile(transferId: message.transferId)
+            removeIncomingFileMetadata(transferId: message.transferId)
             return incomingFileError(transferId: message.transferId, error: error)
         }
     }
@@ -233,20 +237,30 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
         guard let contentStore else {
             return [.status(.runtimeError(MacReceivedContentError.fileOperationFailed("接收目录不可用")))]
         }
+        let historyMetadata = takeIncomingFileMetadata(transferId: message.transferId)
         do {
             let savedFile = try contentStore.finishIncomingFile(transferId: message.transferId)
-            recordMediaHistory(
-                kind: kindFromMime(savedFile.mimeType),
-                label: labelFromMime(savedFile.mimeType),
-                fileName: savedFile.fileName,
-                mimeType: savedFile.mimeType,
-                sizeBytes: savedFile.sizeBytes,
-                path: savedFile.filePath,
-                thumbnailDataURL: nil,
-                peer: peer,
-                status: "success",
-                saveTarget: "desktop_inbox"
-            )
+            if historyMetadata?.sessionId != nil || normalizedHistorySessionId(message) != nil {
+                recordIncomingSessionFile(
+                    savedFile: savedFile,
+                    message: message,
+                    metadata: historyMetadata,
+                    peer: peer
+                )
+            } else {
+                recordMediaHistory(
+                    kind: kindFromMime(savedFile.mimeType),
+                    label: labelFromMime(savedFile.mimeType),
+                    fileName: savedFile.fileName,
+                    mimeType: savedFile.mimeType,
+                    sizeBytes: savedFile.sizeBytes,
+                    path: savedFile.filePath,
+                    thumbnailDataURL: nil,
+                    peer: peer,
+                    status: "success",
+                    saveTarget: "desktop_inbox"
+                )
+            }
             return [
                 .json(
                     [
@@ -367,6 +381,73 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
         try? historyDatabase.insert(entry)
     }
 
+    private func recordIncomingSessionFile(
+        savedFile: MacSavedFile,
+        message: VibeDropMessage,
+        metadata: IncomingFileHistoryMetadata?,
+        peer: ConnectedPeer
+    ) {
+        guard let historyDatabase,
+              let sessionId = metadata?.sessionId ?? normalizedHistorySessionId(message) else { return }
+        let entryId = "native-mac-inbound:\(sessionId)"
+        let existing = try? historyDatabase.fetchEntry(id: entryId)
+        let itemIndex = max(0, metadata?.itemIndex ?? message.historyItemIndex ?? 0)
+        let itemCount = max(metadata?.itemCount ?? message.historyItemCount ?? 1, itemIndex + 1, existing?.itemCount ?? 0)
+        var items = existing?.items ?? []
+        while items.count < itemCount {
+            let index = items.count
+            items.append(
+                HistoryItem(
+                    id: "\(entryId):item:\(index)",
+                    kind: "file",
+                    status: "pending"
+                )
+            )
+        }
+
+        let kind = kindFromMime(savedFile.mimeType)
+        items[itemIndex] = HistoryItem(
+            id: "\(entryId):item:\(itemIndex)",
+            kind: kind,
+            fileName: savedFile.fileName,
+            mimeType: savedFile.mimeType,
+            sizeBytes: savedFile.sizeBytes,
+            localPath: savedFile.filePath,
+            savedPath: savedFile.filePath,
+            thumbnailDataUrl: nil,
+            status: "success",
+            error: nil
+        )
+
+        let summary = historyItemsSummary(items)
+        let entry = HistoryEntry(
+            id: entryId,
+            timestamp: existing?.timestamp ?? now(),
+            direction: "mobile_to_desktop",
+            kind: summary.kind,
+            status: computeSessionStatus(items),
+            text: summary.text,
+            sender: DeviceIdentity(
+                deviceId: peer.deviceId,
+                baseDeviceId: peer.baseDeviceId,
+                displayName: peer.deviceName,
+                role: peer.deviceRole
+            ),
+            receiver: DeviceIdentity(
+                deviceId: configuration.serverId,
+                displayName: configuration.hostname,
+                role: "desktop",
+                ip: configuration.ip,
+                port: configuration.port
+            ),
+            sessionId: sessionId,
+            itemCount: itemCount,
+            saveTarget: metadata?.saveTarget ?? message.saveTarget ?? "desktop_inbox",
+            items: items
+        )
+        try? historyDatabase.insert(entry)
+    }
+
     private func recordMediaFailure(
         kind: String,
         text: String?,
@@ -400,6 +481,75 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
         try? historyDatabase.insert(entry, rawJSON: String(describing: error))
     }
 
+    private func normalizedHistorySessionId(_ message: VibeDropMessage) -> String? {
+        message.historySessionId?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+    }
+
+    private func storeIncomingFileMetadata(_ message: VibeDropMessage) {
+        guard let transferId = message.transferId?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty else {
+            return
+        }
+        guard let sessionId = normalizedHistorySessionId(message) else {
+            removeIncomingFileMetadata(transferId: transferId)
+            return
+        }
+        incomingFileMetadataLock.lock()
+        incomingFileMetadataByTransferId[transferId] = IncomingFileHistoryMetadata(
+            sessionId: sessionId,
+            itemIndex: message.historyItemIndex,
+            itemCount: message.historyItemCount,
+            saveTarget: message.saveTarget
+        )
+        incomingFileMetadataLock.unlock()
+    }
+
+    private func takeIncomingFileMetadata(transferId: String?) -> IncomingFileHistoryMetadata? {
+        guard let transferId = transferId?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty else {
+            return nil
+        }
+        incomingFileMetadataLock.lock()
+        let metadata = incomingFileMetadataByTransferId.removeValue(forKey: transferId)
+        incomingFileMetadataLock.unlock()
+        return metadata
+    }
+
+    private func removeIncomingFileMetadata(transferId: String?) {
+        _ = takeIncomingFileMetadata(transferId: transferId)
+    }
+
+    private func computeSessionStatus(_ items: [HistoryItem]) -> String {
+        if items.isEmpty { return "pending" }
+        if items.contains(where: { ($0.status ?? "").isEmpty || $0.status == "pending" }) {
+            return "pending"
+        }
+        let successCount = items.filter { $0.status == "success" }.count
+        let failedCount = items.filter { $0.status == "failed" }.count
+        if failedCount == 0 { return "success" }
+        if successCount == 0 { return "failed" }
+        return "partial"
+    }
+
+    private func historyItemsSummary(_ items: [HistoryItem]) -> (kind: String, text: String) {
+        if items.count == 1 {
+            let item = items[0]
+            let kind = item.kind
+            return (kind, "[\(labelFromKind(kind))] \(item.fileName ?? "文件")")
+        }
+        let imageCount = items.filter { $0.kind == "image" }.count
+        let videoCount = items.filter { $0.kind == "video" }.count
+        if imageCount == items.count {
+            return ("image", "[图片] \(items.count) 张")
+        }
+        if videoCount == items.count {
+            return ("video", "[视频] \(items.count) 个")
+        }
+        if imageCount + videoCount == items.count {
+            return ("media", "[媒体] \(items.count) 项")
+        }
+        return ("file", "[文件] \(items.count) 项")
+    }
+
     private func kindFromMime(_ mimeType: String) -> String {
         if mimeType.hasPrefix("image/") { return "image" }
         if mimeType.hasPrefix("video/") { return "video" }
@@ -411,6 +561,19 @@ public final class MacRuntimeEffectHandler: @unchecked Sendable {
         if mimeType.hasPrefix("video/") { return "视频" }
         return "文件"
     }
+
+    private func labelFromKind(_ kind: String) -> String {
+        switch kind {
+        case "image":
+            return "图片"
+        case "video":
+            return "视频"
+        case "media":
+            return "媒体"
+        default:
+            return "文件"
+        }
+    }
 }
 
 private extension MacServerStatusEnvelope {
@@ -419,5 +582,18 @@ private extension MacServerStatusEnvelope {
             status: "error",
             error: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         )
+    }
+}
+
+private struct IncomingFileHistoryMetadata: Sendable {
+    var sessionId: String
+    var itemIndex: Int?
+    var itemCount: Int?
+    var saveTarget: String?
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }

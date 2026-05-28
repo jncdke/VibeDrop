@@ -108,6 +108,7 @@ import java.util.Calendar
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 @Composable
 fun VibeDropApp(container: AppContainer) {
@@ -564,11 +565,19 @@ private fun SendScreen(
         val device = devices.firstOrNull { it.id == deviceId } ?: return@rememberLauncherForActivityResult
         scope.launch {
             fileActionLabels[deviceId] = "准备中..."
+            val batchSessionId = if (uris.size > 1) "native-batch-${UUID.randomUUID()}" else null
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     uris.mapIndexed { index, uri ->
                         runCatching {
-                            sendUriToDesktopInbox(context, uri, controller) { progress ->
+                            sendUriToDesktopInbox(
+                                context = context,
+                                uri = uri,
+                                controller = controller,
+                                historySessionId = batchSessionId,
+                                historyItemIndex = batchSessionId?.let { index },
+                                historyItemCount = batchSessionId?.let { uris.size }
+                            ) { progress ->
                                 val label = transferProgressLabel(progress, index, uris.size)
                                 scope.launch(Dispatchers.Main) {
                                     fileActionLabels[deviceId] = label
@@ -731,11 +740,19 @@ private fun SharedPayloadCard(
                         val controller = controllers[device.id] ?: return@Button
                         scope.launch {
                             transferLabel = "准备中..."
+                            val batchSessionId = if (payload.uris.size > 1) "native-batch-${UUID.randomUUID()}" else null
                             val result = runCatching {
                                 withContext(Dispatchers.IO) {
                                     payload.uris.mapIndexed { index, uri ->
                                         runCatching {
-                                            sendUriToDesktopInbox(context, uri, controller) { progress ->
+                                            sendUriToDesktopInbox(
+                                                context = context,
+                                                uri = uri,
+                                                controller = controller,
+                                                historySessionId = batchSessionId,
+                                                historyItemIndex = batchSessionId?.let { index },
+                                                historyItemCount = batchSessionId?.let { payload.uris.size }
+                                            ) { progress ->
                                                 val label = transferProgressLabel(progress, index, payload.uris.size)
                                                 scope.launch(Dispatchers.Main) {
                                                     transferLabel = label

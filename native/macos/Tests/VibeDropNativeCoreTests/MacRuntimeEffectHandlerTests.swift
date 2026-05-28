@@ -192,6 +192,92 @@ final class MacRuntimeEffectHandlerTests: XCTestCase {
         XCTAssertEqual(recent.first?.items.first?.sizeBytes, Int64(bytes.count))
     }
 
+    func testIncomingBatchFilesAreAggregatedIntoOneHistoryEntry() throws {
+        let fixture = try RuntimeFixture()
+        defer { fixture.cleanup() }
+        let runtime = MacRuntimeEffectHandler(
+            configuration: fixture.configuration,
+            historyDatabase: fixture.database,
+            inputController: RecordingInputController(),
+            imageClipboard: RecordingImageClipboard(),
+            contentStore: fixture.contentStore,
+            idGenerator: { "unused-file-id" },
+            now: { Date(timeIntervalSince1970: 1_774_800_000) }
+        )
+
+        let firstBytes = Data("first batch item".utf8)
+        let secondBytes = Data("second batch item".utf8)
+        let files: [(transferId: String, fileName: String, bytes: Data)] = [
+            ("transfer-a", "a.txt", firstBytes),
+            ("transfer-b", "b.txt", secondBytes)
+        ]
+
+        for (index, file) in files.enumerated() {
+            XCTAssertEqual(
+                runtime.handle(
+                    .incomingFileStart(
+                        VibeDropMessage(
+                            action: .incomingFileStart,
+                            fileName: file.fileName,
+                            mimeType: "text/plain",
+                            transferId: file.transferId,
+                            sizeBytes: Int64(file.bytes.count),
+                            saveTarget: "desktop_inbox",
+                            historySessionId: "android-batch-1",
+                            historyItemIndex: index,
+                            historyItemCount: files.count
+                        ),
+                        peer: fixture.peer
+                    )
+                ),
+                [.status(MacServerStatusEnvelope(status: "ok"))]
+            )
+            XCTAssertEqual(
+                runtime.handle(
+                    .incomingFileChunk(
+                        VibeDropMessage(
+                            action: .incomingFileChunk,
+                            transferId: file.transferId,
+                            chunkBase64: file.bytes.base64EncodedString()
+                        ),
+                        peer: fixture.peer
+                    )
+                ),
+                []
+            )
+            let complete = runtime.handle(
+                .incomingFileComplete(
+                    VibeDropMessage(
+                        action: .incomingFileComplete,
+                        transferId: file.transferId
+                    ),
+                    peer: fixture.peer
+                )
+            )
+            guard case let .rawJSON(payload) = complete.first else {
+                return XCTFail("missing saved ack")
+            }
+            XCTAssertEqual(payload["action"], "incoming_file_saved")
+            XCTAssertEqual(payload["transfer_id"], file.transferId)
+        }
+
+        let recent = try fixture.database.fetchRecent(limit: 10)
+        XCTAssertEqual(recent.count, 1)
+        let entry = try XCTUnwrap(recent.first)
+        XCTAssertEqual(entry.id, "native-mac-inbound:android-batch-1")
+        XCTAssertEqual(entry.direction, "mobile_to_desktop")
+        XCTAssertEqual(entry.kind, "file")
+        XCTAssertEqual(entry.status, "success")
+        XCTAssertEqual(entry.text, "[文件] 2 项")
+        XCTAssertEqual(entry.sessionId, "android-batch-1")
+        XCTAssertEqual(entry.itemCount, 2)
+        XCTAssertEqual(entry.saveTarget, "desktop_inbox")
+        XCTAssertEqual(entry.items.map(\.fileName), ["a.txt", "b.txt"])
+        XCTAssertEqual(entry.items.map(\.status), ["success", "success"])
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: entry.items[0].savedPath ?? "")), firstBytes)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: entry.items[1].savedPath ?? "")), secondBytes)
+    }
+
     func testOutboundFileTransferSendsChunksWaitsForAckAndRecordsHistory() throws {
         let fixture = try RuntimeFixture()
         defer { fixture.cleanup() }

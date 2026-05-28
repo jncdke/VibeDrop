@@ -54,6 +54,19 @@ public final class MacHistoryDatabase: @unchecked Sendable {
         }
     }
 
+    public func fetchEntry(id: String) throws -> HistoryEntry? {
+        try queue.read { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: "SELECT * FROM history_entries WHERE id = ?",
+                arguments: [id]
+            ) else {
+                return nil
+            }
+            return try mapHistoryEntries(rows: [row], db: db).first
+        }
+    }
+
     public func fetchAll() throws -> [HistoryEntry] {
         try queue.read { db in
             let rows = try Row.fetchAll(

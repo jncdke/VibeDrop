@@ -73,6 +73,9 @@ suspend fun sendUriToDesktopInbox(
     context: Context,
     uri: Uri,
     controller: DesktopConnectionController,
+    historySessionId: String? = null,
+    historyItemIndex: Int? = null,
+    historyItemCount: Int? = null,
     onProgress: (ContentTransferProgress) -> Unit = {}
 ): ContentTransferResult {
     val meta = queryContentTransferMeta(context, uri)
@@ -82,7 +85,17 @@ suspend fun sendUriToDesktopInbox(
 
     val transferId = "native-${UUID.randomUUID()}"
     controller.trackIncomingFileAck(transferId)
-    if (!controller.sendIncomingFileStart(transferId, meta.fileName, meta.mimeType, meta.sizeBytes)) {
+    if (!controller.sendIncomingFileStart(
+            transferId = transferId,
+            fileName = meta.fileName,
+            mimeType = meta.mimeType,
+            sizeBytes = meta.sizeBytes,
+            saveTarget = "desktop_inbox",
+            historySessionId = historySessionId,
+            historyItemIndex = historyItemIndex,
+            historyItemCount = historyItemCount
+        )
+    ) {
         controller.cancelIncomingFileAck(transferId)
         throw IllegalStateException("连接不可用")
     }

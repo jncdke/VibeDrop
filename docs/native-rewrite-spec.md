@@ -65,7 +65,7 @@
 4. 配对：手机提交配对请求，macOS UI 显示 6 位码，用户批准后手机拿到 PIN、server id、hostname、ip、port。
 5. 手机到 Mac 文本：WebSocket action `type`、`type_enter`、`enter`，成功后写入历史。
 6. 手机到 Mac 图片剪贴板：action `image_clipboard`，保存图片、生成 thumbnail、写入 Mac 剪贴板并记录历史。
-7. 手机到 Mac 文件收件箱：既保留 legacy `file_download`，也支持 `incoming_file_start/chunk/complete` 分片接收，保存到 `~/Downloads/VibeDrop 收件箱`。
+7. 手机到 Mac 文件收件箱：既保留 legacy `file_download`，也支持 `incoming_file_start/chunk/complete` 分片接收，保存到 `~/Downloads/VibeDrop 收件箱`；多文件批次通过 `history_session_id/history_item_index/history_item_count` 聚合成一条历史。
 8. Mac 到 Android 文件：拖拽/Finder 分享/Photos 选择后，按文件、目录或多选打包，使用 `incoming_file_start/chunk/complete` 发送，等待 Android `incoming_file_saved/error` ack。
 9. 历史：写入 `~/.vibedrop/history.jsonl`，兼容旧 `~/.voicedrop/history.jsonl`；记录方向、类型、状态、客户端名、缩略图、文件名、session、items。
 10. UI：概览、连接设备、配对、历史搜索筛选、热力图、媒体预览、拖拽传输进度、状态栏菜单。
