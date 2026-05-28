@@ -531,22 +531,31 @@ private fun SendScreen(
                 }
         }
     }
-    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         val deviceId = pendingFileDeviceId
         pendingFileDeviceId = null
-        if (uri == null || deviceId == null) return@rememberLauncherForActivityResult
+        if (uris.isEmpty() || deviceId == null) return@rememberLauncherForActivityResult
         val controller = controllers[deviceId] ?: return@rememberLauncherForActivityResult
         val device = devices.firstOrNull { it.id == deviceId } ?: return@rememberLauncherForActivityResult
         scope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    sendUriToDesktopInbox(context, uri, controller)
+                    uris.map { uri ->
+                        sendUriToDesktopInbox(context, uri, controller)
+                    }
                 }
             }
             result
-                .onSuccess {
-                    onRecordSentContent(device, it, "inbox")
-                    Toast.makeText(context, "已发送到 Mac 收件箱：${it.fileName}", Toast.LENGTH_SHORT).show()
+                .onSuccess { sentItems ->
+                    sentItems.forEach { item ->
+                        onRecordSentContent(device, item, "inbox")
+                    }
+                    val message = if (sentItems.size == 1) {
+                        "已发送到 Mac 收件箱：${sentItems.first().fileName}"
+                    } else {
+                        "已发送 ${sentItems.size} 个文件到 Mac 收件箱"
+                    }
+                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
                 }
                 .onFailure {
                     Toast.makeText(context, "文件发送失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
