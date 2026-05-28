@@ -6,6 +6,7 @@ import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import com.vibedrop.mobile.nativeapp.data.local.HistoryItemEntity
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileResult
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -18,6 +19,21 @@ class HistoryRepository(
 ) {
     fun observeRecent(limit: Int = 120): Flow<List<HistoryEntryEntity>> {
         return historyDao.observeRecent(limit)
+    }
+
+    fun observeRecentWithItems(limit: Int = 120): Flow<List<HistoryEntryWithItems>> {
+        return combine(
+            historyDao.observeRecent(limit),
+            historyDao.observeAllItems()
+        ) { entries, items ->
+            val itemsByEntryId = items.groupBy { it.entryId }
+            entries.map { entry ->
+                HistoryEntryWithItems(
+                    entry = entry,
+                    items = itemsByEntryId[entry.id].orEmpty()
+                )
+            }
+        }
     }
 
     suspend fun loadAllEntries(): List<HistoryEntryEntity> = historyDao.getAllEntries()

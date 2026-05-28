@@ -23,6 +23,9 @@ interface HistoryDao {
     suspend fun getItemsForEntry(entryId: String): List<HistoryItemEntity>
 
     @Query("SELECT * FROM history_items ORDER BY entryId ASC, itemIndex ASC")
+    fun observeAllItems(): Flow<List<HistoryItemEntity>>
+
+    @Query("SELECT * FROM history_items ORDER BY entryId ASC, itemIndex ASC")
     suspend fun getAllItems(): List<HistoryItemEntity>
 
     @Query("SELECT COUNT(*) FROM history_entries")

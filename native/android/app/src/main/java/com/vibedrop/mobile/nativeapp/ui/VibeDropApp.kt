@@ -1,8 +1,11 @@
 package com.vibedrop.mobile.nativeapp.ui
 
+import android.graphics.BitmapFactory
+import android.util.Base64
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -49,6 +52,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -62,6 +68,8 @@ import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
 import com.vibedrop.mobile.nativeapp.core.model.DiscoveredDesktop
 import com.vibedrop.mobile.nativeapp.data.AppContainer
 import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
+import com.vibedrop.mobile.nativeapp.data.local.HistoryItemEntity
+import com.vibedrop.mobile.nativeapp.data.repository.HistoryEntryWithItems
 import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import com.vibedrop.mobile.nativeapp.platform.readClipboardText
 import com.vibedrop.mobile.nativeapp.platform.sendImageUriToMacClipboard
@@ -93,7 +101,7 @@ fun VibeDropApp(container: AppContainer) {
     var homeVaultBusy by remember { mutableStateOf(false) }
     var pendingExportJson by remember { mutableStateOf<String?>(null) }
     val devices by container.deviceRepository.observeDevices().collectAsState(initial = emptyList())
-    val history by container.historyRepository.observeRecent(limit = 1000).collectAsState(initial = emptyList())
+    val history by container.historyRepository.observeRecentWithItems(limit = 1000).collectAsState(initial = emptyList())
     val hostActivity = context as? MainActivity
     val sharedPayloadState = hostActivity?.sharedPayload?.collectAsState(initial = null)
     val sharedPayload = sharedPayloadState?.value
@@ -764,7 +772,7 @@ private fun SendDeviceCard(
 
 @Composable
 private fun HistoryScreen(
-    entries: List<HistoryEntryEntity>,
+    entries: List<HistoryEntryWithItems>,
     modifier: Modifier = Modifier
 ) {
     var query by rememberSaveable { mutableStateOf("") }
@@ -776,8 +784,12 @@ private fun HistoryScreen(
         entries
             .asSequence()
             .filter { it.matchesQuery(query) }
-            .filter { selectedType == "all" || it.kind == selectedType }
-            .filter { it.matchesTimeFilter(selectedTime, now) }
+            .filter { record ->
+                selectedType == "all" ||
+                    record.entry.kind == selectedType ||
+                    record.items.any { it.kind == selectedType }
+            }
+            .filter { it.entry.matchesTimeFilter(selectedTime, now) }
             .toList()
     }
     val visibleDays = remember(baseFiltered, now) { buildVisibleDays(baseFiltered, now) }
@@ -787,9 +799,9 @@ private fun HistoryScreen(
     val visibleMax = heatmapCounts.values.maxOrNull() ?: 0
     val filteredEntries = remember(baseFiltered, selectedHour) {
         selectedHour?.let { selection ->
-            baseFiltered.filter { entry ->
-                startOfDay(entry.timestampMillis) == selection.dayStartMillis &&
-                    hourOfDay(entry.timestampMillis) == selection.hour
+            baseFiltered.filter { record ->
+                startOfDay(record.entry.timestampMillis) == selection.dayStartMillis &&
+                    hourOfDay(record.entry.timestampMillis) == selection.hour
             }
         } ?: baseFiltered
     }
@@ -953,8 +965,8 @@ private fun HistoryScreen(
                 }
             }
         }
-        items(filteredEntries, key = { it.id }) { entry ->
-            HistoryCard(entry)
+        items(filteredEntries, key = { it.entry.id }) { record ->
+            HistoryCard(record)
         }
     }
 }
@@ -1076,7 +1088,9 @@ private fun HistoryHeatmap(
 }
 
 @Composable
-private fun HistoryCard(entry: HistoryEntryEntity) {
+private fun HistoryCard(record: HistoryEntryWithItems) {
+    val entry = record.entry
+    val items = remember(record.items) { record.items.sortedBy { it.itemIndex } }
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -1097,13 +1111,110 @@ private fun HistoryCard(entry: HistoryEntryEntity) {
                 fontWeight = FontWeight.Bold
             )
             Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (items.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items.take(12).forEach { item ->
+                        HistoryItemPreview(item)
+                    }
+                    if (items.size > 12) {
+                        HistoryMoreItemsChip(items.size - 12)
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+            }
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 HistoryChip(kindLabel(entry.kind))
                 HistoryChip(entry.status)
+                entry.itemCount?.takeIf { it > 1 }?.let { HistoryChip("${it} 项") }
                 entry.senderName?.takeIf { it.isNotBlank() }?.let { HistoryChip(it) }
                 entry.receiverName?.takeIf { it.isNotBlank() }?.let { HistoryChip(it) }
             }
         }
+    }
+}
+
+@Composable
+private fun HistoryItemPreview(item: HistoryItemEntity) {
+    val bitmap = remember(item.thumbnailDataUrl) { decodeThumbnailDataUrl(item.thumbnailDataUrl) }
+    Column(
+        modifier = Modifier
+            .width(92.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color(0xFFF4F7FB))
+            .border(
+                width = 1.dp,
+                color = statusBorderColor(item.status),
+                shape = RoundedCornerShape(14.dp)
+            )
+            .padding(7.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(54.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(itemKindColor(item.kind)),
+            contentAlignment = Alignment.Center
+        ) {
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
+            } else {
+                Text(
+                    text = itemKindShortLabel(item),
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        Text(
+            text = item.fileName.orEmpty().ifBlank { kindLabel(item.kind) },
+            color = Color(0xFF111827),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = itemStatusLabel(item.status),
+            color = if (item.status == "failed") Color(0xFFE5484D) else Color(0xFF667085),
+            fontSize = 10.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun HistoryMoreItemsChip(extraCount: Int) {
+    Box(
+        modifier = Modifier
+            .width(72.dp)
+            .height(104.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color(0xFFEFF4FA)),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "+$extraCount",
+            color = Color(0xFF526174),
+            fontSize = 15.sp,
+            fontWeight = FontWeight.ExtraBold
+        )
     }
 }
 
@@ -1487,6 +1598,7 @@ private data class HeatmapSelection(
 private val historyTypeFilters = listOf(
     HistoryTypeFilter("all", "全部类型"),
     HistoryTypeFilter("text", "文本"),
+    HistoryTypeFilter("media", "媒体"),
     HistoryTypeFilter("image", "图片"),
     HistoryTypeFilter("video", "视频"),
     HistoryTypeFilter("file", "文件")
@@ -1494,17 +1606,30 @@ private val historyTypeFilters = listOf(
 
 private const val DAY_MILLIS = 24L * 60L * 60L * 1000L
 
-private fun HistoryEntryEntity.matchesQuery(query: String): Boolean {
+private fun HistoryEntryWithItems.matchesQuery(query: String): Boolean {
     val trimmed = query.trim()
     if (trimmed.isBlank()) return true
+    val rootEntry = this.entry
+    val itemText = items.joinToString(" ") { item ->
+        listOfNotNull(
+            item.fileName,
+            item.mimeType,
+            item.status,
+            item.localPath,
+            item.savedPath,
+            item.thumbnailPath,
+            kindLabel(item.kind)
+        ).joinToString(" ")
+    }
     val haystack = listOfNotNull(
-        text,
-        senderName,
-        receiverName,
-        kindLabel(kind),
-        status,
-        saveTarget,
-        direction
+        rootEntry.text,
+        rootEntry.senderName,
+        rootEntry.receiverName,
+        kindLabel(rootEntry.kind),
+        rootEntry.status,
+        rootEntry.saveTarget,
+        rootEntry.direction,
+        itemText
     ).joinToString(" ")
     return haystack.contains(trimmed, ignoreCase = true)
 }
@@ -1523,21 +1648,21 @@ private fun HistoryEntryEntity.matchesTimeFilter(
 }
 
 private fun buildVisibleDays(
-    entries: List<HistoryEntryEntity>,
+    entries: List<HistoryEntryWithItems>,
     now: Long
 ): List<Long> {
-    val anchor = entries.maxOfOrNull { it.timestampMillis } ?: now
+    val anchor = entries.maxOfOrNull { it.entry.timestampMillis } ?: now
     val end = startOfDay(anchor)
     return (4 downTo 0).map { end - it * DAY_MILLIS }
 }
 
 private fun buildHeatmapCounts(
-    entries: List<HistoryEntryEntity>,
+    entries: List<HistoryEntryWithItems>,
     days: List<Long>
 ): Map<Pair<Long, Int>, Int> {
     val visibleDays = days.toSet()
     return entries
-        .map { startOfDay(it.timestampMillis) to hourOfDay(it.timestampMillis) }
+        .map { startOfDay(it.entry.timestampMillis) to hourOfDay(it.entry.timestampMillis) }
         .filter { it.first in visibleDays }
         .groupingBy { it }
         .eachCount()
@@ -1589,4 +1714,51 @@ private fun weekdayLabel(timestampMillis: Long): String {
 
 private fun historyTypeLabel(kind: String): String {
     return historyTypeFilters.firstOrNull { it.kind == kind }?.label ?: kindLabel(kind)
+}
+
+private fun decodeThumbnailDataUrl(value: String?): ImageBitmap? {
+    val raw = value?.trim().orEmpty()
+    if (raw.isBlank()) return null
+    val base64 = raw.substringAfter("base64,", raw)
+    return runCatching {
+        val bytes = Base64.decode(base64, Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+    }.getOrNull()
+}
+
+private fun itemKindShortLabel(item: HistoryItemEntity): String {
+    val extension = item.fileName
+        ?.substringAfterLast('.', missingDelimiterValue = "")
+        ?.takeIf { it.isNotBlank() && it.length <= 5 }
+        ?.uppercase(Locale.US)
+    return extension ?: when (item.kind) {
+        "image" -> "IMG"
+        "video" -> "VID"
+        "media" -> "MEDIA"
+        "file" -> "FILE"
+        else -> kindLabel(item.kind)
+    }
+}
+
+private fun itemKindColor(kind: String): Color = when (kind) {
+    "image" -> Color(0xFF168DF7)
+    "video" -> Color(0xFF8B5CF6)
+    "media" -> Color(0xFF0F766E)
+    "file" -> Color(0xFF475467)
+    else -> Color(0xFF667085)
+}
+
+private fun statusBorderColor(status: String?): Color = when (status) {
+    "success" -> Color(0xFFD7F4DF)
+    "failed" -> Color(0xFFFFC9C9)
+    "partial" -> Color(0xFFFFE2A8)
+    else -> Color(0xFFE4EAF2)
+}
+
+private fun itemStatusLabel(status: String?): String = when (status) {
+    "success" -> "已保存"
+    "failed" -> "失败"
+    "partial" -> "部分完成"
+    "pending" -> "接收中"
+    else -> status.orEmpty().ifBlank { "未知状态" }
 }
