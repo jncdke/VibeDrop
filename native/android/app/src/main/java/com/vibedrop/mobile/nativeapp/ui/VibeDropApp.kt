@@ -1,7 +1,9 @@
 package com.vibedrop.mobile.nativeapp.ui
 
 import android.Manifest
+import android.content.Context
 import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Build
 import android.util.Base64
 import android.widget.Toast
@@ -579,12 +581,14 @@ private fun SendScreen(
     val fileActionLabels = remember { mutableStateMapOf<String, String>() }
     var pendingImageDeviceId by remember { mutableStateOf<String?>(null) }
     var pendingFileDeviceId by remember { mutableStateOf<String?>(null) }
-    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        val deviceId = pendingImageDeviceId
-        pendingImageDeviceId = null
-        if (uri == null || deviceId == null) return@rememberLauncherForActivityResult
-        val controller = controllers[deviceId] ?: return@rememberLauncherForActivityResult
-        val device = devices.firstOrNull { it.id == deviceId } ?: return@rememberLauncherForActivityResult
+
+    fun sendImageUriToClipboardForDevice(
+        deviceId: String,
+        uri: Uri,
+        sharedPayloadId: Long? = null
+    ) {
+        val controller = controllers[deviceId] ?: return
+        val device = devices.firstOrNull { it.id == deviceId } ?: return
         scope.launch {
             imageActionLabels[deviceId] = "发送中..."
             val result = runCatching {
@@ -596,6 +600,7 @@ private fun SendScreen(
                 .onSuccess {
                     imageActionLabels[deviceId] = "✓"
                     onRecordSentContent(device, it, "clipboard")
+                    sharedPayloadId?.let(onConsumeSharedPayload)
                     Toast.makeText(context, "已发送图片到 Mac 剪贴板：${it.fileName}", Toast.LENGTH_SHORT).show()
                 }
                 .onFailure {
@@ -606,12 +611,15 @@ private fun SendScreen(
             imageActionLabels.remove(deviceId)
         }
     }
-    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        val deviceId = pendingFileDeviceId
-        pendingFileDeviceId = null
-        if (uris.isEmpty() || deviceId == null) return@rememberLauncherForActivityResult
-        val controller = controllers[deviceId] ?: return@rememberLauncherForActivityResult
-        val device = devices.firstOrNull { it.id == deviceId } ?: return@rememberLauncherForActivityResult
+
+    fun sendUrisToInboxForDevice(
+        deviceId: String,
+        uris: List<Uri>,
+        sharedPayloadId: Long? = null
+    ) {
+        if (uris.isEmpty()) return
+        val controller = controllers[deviceId] ?: return
+        val device = devices.firstOrNull { it.id == deviceId } ?: return
         scope.launch {
             fileActionLabels[deviceId] = "准备中..."
             val batchSessionId = if (uris.size > 1) "native-batch-${UUID.randomUUID()}" else null
@@ -646,6 +654,9 @@ private fun SendScreen(
                     } else {
                         onRecordSentContentBatch(device, sentItems, "inbox")
                     }
+                    if (sentItems.any { it.status == "success" }) {
+                        sharedPayloadId?.let(onConsumeSharedPayload)
+                    }
                     Toast.makeText(context, transferSummaryMessage(sentItems), Toast.LENGTH_SHORT).show()
                 }
                 .onFailure {
@@ -655,6 +666,19 @@ private fun SendScreen(
             delay(900)
             fileActionLabels.remove(deviceId)
         }
+    }
+
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        val deviceId = pendingImageDeviceId
+        pendingImageDeviceId = null
+        if (uri == null || deviceId == null) return@rememberLauncherForActivityResult
+        sendImageUriToClipboardForDevice(deviceId, uri)
+    }
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        val deviceId = pendingFileDeviceId
+        pendingFileDeviceId = null
+        if (uris.isEmpty() || deviceId == null) return@rememberLauncherForActivityResult
+        sendUrisToInboxForDevice(deviceId, uris)
     }
 
     LaunchedEffect(sharedPayload?.id, devices) {
@@ -736,10 +760,29 @@ private fun SendScreen(
                     }
                 },
                 onPickImage = {
+                    val payload = sharedPayload
+                    if (payload?.uris?.isNotEmpty() == true) {
+                        if (payload.uris.size > 1) {
+                            Toast.makeText(context, "批量内容请使用“传到收件箱”", Toast.LENGTH_SHORT).show()
+                            return@SendDeviceCard
+                        }
+                        val uri = payload.uris.first()
+                        if (!isSharedImageUri(context, uri, payload.mimeType)) {
+                            Toast.makeText(context, "当前共享内容不是图片，请使用“传到收件箱”", Toast.LENGTH_SHORT).show()
+                            return@SendDeviceCard
+                        }
+                        sendImageUriToClipboardForDevice(device.id, uri, payload.id)
+                        return@SendDeviceCard
+                    }
                     pendingImageDeviceId = device.id
                     imagePicker.launch("image/*")
                 },
                 onPickFile = {
+                    val payload = sharedPayload
+                    if (payload?.uris?.isNotEmpty() == true) {
+                        sendUrisToInboxForDevice(device.id, payload.uris, payload.id)
+                        return@SendDeviceCard
+                    }
                     pendingFileDeviceId = device.id
                     filePicker.launch(arrayOf("*/*"))
                 }
@@ -762,6 +805,7 @@ private fun SharedPayloadCard(
     var transferLabel by remember(payload.id) { mutableStateOf<String?>(null) }
     val target = devices.firstOrNull { controllers[it.id]?.connection?.status == ConnectionStatus.Connected }
         ?: devices.firstOrNull()
+    val singleSharedImage = payload.uris.size == 1 && isSharedImageUri(context, payload.uris.first(), payload.mimeType)
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(24.dp),
@@ -778,7 +822,11 @@ private fun SharedPayloadCard(
                 fontWeight = FontWeight.ExtraBold
             )
             Text(
-                text = "${payload.uris.size} 个文件待发送到 Mac 收件箱",
+                text = if (singleSharedImage) {
+                    "1 张图片待发送；可点任意设备的“传图到剪贴板”或“传到收件箱”。"
+                } else {
+                    "${payload.uris.size} 个文件待发送；可点任意设备的“传到收件箱”。"
+                },
                 color = Color(0xFF667085),
                 fontSize = 14.sp
             )
@@ -1063,6 +1111,16 @@ private fun transferSummaryMessage(items: List<ContentTransferResult>): String {
         successCount == 0 -> "${items.size} 个文件发送失败"
         else -> "已发送 $successCount 项，失败 $failedCount 项"
     }
+}
+
+private fun isSharedImageUri(
+    context: Context,
+    uri: Uri,
+    declaredMimeType: String?
+): Boolean {
+    val actualMimeType = context.contentResolver.getType(uri)
+    return listOfNotNull(actualMimeType, declaredMimeType)
+        .any { it.lowercase(Locale.US).startsWith("image/") }
 }
 
 @Composable
