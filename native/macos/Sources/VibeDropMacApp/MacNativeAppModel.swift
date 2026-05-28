@@ -139,35 +139,42 @@ final class MacNativeAppModel: ObservableObject {
             return
         }
 
-        for url in urls {
-            let itemId = UUID().uuidString
-            transferItems.insert(
-                MacTransferListItem(
-                    id: itemId,
-                    fileName: url.lastPathComponent,
-                    peerName: peer.deviceName,
-                    status: "sending",
-                    detail: "正在发送到手机"
-                ),
-                at: 0
-            )
-            Task.detached {
-                do {
-                    let report = try outboundService.sendFile(at: url, to: peer)
-                    await MainActor.run {
+        let itemId = UUID().uuidString
+        transferItems.insert(
+            MacTransferListItem(
+                id: itemId,
+                fileName: transferDisplayName(for: urls),
+                peerName: peer.deviceName,
+                status: "sending",
+                detail: urls.count > 1 ? "正在准备多文件发送" : "正在发送到手机"
+            ),
+            at: 0
+        )
+        Task.detached {
+            do {
+                let reports = try outboundService.sendURLs(urls, to: peer)
+                let failed = reports.first(where: { $0.status != "success" })
+                await MainActor.run {
+                    if let failed {
                         self.updateTransfer(
                             id: itemId,
-                            status: report.status,
-                            detail: report.savedPath.map { "已保存到手机：\($0)" } ?? (report.error ?? "发送完成")
+                            status: "failed",
+                            detail: failed.error ?? "发送失败"
                         )
-                        self.refresh()
+                    } else {
+                        self.updateTransfer(
+                            id: itemId,
+                            status: "success",
+                            detail: reports.first?.savedPath.map { "已保存到手机：\($0)" } ?? "发送完成"
+                        )
                     }
-                } catch {
-                    let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                    await MainActor.run {
-                        self.updateTransfer(id: itemId, status: "failed", detail: message)
-                        self.refresh()
-                    }
+                    self.refresh()
+                }
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                await MainActor.run {
+                    self.updateTransfer(id: itemId, status: "failed", detail: message)
+                    self.refresh()
                 }
             }
         }
@@ -197,6 +204,13 @@ final class MacNativeAppModel: ObservableObject {
         guard let index = transferItems.firstIndex(where: { $0.id == id }) else { return }
         transferItems[index].status = status
         transferItems[index].detail = detail
+    }
+
+    private func transferDisplayName(for urls: [URL]) -> String {
+        if urls.count == 1 {
+            return urls[0].lastPathComponent
+        }
+        return "\(urls.count) 项"
     }
 
     private func copy(_ text: String) {

@@ -23,7 +23,7 @@ cd native/macos
 swift run VibeDropMacApp
 ```
 
-这个预览服务已经是真实网络监听。当前预览已接入文本/回车输入模拟、图片剪贴板、文件收件箱、桌面到 Android 分片发送、手机保存回执、SQLite 历史写入和 SwiftUI/AppKit 基础窗口；首次运行时 macOS 会弹辅助功能权限，授权后 Android 发来的 `type`、`type_enter`、`enter` 才能真正写到当前焦点应用。图片会保存到 `~/.vibedrop/received-images` 并写入系统剪贴板，文件会保存到 `~/Downloads/VibeDrop 收件箱`，分片接收的临时文件在 `~/.vibedrop/incoming-downloads`。
+这个预览服务已经是真实网络监听。当前预览已接入文本/回车输入模拟、图片剪贴板、文件收件箱、桌面到 Android 分片发送、文件夹/多文件 ZIP 打包发送、手机保存回执、SQLite 历史写入和 SwiftUI/AppKit 基础窗口；首次运行时 macOS 会弹辅助功能权限，授权后 Android 发来的 `type`、`type_enter`、`enter` 才能真正写到当前焦点应用。图片会保存到 `~/.vibedrop/received-images` 并写入系统剪贴板，文件会保存到 `~/Downloads/VibeDrop 收件箱`，分片接收的临时文件在 `~/.vibedrop/incoming-downloads`。
 
 ## 后续模块
 
@@ -31,4 +31,4 @@ swift run VibeDropMacApp
 2. `VibeDropMacStorage`：GRDB 历史库和 JSONL 迁移，后续承接历史查询、热力图聚合和 Home Vault 导出。
 3. `VibeDropMacServer`：discover/pair/WebSocket v1 路由和消息效果分流，后续接 SwiftNIO HTTP/WebSocket 与 UDP discovery。
 4. `VibeDropMacRuntime`：把 server effect 接到 CGEvent 输入模拟和 SQLite 历史写入。
-5. `VibeDropMacApp`：SwiftUI/AppKit app shell，当前已覆盖服务状态、连接信息、配对、连接设备、拖拽普通文件发送和最近历史。
+5. `VibeDropMacApp`：SwiftUI/AppKit app shell，当前已覆盖服务状态、连接信息、配对、连接设备、拖拽普通文件/文件夹/多文件发送和最近历史。

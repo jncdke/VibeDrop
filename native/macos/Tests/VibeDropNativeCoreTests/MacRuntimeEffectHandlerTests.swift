@@ -224,13 +224,16 @@ final class MacRuntimeEffectHandlerTests: XCTestCase {
         XCTAssertEqual(report.transferId, "native-mac-id-1")
         XCTAssertEqual(report.chunksSent, 3)
         XCTAssertEqual(sender.payloads.map { $0["action"] as? String }, [
+            "incoming_history_session_start",
             "incoming_file_start",
             "incoming_file_chunk",
             "incoming_file_chunk",
             "incoming_file_chunk",
             "incoming_file_complete"
         ])
-        XCTAssertEqual(sender.payloads.first?["size_bytes"] as? Int, bytes.count)
+        XCTAssertEqual(sender.payloads.first?["text"] as? String, "[文件] outbound.txt")
+        XCTAssertEqual(sender.payloads.dropFirst().first?["size_bytes"] as? Int, bytes.count)
+        XCTAssertEqual(sender.payloads.dropFirst().first?["history_session_id"] as? String, "native-mac-id-1")
         let joinedChunks = try sender.payloads
             .filter { $0["action"] as? String == "incoming_file_chunk" }
             .map { try XCTUnwrap($0["chunk_base64"] as? String) }
@@ -245,6 +248,61 @@ final class MacRuntimeEffectHandlerTests: XCTestCase {
         XCTAssertEqual(recent.first?.status, "success")
         XCTAssertEqual(recent.first?.saveTarget, "download")
         XCTAssertEqual(recent.first?.items.first?.savedPath, "content://vibedrop/outbound.txt")
+    }
+
+    func testOutboundDirectoryAndMultipleFilesAreArchivedBeforeTransfer() throws {
+        let fixture = try RuntimeFixture()
+        defer { fixture.cleanup() }
+        let first = fixture.directory.appendingPathComponent("alpha.txt")
+        try Data("alpha".utf8).write(to: first)
+        let folder = fixture.directory.appendingPathComponent("folder", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("nested".utf8).write(to: folder.appendingPathComponent("nested.txt"))
+        let registry = MacOutboundTransferRegistry()
+        let sender = RecordingMacServerSender { payload in
+            guard payload["action"] as? String == "incoming_file_complete",
+                  let transferId = payload["transfer_id"] as? String else {
+                return
+            }
+            registry.resolveSaved(transferId: transferId, savedPath: "content://vibedrop/archive.zip")
+        }
+        let ids = RecordingIDGenerator()
+        let service = MacOutboundFileTransferService(
+            sender: sender,
+            transferRegistry: registry,
+            historyDatabase: fixture.database,
+            configuration: fixture.configuration,
+            chunkSize: 1024,
+            ackTimeoutSeconds: 1,
+            idGenerator: { ids.next() },
+            now: { Date(timeIntervalSince1970: 1_774_800_000) }
+        )
+
+        let reports = try service.sendURLs([first, folder], to: fixture.peer)
+
+        XCTAssertEqual(reports.count, 1)
+        XCTAssertEqual(reports.first?.status, "success")
+        XCTAssertEqual(sender.payloads.first?["action"] as? String, "incoming_history_session_start")
+        XCTAssertEqual(sender.payloads.first?["text"] as? String, "[文件] 2 项")
+        let start = try XCTUnwrap(sender.payloads.first(where: { $0["action"] as? String == "incoming_file_start" }))
+        XCTAssertEqual(start["mime_type"] as? String, "application/zip")
+        XCTAssertEqual(start["is_archive"] as? Bool, true)
+        XCTAssertEqual(start["history_item_count"] as? Int, 2)
+        XCTAssertEqual((start["file_name"] as? String)?.hasSuffix(".zip"), true)
+        let archivedBytes = sender.payloads
+            .filter { $0["action"] as? String == "incoming_file_chunk" }
+            .compactMap { $0["chunk_base64"] as? String }
+            .reduce(Data()) { partial, value in
+                var data = partial
+                data.append(Data(base64Encoded: value) ?? Data())
+                return data
+            }
+        XCTAssertTrue(archivedBytes.starts(with: Data([0x50, 0x4B])))
+        let recent = try fixture.database.fetchRecent(limit: 1)
+        XCTAssertEqual(recent.first?.direction, "desktop_to_mobile")
+        XCTAssertEqual(recent.first?.text, "[文件] 2 项")
+        XCTAssertEqual(recent.first?.itemCount, 2)
+        XCTAssertEqual(recent.first?.items.first?.mimeType, "application/zip")
     }
 }
 
