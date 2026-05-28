@@ -35,6 +35,49 @@ public struct MacOutboundFileTransferReport: Equatable, Sendable {
     }
 }
 
+public enum MacOutboundFileTransferStage: String, Equatable, Sendable {
+    case preparing
+    case sending
+    case waitingForReceiver
+    case success
+    case failed
+}
+
+public struct MacOutboundFileTransferProgress: Equatable, Sendable {
+    public var transferId: String
+    public var fileName: String
+    public var stage: MacOutboundFileTransferStage
+    public var sentBytes: Int64
+    public var totalBytes: Int64
+    public var chunksSent: Int
+    public var detail: String?
+
+    public var fraction: Double {
+        guard totalBytes > 0 else { return stage == .success ? 1 : 0 }
+        return min(1, max(0, Double(sentBytes) / Double(totalBytes)))
+    }
+
+    public init(
+        transferId: String,
+        fileName: String,
+        stage: MacOutboundFileTransferStage,
+        sentBytes: Int64,
+        totalBytes: Int64,
+        chunksSent: Int,
+        detail: String? = nil
+    ) {
+        self.transferId = transferId
+        self.fileName = fileName
+        self.stage = stage
+        self.sentBytes = sentBytes
+        self.totalBytes = totalBytes
+        self.chunksSent = chunksSent
+        self.detail = detail
+    }
+}
+
+public typealias MacOutboundFileTransferProgressHandler = @Sendable (MacOutboundFileTransferProgress) -> Void
+
 public final class MacOutboundFileTransferService: @unchecked Sendable {
     public static let defaultChunkSize = 192 * 1024
     public static let defaultAckTimeoutSeconds: TimeInterval = 90
@@ -70,7 +113,8 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
 
     public func sendFile(
         at fileURL: URL,
-        to peer: ConnectedPeer
+        to peer: ConnectedPeer,
+        progressHandler: MacOutboundFileTransferProgressHandler? = nil
     ) throws -> MacOutboundFileTransferReport {
         try sendPreparedFile(
             fileURL: fileURL,
@@ -79,13 +123,15 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
             isArchive: false,
             historySession: historySession(for: [fileURL], sessionId: "native-mac-\(idGenerator())"),
             localPathForHistory: fileURL.path,
-            peer: peer
+            peer: peer,
+            progressHandler: progressHandler
         )
     }
 
     public func sendURLs(
         _ urls: [URL],
-        to peer: ConnectedPeer
+        to peer: ConnectedPeer,
+        progressHandler: MacOutboundFileTransferProgressHandler? = nil
     ) throws -> [MacOutboundFileTransferReport] {
         let normalizedURLs = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
         guard !normalizedURLs.isEmpty else {
@@ -93,11 +139,11 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
         }
 
         if normalizedURLs.count == 1, try isRegularFile(normalizedURLs[0]) {
-            return [try sendFile(at: normalizedURLs[0], to: peer)]
+            return [try sendFile(at: normalizedURLs[0], to: peer, progressHandler: progressHandler)]
         }
 
         if shouldSplitGalleryMedia(normalizedURLs) {
-            return try normalizedURLs.map { try sendFile(at: $0, to: peer) }
+            return try normalizedURLs.map { try sendFile(at: $0, to: peer, progressHandler: progressHandler) }
         }
 
         let sessionId = "native-mac-\(idGenerator())"
@@ -112,7 +158,8 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
                 isArchive: true,
                 historySession: session,
                 localPathForHistory: archive.archiveURL.path,
-                peer: peer
+                peer: peer,
+                progressHandler: progressHandler
             )
         ]
     }
@@ -124,7 +171,8 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
         isArchive: Bool,
         historySession: OutboundHistorySessionMessage,
         localPathForHistory: String,
-        peer: ConnectedPeer
+        peer: ConnectedPeer,
+        progressHandler: MacOutboundFileTransferProgressHandler?
     ) throws -> MacOutboundFileTransferReport {
         let metadata = try FileManager.default.attributesOfItem(atPath: fileURL.path)
         guard let type = metadata[.type] as? FileAttributeType, type == .typeRegular else {
@@ -133,6 +181,17 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
         let sizeBytes = (metadata[.size] as? NSNumber)?.int64Value ?? 0
         let transferId = historySession.sessionId
         transferRegistry.register(transferId)
+        progressHandler?(
+            MacOutboundFileTransferProgress(
+                transferId: transferId,
+                fileName: fileName,
+                stage: .preparing,
+                sentBytes: 0,
+                totalBytes: sizeBytes,
+                chunksSent: 0,
+                detail: "正在准备发送"
+            )
+        )
 
         do {
             try send(historySession, to: peer.sessionId)
@@ -152,10 +211,24 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
 
             let chunksSent = try sendChunks(
                 fileURL: fileURL,
+                fileName: fileName,
                 transferId: transferId,
-                sessionId: peer.sessionId
+                sessionId: peer.sessionId,
+                totalBytes: sizeBytes,
+                progressHandler: progressHandler
             )
             try send(OutboundFileCompleteMessage(transferId: transferId), to: peer.sessionId)
+            progressHandler?(
+                MacOutboundFileTransferProgress(
+                    transferId: transferId,
+                    fileName: fileName,
+                    stage: .waitingForReceiver,
+                    sentBytes: sizeBytes,
+                    totalBytes: sizeBytes,
+                    chunksSent: chunksSent,
+                    detail: "等待手机保存"
+                )
+            )
 
             let result = transferRegistry.wait(
                 transferId: transferId,
@@ -175,9 +248,32 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
                 peer: peer,
                 historySession: historySession
             )
+            progressHandler?(
+                MacOutboundFileTransferProgress(
+                    transferId: transferId,
+                    fileName: fileName,
+                    stage: report.status == "success" ? .success : .failed,
+                    sentBytes: sizeBytes,
+                    totalBytes: sizeBytes,
+                    chunksSent: chunksSent,
+                    detail: report.error ?? report.savedPath
+                )
+            )
             return report
         } catch {
             transferRegistry.resolveFailed(transferId: transferId, error: error.localizedDescription)
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            progressHandler?(
+                MacOutboundFileTransferProgress(
+                    transferId: transferId,
+                    fileName: fileName,
+                    stage: .failed,
+                    sentBytes: 0,
+                    totalBytes: sizeBytes,
+                    chunksSent: 0,
+                    detail: message
+                )
+            )
             let report = MacOutboundFileTransferReport(
                 transferId: transferId,
                 fileName: fileName,
@@ -185,7 +281,7 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
                 sizeBytes: sizeBytes,
                 chunksSent: 0,
                 status: "failed",
-                error: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                error: message
             )
             recordHistory(
                 report: report,
@@ -199,12 +295,16 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
 
     private func sendChunks(
         fileURL: URL,
+        fileName: String,
         transferId: String,
-        sessionId: UInt64
+        sessionId: UInt64,
+        totalBytes: Int64,
+        progressHandler: MacOutboundFileTransferProgressHandler?
     ) throws -> Int {
         let handle = try FileHandle(forReadingFrom: fileURL)
         defer { try? handle.close() }
         var count = 0
+        var sentBytes: Int64 = 0
         while true {
             let chunk = try handle.read(upToCount: chunkSize) ?? Data()
             if chunk.isEmpty { break }
@@ -216,6 +316,18 @@ public final class MacOutboundFileTransferService: @unchecked Sendable {
                 to: sessionId
             )
             count += 1
+            sentBytes += Int64(chunk.count)
+            progressHandler?(
+                MacOutboundFileTransferProgress(
+                    transferId: transferId,
+                    fileName: fileName,
+                    stage: .sending,
+                    sentBytes: sentBytes,
+                    totalBytes: totalBytes,
+                    chunksSent: count,
+                    detail: nil
+                )
+            )
         }
         return count
     }

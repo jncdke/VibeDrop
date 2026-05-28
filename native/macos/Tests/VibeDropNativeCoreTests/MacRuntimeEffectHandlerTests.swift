@@ -207,6 +207,7 @@ final class MacRuntimeEffectHandlerTests: XCTestCase {
             registry.resolveSaved(transferId: transferId, savedPath: "content://vibedrop/outbound.txt")
         }
         let ids = RecordingIDGenerator()
+        let progress = RecordingTransferProgress()
         let service = MacOutboundFileTransferService(
             sender: sender,
             transferRegistry: registry,
@@ -218,7 +219,11 @@ final class MacRuntimeEffectHandlerTests: XCTestCase {
             now: { Date(timeIntervalSince1970: 1_774_800_000) }
         )
 
-        let report = try service.sendFile(at: fileURL, to: fixture.peer)
+        let report = try service.sendFile(
+            at: fileURL,
+            to: fixture.peer,
+            progressHandler: { progress.append($0) }
+        )
 
         XCTAssertEqual(report.status, "success")
         XCTAssertEqual(report.transferId, "native-mac-id-1")
@@ -248,6 +253,16 @@ final class MacRuntimeEffectHandlerTests: XCTestCase {
         XCTAssertEqual(recent.first?.status, "success")
         XCTAssertEqual(recent.first?.saveTarget, "download")
         XCTAssertEqual(recent.first?.items.first?.savedPath, "content://vibedrop/outbound.txt")
+        let progressEvents = progress.snapshot()
+        XCTAssertEqual(progressEvents.first?.stage, .preparing)
+        XCTAssertEqual(progressEvents.filter { $0.stage == .sending }.map(\.sentBytes), [
+            8,
+            16,
+            Int64(bytes.count)
+        ])
+        XCTAssertEqual(progressEvents.first(where: { $0.stage == .waitingForReceiver })?.sentBytes, Int64(bytes.count))
+        XCTAssertEqual(progressEvents.last?.stage, .success)
+        XCTAssertEqual(progressEvents.last?.fraction, 1)
     }
 
     func testOutboundDirectoryAndMultipleFilesAreArchivedBeforeTransfer() throws {
@@ -366,6 +381,23 @@ private final class RecordingIDGenerator: @unchecked Sendable {
         defer { lock.unlock() }
         value += 1
         return "id-\(value)"
+    }
+}
+
+private final class RecordingTransferProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [MacOutboundFileTransferProgress] = []
+
+    func append(_ event: MacOutboundFileTransferProgress) {
+        lock.lock()
+        defer { lock.unlock() }
+        events.append(event)
+    }
+
+    func snapshot() -> [MacOutboundFileTransferProgress] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
     }
 }
 

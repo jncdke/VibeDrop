@@ -12,6 +12,9 @@ struct MacTransferListItem: Identifiable, Equatable {
     var peerName: String
     var status: String
     var detail: String
+    var progress: Double
+    var sentBytes: Int64
+    var totalBytes: Int64
 }
 
 @MainActor
@@ -190,13 +193,24 @@ final class MacNativeAppModel: ObservableObject {
                 fileName: transferDisplayName(for: urls),
                 peerName: peer.deviceName,
                 status: "sending",
-                detail: urls.count > 1 ? "正在准备多文件发送" : "正在发送到手机"
+                detail: urls.count > 1 ? "正在准备多文件发送" : "正在发送到手机",
+                progress: 0,
+                sentBytes: 0,
+                totalBytes: 0
             ),
             at: 0
         )
         Task.detached {
             do {
-                let reports = try outboundService.sendURLs(urls, to: peer)
+                let reports = try outboundService.sendURLs(
+                    urls,
+                    to: peer,
+                    progressHandler: { progress in
+                        Task { @MainActor in
+                            self.updateTransferProgress(id: itemId, progress: progress)
+                        }
+                    }
+                )
                 let failed = reports.first(where: { $0.status != "success" })
                 await MainActor.run {
                     if let failed {
@@ -212,7 +226,10 @@ final class MacNativeAppModel: ObservableObject {
                         self.updateTransfer(
                             id: itemId,
                             status: "failed",
-                            detail: failed.error ?? "发送失败"
+                            detail: failed.error ?? "发送失败",
+                            progress: nil,
+                            sentBytes: nil,
+                            totalBytes: nil
                         )
                     } else {
                         self.log(
@@ -226,7 +243,10 @@ final class MacNativeAppModel: ObservableObject {
                         self.updateTransfer(
                             id: itemId,
                             status: "success",
-                            detail: reports.first?.savedPath.map { "已保存到手机：\($0)" } ?? "发送完成"
+                            detail: reports.first?.savedPath.map { "已保存到手机：\($0)" } ?? "发送完成",
+                            progress: 1,
+                            sentBytes: nil,
+                            totalBytes: nil
                         )
                     }
                     self.refresh()
@@ -235,7 +255,7 @@ final class MacNativeAppModel: ObservableObject {
                 let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 await MainActor.run {
                     self.log("transfer", "send_failed", ["peer": peer.deviceName, "error": message])
-                    self.updateTransfer(id: itemId, status: "failed", detail: message)
+                    self.updateTransfer(id: itemId, status: "failed", detail: message, progress: nil, sentBytes: nil, totalBytes: nil)
                     self.refresh()
                 }
             }
@@ -355,10 +375,50 @@ final class MacNativeAppModel: ObservableObject {
         }
     }
 
-    private func updateTransfer(id: String, status: String, detail: String) {
+    private func updateTransfer(
+        id: String,
+        status: String,
+        detail: String,
+        progress: Double? = nil,
+        sentBytes: Int64? = nil,
+        totalBytes: Int64? = nil
+    ) {
         guard let index = transferItems.firstIndex(where: { $0.id == id }) else { return }
         transferItems[index].status = status
         transferItems[index].detail = detail
+        if let progress {
+            transferItems[index].progress = progress
+        }
+        if let sentBytes {
+            transferItems[index].sentBytes = sentBytes
+        }
+        if let totalBytes {
+            transferItems[index].totalBytes = totalBytes
+        }
+    }
+
+    private func updateTransferProgress(id: String, progress: MacOutboundFileTransferProgress) {
+        guard let index = transferItems.firstIndex(where: { $0.id == id }) else { return }
+        transferItems[index].progress = progress.fraction
+        transferItems[index].sentBytes = progress.sentBytes
+        transferItems[index].totalBytes = progress.totalBytes
+        switch progress.stage {
+        case .preparing:
+            transferItems[index].status = "sending"
+            transferItems[index].detail = "正在准备：\(progress.fileName)"
+        case .sending:
+            transferItems[index].status = "sending"
+            transferItems[index].detail = "已发送 \(Self.byteText(progress.sentBytes)) / \(Self.byteText(progress.totalBytes))"
+        case .waitingForReceiver:
+            transferItems[index].status = "sending"
+            transferItems[index].detail = "已传完，等待手机保存"
+        case .success:
+            transferItems[index].status = "success"
+            transferItems[index].detail = progress.detail.map { "已保存到手机：\($0)" } ?? "发送完成"
+        case .failed:
+            transferItems[index].status = "failed"
+            transferItems[index].detail = progress.detail ?? "发送失败"
+        }
     }
 
     private func transferDisplayName(for urls: [URL]) -> String {
@@ -436,6 +496,13 @@ final class MacNativeAppModel: ObservableObject {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd_HHmmss"
         return formatter.string(from: Date())
+    }
+
+    private static func byteText(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
     }
 
     private static func finderShareRequestsDirectory() -> URL {

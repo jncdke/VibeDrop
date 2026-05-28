@@ -276,15 +276,27 @@ private struct DropSendCard: View {
                         return true
                     }
                 ForEach(model.transferItems) { item in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(item.fileName).font(.system(size: 14, weight: .bold))
-                            Text(item.detail).font(.system(size: 12)).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.fileName).font(.system(size: 14, weight: .bold))
+                                Text(item.detail).font(.system(size: 12)).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text(statusText(item.status))
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(item.status == "success" ? .green : item.status == "failed" ? .red : .blue)
                         }
-                        Spacer()
-                        Text(statusText(item.status))
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(item.status == "success" ? .green : item.status == "failed" ? .red : .blue)
+                        if item.totalBytes > 0 {
+                            HStack(spacing: 10) {
+                                ProgressView(value: min(1, max(0, item.progress)))
+                                    .progressViewStyle(.linear)
+                                Text("\(Int((min(1, max(0, item.progress)) * 100).rounded()))%")
+                                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 38, alignment: .trailing)
+                            }
+                        }
                     }
                     .padding(12)
                     .background(Color.white.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
