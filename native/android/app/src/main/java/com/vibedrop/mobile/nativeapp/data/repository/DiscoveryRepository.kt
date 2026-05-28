@@ -5,6 +5,8 @@ import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
 import com.vibedrop.mobile.nativeapp.core.model.DiscoveredDesktop
 import com.vibedrop.mobile.nativeapp.core.model.PairRequestAccepted
 import com.vibedrop.mobile.nativeapp.core.model.PairStatus
+import com.vibedrop.mobile.nativeapp.protocol.AuthPayload
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -12,10 +14,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -24,6 +30,14 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.util.concurrent.TimeUnit
+
+data class DesktopConnectionTestResult(
+    val deviceId: String,
+    val displayName: String,
+    val endpoint: String?,
+    val ok: Boolean,
+    val message: String
+)
 
 class DiscoveryRepository(
     private val context: Context
@@ -55,6 +69,80 @@ class DiscoveryRepository(
                     .thenBy { it.ip }
             )
         }
+    }
+
+    suspend fun testDesktopConnections(
+        devices: List<DesktopDevice>,
+        clientId: String,
+        clientName: String
+    ): List<DesktopConnectionTestResult> = withContext(Dispatchers.IO) {
+        val semaphore = Semaphore(4)
+        coroutineScope {
+            devices.map { device ->
+                async {
+                    semaphore.withPermit {
+                        testDesktopConnection(device, clientId, clientName)
+                    }
+                }
+            }.awaitAll()
+        }
+    }
+
+    suspend fun testDesktopConnection(
+        device: DesktopDevice,
+        clientId: String,
+        clientName: String
+    ): DesktopConnectionTestResult = withContext(Dispatchers.IO) {
+        val pin = device.pin?.trim().orEmpty()
+        if (pin.isBlank()) {
+            return@withContext DesktopConnectionTestResult(
+                deviceId = device.id,
+                displayName = device.displayName,
+                endpoint = null,
+                ok = false,
+                message = "缺少 PIN，无法认证"
+            )
+        }
+
+        val endpoints = desktopEndpointCandidates(device)
+        var lastFailure: DesktopConnectionTestResult? = null
+        for (host in endpoints) {
+            val endpoint = "$host:${device.port}"
+            val result = runCatching {
+                probeDesktopWebSocket(
+                    host = host,
+                    port = device.port,
+                    pin = pin,
+                    clientId = clientId,
+                    clientName = clientName
+                )
+            }
+            val successMessage = result.getOrNull()
+            if (successMessage != null) {
+                return@withContext DesktopConnectionTestResult(
+                    deviceId = device.id,
+                    displayName = device.displayName,
+                    endpoint = endpoint,
+                    ok = true,
+                    message = successMessage
+                )
+            }
+            val error = result.exceptionOrNull()
+            lastFailure = DesktopConnectionTestResult(
+                deviceId = device.id,
+                displayName = device.displayName,
+                endpoint = endpoint,
+                ok = false,
+                message = error?.message?.takeIf { it.isNotBlank() } ?: "测试失败"
+            )
+        }
+        lastFailure ?: DesktopConnectionTestResult(
+            deviceId = device.id,
+            displayName = device.displayName,
+            endpoint = null,
+            ok = false,
+            message = "没有可测试的 host 或 IP"
+        )
     }
 
     suspend fun requestPairing(
@@ -177,6 +265,83 @@ class DiscoveryRepository(
                 source = source
             )
         }.getOrNull()
+    }
+
+    private suspend fun probeDesktopWebSocket(
+        host: String,
+        port: Int,
+        pin: String,
+        clientId: String,
+        clientName: String
+    ): String {
+        val result = CompletableDeferred<String>()
+        val request = Request.Builder()
+            .url("ws://$host:$port/ws")
+            .build()
+        var testSocket: WebSocket? = null
+        testSocket = client.newWebSocket(
+            request,
+            object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    webSocket.send(
+                        AuthPayload(
+                            pin = pin,
+                            deviceId = clientId,
+                            baseDeviceId = clientId,
+                            deviceName = clientName,
+                            canReceiveFiles = false,
+                            receivesClipboard = false,
+                            deviceRole = "diagnostic"
+                        ).toJson().toString()
+                    )
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val json = runCatching { JSONObject(text) }.getOrNull() ?: return
+                    when (json.optString("status")) {
+                        "ok" -> {
+                            result.complete("WebSocket 已连接，PIN 认证成功")
+                            webSocket.close(1000, "diagnostic complete")
+                        }
+                        "error" -> {
+                            val error = json.optString("error").ifBlank { "桌面端返回认证失败" }
+                            result.completeExceptionally(IllegalStateException(error))
+                            webSocket.close(1000, "diagnostic failed")
+                        }
+                    }
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    if (!result.isCompleted) {
+                        result.completeExceptionally(
+                            IllegalStateException(reason.ifBlank { "连接提前关闭，code=$code" })
+                        )
+                    }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    val message = buildString {
+                        append(t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName)
+                        response?.code?.let { append(" · HTTP $it") }
+                    }
+                    result.completeExceptionally(IllegalStateException(message))
+                }
+            }
+        )
+        return try {
+            withTimeout(DESKTOP_CONNECTION_TEST_TIMEOUT_MS) {
+                result.await()
+            }
+        } finally {
+            testSocket?.cancel()
+        }
+    }
+
+    private fun desktopEndpointCandidates(device: DesktopDevice): List<String> {
+        return listOfNotNull(device.host, device.ip)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
     }
 
     private fun parseDiscoverResponse(
@@ -315,5 +480,6 @@ class DiscoveryRepository(
     private companion object {
         const val DESKTOP_DISCOVERY_PORT = 9001
         const val HTTP_SUBNET_LIMIT = 2
+        const val DESKTOP_CONNECTION_TEST_TIMEOUT_MS = 4_500L
     }
 }

@@ -30,6 +30,7 @@
 10. Mac 拖拽/分享发送到原生 Android 时，`DesktopConnectionController` 会接收 `incoming_history_session_start` 与 `incoming_file_start/chunk/complete`，`IncomingFileReceiver` 写入临时文件、校验大小、保存到 MediaStore，并按会话写入 Room 聚合历史。
 11. 设置页支持图片/视频历史打开策略：系统默认、相册、浏览器或每次询问；历史媒体 item 点击后会通过 Android `ACTION_VIEW` 和 FileProvider/MediaStore URI 打开。历史页支持发送端和接收端分离筛选，候选项显示数量并按数量排序。
 12. 设置页连接诊断卡支持直接编辑或删除已保存 Mac；编辑保留原设备 ID，只更新显示名、host、端口和 PIN，删除不会清空历史记录。
+13. 设置页“测试连接”会为每台已保存 Mac 打开一次性 WebSocket，发送 v1 `auth` 并等待 `status ok`，所以可以区分 host/端口不可达、PIN 错误和真实可发送状态；测试 socket 不复用也不打断当前发送连接。
 
 ## 构建
 

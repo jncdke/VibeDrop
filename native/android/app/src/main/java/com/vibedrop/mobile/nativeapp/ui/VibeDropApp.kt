@@ -74,6 +74,7 @@ import com.vibedrop.mobile.nativeapp.core.model.DiscoveredDesktop
 import com.vibedrop.mobile.nativeapp.data.AppContainer
 import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import com.vibedrop.mobile.nativeapp.data.local.HistoryItemEntity
+import com.vibedrop.mobile.nativeapp.data.repository.DesktopConnectionTestResult
 import com.vibedrop.mobile.nativeapp.data.repository.HistoryEntryWithItems
 import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import com.vibedrop.mobile.nativeapp.platform.AndroidDeviceIdentity
@@ -119,6 +120,9 @@ fun VibeDropApp(container: AppContainer) {
     var discoveredDesktops by remember { mutableStateOf<List<DiscoveredDesktop>>(emptyList()) }
     var discoveryStatus by remember { mutableStateOf("还未扫描附近 Mac") }
     var discoveryBusy by remember { mutableStateOf(false) }
+    var connectionTestStatus by remember { mutableStateOf("还未手动测试连接") }
+    var connectionTestBusy by remember { mutableStateOf(false) }
+    var connectionTestResults by remember { mutableStateOf<List<DesktopConnectionTestResult>>(emptyList()) }
     var pairingDesktopKey by remember { mutableStateOf<String?>(null) }
     var homeVaultUrl by rememberSaveable { mutableStateOf(container.homeVaultRepository.loadEndpoint()) }
     var homeVaultStatus by remember { mutableStateOf("还未同步") }
@@ -272,6 +276,9 @@ fun VibeDropApp(container: AppContainer) {
                     discoveredDesktops = discoveredDesktops,
                     discoveryStatus = discoveryStatus,
                     discoveryBusy = discoveryBusy,
+                    connectionTestStatus = connectionTestStatus,
+                    connectionTestBusy = connectionTestBusy,
+                    connectionTestResults = connectionTestResults,
                     pairingDesktopKey = pairingDesktopKey,
                     homeVaultUrl = homeVaultUrl,
                     homeVaultStatus = homeVaultStatus,
@@ -314,6 +321,48 @@ fun VibeDropApp(container: AppContainer) {
                                     discoveryStatus = "扫描失败：${error.message ?: "未知错误"}"
                                 }
                             discoveryBusy = false
+                        }
+                    },
+                    onTestConnections = {
+                        if (connectionTestBusy) return@SettingsScreen
+                        if (devices.isEmpty()) {
+                            connectionTestStatus = "没有可测试的 Mac"
+                            connectionTestResults = emptyList()
+                            return@SettingsScreen
+                        }
+                        scope.launch {
+                            connectionTestBusy = true
+                            connectionTestStatus = "正在测试 ${devices.size} 台 Mac..."
+                            connectionTestResults = emptyList()
+                            container.diagnosticLogStore.append("connection-test", "start", JSONObject().put("deviceCount", devices.size))
+                            val result = runCatching {
+                                withContext(Dispatchers.IO) {
+                                    container.discoveryRepository.testDesktopConnections(
+                                        devices = devices,
+                                        clientId = container.androidIdentity.deviceId,
+                                        clientName = container.androidIdentity.deviceName
+                                    )
+                                }
+                            }
+                            result
+                                .onSuccess { results ->
+                                    val successCount = results.count { it.ok }
+                                    connectionTestResults = results
+                                    connectionTestStatus = "测试完成：$successCount/${results.size} 台可用"
+                                    container.diagnosticLogStore.append(
+                                        "connection-test",
+                                        "finished",
+                                        JSONObject()
+                                            .put("success", successCount)
+                                            .put("total", results.size)
+                                    )
+                                }
+                                .onFailure { error ->
+                                    connectionTestStatus = "测试失败：${error.message ?: "未知错误"}"
+                                    connectionTestResults = emptyList()
+                                    container.diagnosticLogStore.append("connection-test", "failure", JSONObject().put("error", error.message ?: "未知错误"))
+                                }
+                            connectionTestBusy = false
                         }
                     },
                     onPairDesktop = { desktop ->
@@ -1851,6 +1900,9 @@ private fun SettingsScreen(
     discoveredDesktops: List<DiscoveredDesktop>,
     discoveryStatus: String,
     discoveryBusy: Boolean,
+    connectionTestStatus: String,
+    connectionTestBusy: Boolean,
+    connectionTestResults: List<DesktopConnectionTestResult>,
     pairingDesktopKey: String?,
     homeVaultUrl: String,
     homeVaultStatus: String,
@@ -1862,6 +1914,7 @@ private fun SettingsScreen(
     onImageOpenModeChange: (MediaOpenMode) -> Unit,
     onVideoOpenModeChange: (MediaOpenMode) -> Unit,
     onDiscover: () -> Unit,
+    onTestConnections: () -> Unit,
     onPairDesktop: (DiscoveredDesktop) -> Unit,
     onSyncHomeVault: () -> Unit,
     onImportHistory: () -> Unit,
@@ -1931,6 +1984,9 @@ private fun SettingsScreen(
                 devices = devices,
                 controllers = controllers,
                 diagnostics = networkDiagnostics,
+                connectionTestStatus = connectionTestStatus,
+                connectionTestBusy = connectionTestBusy,
+                connectionTestResults = connectionTestResults,
                 editingDeviceId = editingDeviceId,
                 deleteArmedDeviceId = deleteArmedDeviceId,
                 onRefresh = {
@@ -1940,6 +1996,7 @@ private fun SettingsScreen(
                         }
                     }
                 },
+                onTestConnections = onTestConnections,
                 onEditDevice = { device ->
                     editingDeviceId = device.id
                     deleteArmedDeviceId = null
@@ -2442,9 +2499,13 @@ private fun ConnectionDiagnosticsCard(
     devices: List<DesktopDevice>,
     controllers: Map<String, DesktopConnectionController>,
     diagnostics: AndroidNetworkDiagnosticsSnapshot?,
+    connectionTestStatus: String,
+    connectionTestBusy: Boolean,
+    connectionTestResults: List<DesktopConnectionTestResult>,
     editingDeviceId: String?,
     deleteArmedDeviceId: String?,
     onRefresh: () -> Unit,
+    onTestConnections: () -> Unit,
     onEditDevice: (DesktopDevice) -> Unit,
     onArmDeleteDevice: (DesktopDevice) -> Unit,
     onDeleteDevice: (DesktopDevice) -> Unit
@@ -2478,6 +2539,12 @@ private fun ConnectionDiagnosticsCard(
                         fontSize = 13.sp
                     )
                 }
+                OutlinedButton(
+                    onClick = onTestConnections,
+                    enabled = !connectionTestBusy && devices.isNotEmpty()
+                ) {
+                    Text(if (connectionTestBusy) "测试中" else "测试连接")
+                }
                 OutlinedButton(onClick = onRefresh) {
                     Text("刷新")
                 }
@@ -2487,6 +2554,7 @@ private fun ConnectionDiagnosticsCard(
             DiagnosticRow("设备 ID", shortIdentity(identity.deviceId))
             DiagnosticRow("已保存 Mac", "${devices.size} 台")
             DiagnosticRow("当前连接", "${connectedCount} 已连接 · ${reconnectingCount} 重连中")
+            DiagnosticRow("手动测试", connectionTestStatus)
 
             val activeNetwork = diagnostics?.activeTransports?.joinToString(" + ").orEmpty()
             DiagnosticRow("当前网络", activeNetwork.ifBlank { "未识别到活动网络" })
@@ -2600,6 +2668,13 @@ private fun ConnectionDiagnosticsCard(
                 }
             }
 
+            if (connectionTestResults.isNotEmpty()) {
+                Text("测试结果", color = Color(0xFF98A2B3), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                connectionTestResults.forEach { result ->
+                    ConnectionTestResultRow(result)
+                }
+            }
+
             if (recentErrors.isNotEmpty()) {
                 Text("最近错误", color = Color(0xFF98A2B3), fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 recentErrors.take(4).forEach { error ->
@@ -2627,6 +2702,56 @@ private fun DiagnosticRow(label: String, value: String) {
             fontSize = 13.sp,
             fontWeight = FontWeight.Bold
         )
+    }
+}
+
+@Composable
+private fun ConnectionTestResultRow(result: DesktopConnectionTestResult) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color(0xFFF8FAFC))
+            .padding(12.dp),
+        verticalAlignment = Alignment.Top
+    ) {
+        Box(
+            modifier = Modifier
+                .padding(top = 3.dp)
+                .size(10.dp)
+                .clip(CircleShape)
+                .background(if (result.ok) Color(0xFF34C759) else Color(0xFFE5484D))
+        )
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            Text(
+                text = result.displayName,
+                color = Color(0xFF111827),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.ExtraBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            result.endpoint?.let { endpoint ->
+                Text(
+                    text = endpoint,
+                    color = Color(0xFF667085),
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Text(
+                text = result.message,
+                color = if (result.ok) Color(0xFF667085) else Color(0xFFE5484D),
+                fontSize = 12.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
     }
 }
 
