@@ -111,6 +111,20 @@ private struct ConnectionCard: View {
                 InfoRow(label: "主机名", value: model.configuration?.hostname ?? "加载中")
                 InfoRow(label: "地址", value: model.addressText)
                 InfoRow(label: "PIN", value: model.pinText)
+                Divider()
+                Toggle("开机自动启动", isOn: Binding(
+                    get: { model.launchAtLoginEnabled },
+                    set: { model.setLaunchAtLoginEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                HStack {
+                    Text("登录项状态：\(model.launchAtLoginStatus)")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("系统登录项") { model.openLoginItemsSettings() }
+                        .buttonStyle(.bordered)
+                }
                 Text("手机端优先用“附近电脑 + 验证码配对”，手动地址只作为排障兜底。")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)

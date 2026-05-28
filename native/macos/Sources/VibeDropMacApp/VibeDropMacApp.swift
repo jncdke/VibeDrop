@@ -24,6 +24,11 @@ struct VibeDropMacApp: App {
             Button("复制 PIN") {
                 model.copyPin()
             }
+            Toggle("开机启动", isOn: Binding(
+                get: { model.launchAtLoginEnabled },
+                set: { model.setLaunchAtLoginEnabled($0) }
+            ))
+            Text("开机启动 \(model.launchAtLoginStatus)")
             Divider()
             Button("打开 VibeDrop") {
                 openWindow(id: "main")

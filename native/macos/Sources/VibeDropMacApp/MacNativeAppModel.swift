@@ -25,6 +25,8 @@ final class MacNativeAppModel: ObservableObject {
     @Published var recentHistory: [HistoryEntry] = []
     @Published var selectedSessionId: UInt64?
     @Published var transferItems: [MacTransferListItem] = []
+    @Published var launchAtLoginEnabled = MacLaunchAtLoginController.isEnabled
+    @Published var launchAtLoginStatus = MacLaunchAtLoginController.statusText
 
     private var started = false
     private var server: VibeDropMacServer?
@@ -102,6 +104,8 @@ final class MacNativeAppModel: ObservableObject {
 
     func refresh() {
         isAccessibilityTrusted = MacKeyboardInputService().isAccessibilityTrusted
+        launchAtLoginEnabled = MacLaunchAtLoginController.isEnabled
+        launchAtLoginStatus = MacLaunchAtLoginController.statusText
         connectedClients = server?.connectedClientSnapshots ?? []
         pendingPairRequests = pairManager?.pendingRequests() ?? []
         if selectedSessionId == nil || !connectedClients.contains(where: { $0.peer.sessionId == selectedSessionId }) {
@@ -190,6 +194,21 @@ final class MacNativeAppModel: ObservableObject {
             return
         }
         NSWorkspace.shared.open(url)
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) {
+        do {
+            try MacLaunchAtLoginController.setEnabled(enabled)
+            refresh()
+        } catch {
+            launchAtLoginEnabled = MacLaunchAtLoginController.isEnabled
+            launchAtLoginStatus = MacLaunchAtLoginController.statusText
+            serviceError = "开机启动设置失败：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+        }
+    }
+
+    func openLoginItemsSettings() {
+        MacLaunchAtLoginController.openSystemSettings()
     }
 
     func copyAddress() {
