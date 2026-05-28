@@ -239,6 +239,7 @@ fun VibeDropApp(container: AppContainer) {
                                 sizeBytes = result.sizeBytes,
                                 sourceUri = result.sourceUri,
                                 transferId = result.transferId,
+                                savedPath = result.savedPath,
                                 saveTarget = saveTarget
                             )
                         }

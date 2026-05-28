@@ -16,7 +16,8 @@ data class ContentTransferResult(
     val mimeType: String,
     val sizeBytes: Long,
     val sourceUri: String?,
-    val transferId: String?
+    val transferId: String?,
+    val savedPath: String? = null
 )
 
 fun sendImageUriToMacClipboard(
@@ -54,7 +55,7 @@ fun sendImageUriToMacClipboard(
     )
 }
 
-fun sendUriToDesktopInbox(
+suspend fun sendUriToDesktopInbox(
     context: Context,
     uri: Uri,
     controller: DesktopConnectionController
@@ -65,30 +66,39 @@ fun sendUriToDesktopInbox(
     }
 
     val transferId = "native-${UUID.randomUUID()}"
+    controller.trackIncomingFileAck(transferId)
     if (!controller.sendIncomingFileStart(transferId, meta.fileName, meta.mimeType, meta.sizeBytes)) {
+        controller.cancelIncomingFileAck(transferId)
         throw IllegalStateException("连接不可用")
     }
 
-    context.contentResolver.openInputStream(uri)?.use { input ->
-        val buffer = ByteArray(FILE_CHUNK_BYTES)
-        while (true) {
-            val read = input.read(buffer)
-            if (read <= 0) break
-            val chunk = if (read == buffer.size) buffer else buffer.copyOf(read)
-            val base64 = Base64.encodeToString(chunk, Base64.NO_WRAP)
-            if (!controller.sendIncomingFileChunk(transferId, base64)) {
-                throw IllegalStateException("发送分片失败")
+    try {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val buffer = ByteArray(FILE_CHUNK_BYTES)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                val chunk = if (read == buffer.size) buffer else buffer.copyOf(read)
+                val base64 = Base64.encodeToString(chunk, Base64.NO_WRAP)
+                if (!controller.sendIncomingFileChunk(transferId, base64)) {
+                    throw IllegalStateException("发送分片失败")
+                }
             }
-        }
-    } ?: throw IllegalStateException("无法读取文件")
+        } ?: throw IllegalStateException("无法读取文件")
 
-    if (!controller.sendIncomingFileComplete(transferId)) {
-        throw IllegalStateException("发送完成消息失败")
+        if (!controller.sendIncomingFileComplete(transferId)) {
+            throw IllegalStateException("发送完成消息失败")
+        }
+        val ack = controller.awaitIncomingFileAck(transferId)
+        return meta.copy(
+            sourceUri = uri.toString(),
+            transferId = transferId,
+            savedPath = ack.savedPath
+        )
+    } catch (error: Exception) {
+        controller.cancelIncomingFileAck(transferId)
+        throw error
     }
-    return meta.copy(
-        sourceUri = uri.toString(),
-        transferId = transferId
-    )
 }
 
 private fun Context.queryContentMeta(

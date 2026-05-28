@@ -26,7 +26,7 @@
 6. 设置页点击“扫描”会寻找当前局域网里的旧 Mac Tauri 服务；点击“配对”后 Mac 会弹出确认码，批准后原生 Android 自动保存 PIN 和连接信息。
 7. App 运行后会启动 `ClipboardSyncService`，从 Room 读取已保存 Mac，建立后台 WebSocket，收到 `clipboard` 消息后写入 Android 剪贴板；后台直接写入失败时会启动 1x1 透明 Activity 兜底。设置页会显示本机身份、网络能力、VPN 状态、局域网地址、通知权限、电池优化、闲置应用管理、已保存 Mac 状态和最近连接错误。
 8. 设置页可以配置 Home Vault 地址，点击“同步到 Mac mini”会上传原生 Room 历史；payload 会带真实 Android 设备身份、历史主记录和媒体 item/缩略图字段。
-9. 发送页“传图到剪贴板”使用 Android 图片选择器读取图片并发送 `image_clipboard`；“传到收件箱”使用系统文件选择器读取 URI 并按 192KiB 分片发送 `incoming_file_start/chunk/complete`。
+9. 发送页“传图到剪贴板”使用 Android 图片选择器读取图片并发送 `image_clipboard`；“传到收件箱”使用系统文件选择器读取 URI 并按 192KiB 分片发送 `incoming_file_start/chunk/complete`，并等待 Mac 返回 `incoming_file_saved` 后才写成功历史。
 10. Mac 拖拽/分享发送到原生 Android 时，`DesktopConnectionController` 会接收 `incoming_history_session_start` 与 `incoming_file_start/chunk/complete`，`IncomingFileReceiver` 写入临时文件、校验大小、保存到 MediaStore，并按会话写入 Room 聚合历史。
 11. 设置页支持图片/视频历史打开策略：系统默认、相册、浏览器或每次询问；历史媒体 item 点击后会通过 Android `ACTION_VIEW` 和 FileProvider/MediaStore URI 打开。历史页支持发送端和接收端分离筛选，候选项显示数量并按数量排序。
 12. 设置页连接诊断卡支持直接编辑或删除已保存 Mac；编辑保留原设备 ID，只更新显示名、host、端口和 PIN，删除不会清空历史记录。

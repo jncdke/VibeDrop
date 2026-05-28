@@ -14,6 +14,8 @@ import com.vibedrop.mobile.nativeapp.protocol.VibeDropActions
 import com.vibedrop.mobile.nativeapp.platform.DiagnosticLogStore
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileReceiver
 import com.vibedrop.mobile.nativeapp.platform.IncomingFileResult
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -21,7 +23,13 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
 import kotlin.math.min
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+
+data class IncomingFileAck(
+    val transferId: String,
+    val savedPath: String?
+)
 
 class DesktopConnectionController(
     private val device: DesktopDevice,
@@ -42,6 +50,7 @@ class DesktopConnectionController(
     @Volatile private var connectionToken = 0L
     private var reconnectAttempt = 0
     private var reconnectRunnable: Runnable? = null
+    private val pendingIncomingFileAcks = ConcurrentHashMap<String, CompletableDeferred<IncomingFileAck>>()
 
     var connection by mutableStateOf(device.connection)
         private set
@@ -209,11 +218,35 @@ class DesktopConnectionController(
         return accepted
     }
 
+    fun trackIncomingFileAck(transferId: String) {
+        pendingIncomingFileAcks[transferId] = CompletableDeferred()
+    }
+
+    suspend fun awaitIncomingFileAck(
+        transferId: String,
+        timeoutMillis: Long = 30_000L
+    ): IncomingFileAck {
+        val deferred = pendingIncomingFileAcks[transferId]
+            ?: CompletableDeferred<IncomingFileAck>().also { pendingIncomingFileAcks[transferId] = it }
+        return try {
+            withTimeout(timeoutMillis) {
+                deferred.await()
+            }
+        } finally {
+            pendingIncomingFileAcks.remove(transferId)
+        }
+    }
+
+    fun cancelIncomingFileAck(transferId: String) {
+        pendingIncomingFileAcks.remove(transferId)?.cancel()
+    }
+
     fun close() {
         manuallyClosed = true
         log("manual_close", endpointDetail())
         connectionToken += 1
         cancelScheduledReconnect()
+        failPendingIncomingFileAcks("连接已关闭")
         socket?.close(1000, "dispose")
         socket = null
         update(ConnectionSnapshot(ConnectionStatus.Disconnected))
@@ -244,7 +277,28 @@ class DesktopConnectionController(
             action == VibeDropActions.IncomingFileStart -> handleIncomingFileMessage(webSocket, objectValue)
             action == VibeDropActions.IncomingFileChunk -> handleIncomingFileMessage(webSocket, objectValue)
             action == VibeDropActions.IncomingFileComplete -> handleIncomingFileMessage(webSocket, objectValue)
+            action == VibeDropActions.IncomingFileSaved -> completeIncomingFileAck(objectValue)
+            action == VibeDropActions.IncomingFileError -> failIncomingFileAck(objectValue)
         }
+    }
+
+    private fun completeIncomingFileAck(payload: JSONObject) {
+        val transferId = payload.optString("transfer_id")
+        if (transferId.isBlank()) return
+        val ack = IncomingFileAck(
+            transferId = transferId,
+            savedPath = payload.optString("saved_path").takeIf { it.isNotBlank() }
+        )
+        pendingIncomingFileAcks.remove(transferId)?.complete(ack)
+        log("send_file_saved", endpointDetail().put("transferId", transferId))
+    }
+
+    private fun failIncomingFileAck(payload: JSONObject) {
+        val transferId = payload.optString("transfer_id")
+        if (transferId.isBlank()) return
+        val message = payload.optString("error").ifBlank { "Mac 保存文件失败" }
+        pendingIncomingFileAcks.remove(transferId)?.completeExceptionally(IllegalStateException(message))
+        log("send_file_error", endpointDetail().put("transferId", transferId).put("error", message))
     }
 
     private fun handleIncomingFileMessage(webSocket: WebSocket, payload: JSONObject) {
@@ -287,6 +341,7 @@ class DesktopConnectionController(
             update(ConnectionSnapshot(ConnectionStatus.Disconnected, reason))
             return
         }
+        failPendingIncomingFileAcks(reason)
         reconnectAttempt += 1
         val delayMillis = reconnectDelayMillis(reconnectAttempt)
         log(
@@ -316,6 +371,14 @@ class DesktopConnectionController(
     private fun cancelScheduledReconnect() {
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         reconnectRunnable = null
+    }
+
+    private fun failPendingIncomingFileAcks(reason: String) {
+        val error = IllegalStateException(reason)
+        pendingIncomingFileAcks.values.forEach { deferred ->
+            deferred.completeExceptionally(error)
+        }
+        pendingIncomingFileAcks.clear()
     }
 
     private fun reconnectDelayMillis(attempt: Int): Long {

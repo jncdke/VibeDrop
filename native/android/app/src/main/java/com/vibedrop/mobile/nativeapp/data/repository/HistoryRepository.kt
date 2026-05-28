@@ -85,6 +85,7 @@ class HistoryRepository(
         sizeBytes: Long,
         sourceUri: String?,
         transferId: String?,
+        savedPath: String?,
         saveTarget: String,
         status: String = "success"
     ) {
@@ -117,7 +118,7 @@ class HistoryRepository(
             mimeType = mimeType,
             sizeBytes = sizeBytes.takeIf { it >= 0L },
             localPath = sourceUri,
-            savedPath = null,
+            savedPath = savedPath,
             thumbnailPath = null,
             thumbnailDataUrl = null,
             status = status,
