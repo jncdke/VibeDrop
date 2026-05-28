@@ -26,6 +26,32 @@ DEFAULT_VIEWER_IP_URL = "http://192.168.3.2:8787/viewer/"
 DEFAULT_VIEWER_URL = DEFAULT_VIEWER_IP_URL
 LOCAL_VIEWER_URL = "http://localhost:8787/viewer/"
 OBJECT_BUCKETS = [f"{i:02x}" for i in range(256)]
+DEVICE_CANONICALS = [
+    {
+        "id": "desktop-19ceff532e716596",
+        "name": "overlorddeMacBook-Air-4.local",
+        "host": "overlorddeMacBook-Air-4.local",
+        "server_id": "desktop-19ceff532e716596",
+        "aliases": {
+            "MacBook",
+            "macbook",
+            "overlorddeMacBook-Air.local",
+            "overlorddeMacBook-Air-4.local",
+            "desktop-19ceff532e716596",
+        },
+    },
+    {
+        "id": "client_mmr92alsud0nu7",
+        "name": "一加 Ace 5",
+        "host": "",
+        "server_id": "",
+        "aliases": {
+            "一加 Ace 5",
+            "client_mmr92alsud0nu7",
+            "未知发送端",
+        },
+    },
+]
 
 
 def iso_now() -> str:
@@ -160,6 +186,25 @@ def clean_label(value: Any) -> str:
     return str(value or "").strip()
 
 
+def canonicalize_device(device: dict[str, str], *, role: str = "") -> dict[str, str]:
+    labels = {
+        clean_label(device.get("id")),
+        clean_label(device.get("name")),
+        clean_label(device.get("host")),
+        clean_label(device.get("server_id")),
+    }
+    labels.discard("")
+    for canonical in DEVICE_CANONICALS:
+        if labels & canonical["aliases"]:
+            next_device = dict(device)
+            next_device["id"] = canonical["id"]
+            next_device["name"] = canonical["name"]
+            next_device["host"] = canonical["host"] or next_device.get("host", "")
+            next_device["server_id"] = canonical["server_id"] or next_device.get("server_id", "")
+            return next_device
+    return device
+
+
 def source_receiver_device(source: str) -> dict[str, str]:
     source = str(source or "")
     if source.startswith("macbook:"):
@@ -191,6 +236,8 @@ def derive_device_roles(entry: dict[str, Any], source: str = "") -> dict[str, st
     else:
         sender = client
         receiver = target if target["name"] or target["id"] else source_receiver
+    sender = canonicalize_device(sender, role="sender")
+    receiver = canonicalize_device(receiver, role="receiver")
 
     return {
         "sender_id": sender.get("id", ""),
@@ -1078,26 +1125,61 @@ def backfill_device_roles(conn: sqlite3.Connection) -> None:
         )
 
 
-def canonicalize_receiver_names(conn: sqlite3.Connection) -> None:
+def canonicalize_device_roles(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """
-        SELECT receiver_server_id,
-               MAX(NULLIF(receiver_host, '')) AS preferred_host
+        SELECT entry_id, sender_id, sender_name, receiver_id, receiver_name,
+               receiver_host, receiver_server_id
         FROM history_entries
-        WHERE COALESCE(receiver_server_id, '') != ''
-        GROUP BY receiver_server_id
         """
     ).fetchall()
-    for server_id, preferred_host in rows:
-        if not preferred_host:
-            continue
+    for (
+        entry_id,
+        sender_id,
+        sender_name,
+        receiver_id,
+        receiver_name,
+        receiver_host,
+        receiver_server_id,
+    ) in rows:
+        sender = canonicalize_device(
+            {
+                "id": sender_id or "",
+                "name": sender_name or "",
+                "host": "",
+                "server_id": "",
+            },
+            role="sender",
+        )
+        receiver = canonicalize_device(
+            {
+                "id": receiver_id or "",
+                "name": receiver_name or "",
+                "host": receiver_host or "",
+                "server_id": receiver_server_id or "",
+            },
+            role="receiver",
+        )
         conn.execute(
             """
             UPDATE history_entries
-            SET receiver_name = ?
-            WHERE receiver_server_id = ?
+            SET sender_id = ?,
+                sender_name = ?,
+                receiver_id = ?,
+                receiver_name = ?,
+                receiver_host = ?,
+                receiver_server_id = ?
+            WHERE entry_id = ?
             """,
-            (preferred_host, server_id),
+            (
+                sender.get("id", ""),
+                sender.get("name", ""),
+                receiver.get("id", ""),
+                receiver.get("name", ""),
+                receiver.get("host", ""),
+                receiver.get("server_id", ""),
+                entry_id,
+            ),
         )
 
 
@@ -1235,7 +1317,7 @@ def main() -> int:
         for key, value in current_counts.items():
             counts[key] += value
     backfill_device_roles(conn)
-    canonicalize_receiver_names(conn)
+    canonicalize_device_roles(conn)
 
     report = build_report(conn, snapshot_id, args, source_stats, android_status, counts)
     conn.execute(

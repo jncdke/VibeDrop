@@ -49,7 +49,7 @@ VibeDropVault/
 
 媒体对象路径由文件内容决定：`objects/<sha256 前两位>/<sha256><原扩展名>`。这和 Apple Photos 用固定分桶降低单目录压力的思路类似，但这里用完整内容哈希做去重和校验，比按 UUID 首字符更适合备份与同步。
 
-SQLite 保存四类核心索引：`history_entries` 保存历史记录，`media_objects` 保存去重文件对象，`history_media` 保存历史和媒体对象的关联，`snapshots/snapshot_entries/source_files` 保存每次同步的可追溯状态。`history_entries` 还保存规范化的 `sender_id/sender_name/receiver_id/receiver_name/receiver_host/receiver_server_id`，用于区分多个手机发送端和多台 Mac 接收端。
+SQLite 保存四类核心索引：`history_entries` 保存历史记录，`media_objects` 保存去重文件对象，`history_media` 保存历史和媒体对象的关联，`snapshots/snapshot_entries/source_files` 保存每次同步的可追溯状态。`history_entries` 还保存规范化的 `sender_id/sender_name/receiver_id/receiver_name/receiver_host/receiver_server_id`，用于区分多个手机发送端和多台 Mac 接收端。同一物理设备的历史别名需要归并，例如 `MacBook`、`overlorddeMacBook-Air.local`、`overlorddeMacBook-Air-4.local`、`desktop-19ceff532e716596` 统一为 `overlorddeMacBook-Air-4.local`；已确认的旧 `未知发送端` 统一为 `一加 Ace 5`。
 
 ## 查看器入口
 
