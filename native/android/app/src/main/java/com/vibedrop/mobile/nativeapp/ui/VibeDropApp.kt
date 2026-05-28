@@ -123,7 +123,7 @@ fun VibeDropApp(container: AppContainer) {
     var videoOpenMode by rememberSaveable { mutableStateOf(container.mediaOpenPreferences.loadVideoMode()) }
     var pendingExportJson by remember { mutableStateOf<String?>(null) }
     val devices by container.deviceRepository.observeDevices().collectAsState(initial = emptyList())
-    val history by container.historyRepository.observeRecentWithItems(limit = 1000).collectAsState(initial = emptyList())
+    val history by container.historyRepository.observeAllWithItems().collectAsState(initial = emptyList())
     val hostActivity = context as? MainActivity
     val sharedPayloadState = hostActivity?.sharedPayload?.collectAsState(initial = null)
     val sharedPayload = sharedPayloadState?.value

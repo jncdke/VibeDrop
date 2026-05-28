@@ -38,6 +38,21 @@ class HistoryRepository(
         }
     }
 
+    fun observeAllWithItems(): Flow<List<HistoryEntryWithItems>> {
+        return combine(
+            historyDao.observeAllEntries(),
+            historyDao.observeAllItems()
+        ) { entries, items ->
+            val itemsByEntryId = items.groupBy { it.entryId }
+            entries.map { entry ->
+                HistoryEntryWithItems(
+                    entry = entry,
+                    items = itemsByEntryId[entry.id].orEmpty()
+                )
+            }
+        }
+    }
+
     suspend fun loadAllEntries(): List<HistoryEntryEntity> = historyDao.getAllEntries()
 
     suspend fun loadAllEntriesWithItems(): List<HistoryEntryWithItems> {
