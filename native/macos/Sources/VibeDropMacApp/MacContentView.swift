@@ -601,7 +601,11 @@ private struct HistoryView: View {
                 } else {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(filteredEntries, id: \.id) { entry in
-                            HistoryRow(entry: entry, onPreviewItem: { previewItem = $0 })
+                            HistoryRow(
+                                entry: entry,
+                                onPreviewItem: { previewItem = $0 },
+                                onOpenItems: { openHistoryItems($0) }
+                            )
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
@@ -781,6 +785,14 @@ private struct MacHistoryHeatmap: View {
 private struct HistoryRow: View {
     let entry: HistoryEntry
     var onPreviewItem: (HistoryItem) -> Void = { _ in }
+    var onOpenItems: ([HistoryItem]) -> Void = { _ in }
+
+    private var openableItems: [HistoryItem] {
+        entry.items.filter { item in
+            guard let path = historyItemOpenPath(item) else { return false }
+            return FileManager.default.fileExists(atPath: path)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -803,6 +815,12 @@ private struct HistoryRow: View {
                     }
                 }
                 Spacer()
+                if !openableItems.isEmpty {
+                    Button(openableItems.count > 1 ? "打开全部" : "系统打开") {
+                        onOpenItems(openableItems)
+                    }
+                    .buttonStyle(.bordered)
+                }
             }
             if !entry.items.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -1185,6 +1203,19 @@ private func historyItemOpenPath(_ item: HistoryItem) -> String? {
     [item.localPath, item.savedPath]
         .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
         .first { !$0.isEmpty }
+}
+
+private func openHistoryItems(_ items: [HistoryItem]) {
+    let urls = items.compactMap { item -> URL? in
+        guard let path = historyItemOpenPath(item),
+              FileManager.default.fileExists(atPath: path) else {
+            return nil
+        }
+        return URL(fileURLWithPath: path)
+    }
+    for url in urls {
+        NSWorkspace.shared.open(url)
+    }
 }
 
 private func decodeDataURLImage(_ value: String) -> NSImage? {
