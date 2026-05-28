@@ -827,6 +827,7 @@ private fun HistoryScreen(
     var selectedStatus by rememberSaveable { mutableStateOf("all") }
     var selectedParticipant by rememberSaveable { mutableStateOf("all") }
     var selectedTime by rememberSaveable { mutableStateOf(HistoryTimeFilter.All) }
+    var dayWindowOffset by rememberSaveable { mutableIntStateOf(0) }
     var selectedHour by remember { mutableStateOf<HeatmapSelection?>(null) }
     val now = remember(entries.size) { System.currentTimeMillis() }
     val participantFilters = remember(entries) { buildHistoryParticipantFilters(entries) }
@@ -850,7 +851,9 @@ private fun HistoryScreen(
             .filter { it.entry.matchesTimeFilter(selectedTime, now) }
             .toList()
     }
-    val visibleDays = remember(baseFiltered, now) { buildVisibleDays(baseFiltered, now) }
+    val visibleDays = remember(baseFiltered, now, dayWindowOffset) {
+        buildVisibleDays(baseFiltered, now, dayWindowOffset)
+    }
     val heatmapCounts = remember(baseFiltered, visibleDays) {
         buildHeatmapCounts(baseFiltered, visibleDays)
     }
@@ -923,18 +926,22 @@ private fun HistoryScreen(
                     ) {
                         HistoryFilterButton("全部时间", selectedTime == HistoryTimeFilter.All) {
                             selectedTime = HistoryTimeFilter.All
+                            dayWindowOffset = 0
                             selectedHour = null
                         }
                         HistoryFilterButton("今天", selectedTime == HistoryTimeFilter.Today) {
                             selectedTime = HistoryTimeFilter.Today
+                            dayWindowOffset = 0
                             selectedHour = null
                         }
                         HistoryFilterButton("近7天", selectedTime == HistoryTimeFilter.Last7Days) {
                             selectedTime = HistoryTimeFilter.Last7Days
+                            dayWindowOffset = 0
                             selectedHour = null
                         }
                         HistoryFilterButton("近30天", selectedTime == HistoryTimeFilter.Last30Days) {
                             selectedTime = HistoryTimeFilter.Last30Days
+                            dayWindowOffset = 0
                             selectedHour = null
                         }
                     }
@@ -945,6 +952,7 @@ private fun HistoryScreen(
                         historyTypeFilters.forEach { filter ->
                             HistoryFilterButton(filter.label, selectedType == filter.kind) {
                                 selectedType = filter.kind
+                                dayWindowOffset = 0
                                 selectedHour = null
                             }
                         }
@@ -956,6 +964,7 @@ private fun HistoryScreen(
                         historyStatusFilters.forEach { filter ->
                             HistoryFilterButton(filter.label, selectedStatus == filter.status) {
                                 selectedStatus = filter.status
+                                dayWindowOffset = 0
                                 selectedHour = null
                             }
                         }
@@ -967,6 +976,7 @@ private fun HistoryScreen(
                         participantFilters.forEach { filter ->
                             HistoryFilterButton(filter.label, selectedParticipant == filter.key) {
                                 selectedParticipant = filter.key
+                                dayWindowOffset = 0
                                 selectedHour = null
                             }
                         }
@@ -998,9 +1008,36 @@ private fun HistoryScreen(
                                 fontSize = 14.sp
                             )
                         }
-                        if (selectedHour != null) {
-                            OutlinedButton(onClick = { selectedHour = null }) {
-                                Text("清除小时")
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    dayWindowOffset += 5
+                                    selectedHour = null
+                                }
+                            ) {
+                                Text("更早")
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    dayWindowOffset = (dayWindowOffset - 5).coerceAtLeast(0)
+                                    selectedHour = null
+                                },
+                                enabled = dayWindowOffset > 0
+                            ) {
+                                Text("更近")
+                            }
+                            if (dayWindowOffset > 0 || selectedHour != null) {
+                                OutlinedButton(
+                                    onClick = {
+                                        dayWindowOffset = 0
+                                        selectedHour = null
+                                    }
+                                ) {
+                                    Text("回到最近")
+                                }
                             }
                         }
                     }
@@ -2067,10 +2104,11 @@ private fun HistoryEntryEntity.matchesTimeFilter(
 
 private fun buildVisibleDays(
     entries: List<HistoryEntryWithItems>,
-    now: Long
+    now: Long,
+    dayWindowOffset: Int
 ): List<Long> {
     val anchor = entries.maxOfOrNull { it.entry.timestampMillis } ?: now
-    val end = startOfDay(anchor)
+    val end = startOfDay(anchor) - dayWindowOffset.toLong().coerceAtLeast(0L) * DAY_MILLIS
     return (4 downTo 0).map { end - it * DAY_MILLIS }
 }
 
