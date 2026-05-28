@@ -1,13 +1,13 @@
 # VibeDrop native Android
 
-这是 Android 原生重构入口，目标技术栈是 Kotlin + Jetpack Compose + Room + OkHttp。当前阶段先建立可编译骨架、复刻发送页结构、沉淀协议与本地数据模型，并逐项补齐真实 WebSocket、发现、配对、文件传输、后台剪贴板和 Home Vault。
+这是 Android 原生重构入口，目标技术栈是 Kotlin + Jetpack Compose + Room + OkHttp。当前阶段已经从骨架推进到主功能闭环：发送页、历史页、设置页、真实 WebSocket、发现、配对、文件传输、后台剪贴板、Home Vault、系统分享、媒体预览、诊断和 release 覆盖升级路径都已接入。
 
 ## 设计约束
 
 1. release `applicationId` 保持 `com.vibedrop.mobile`，用于未来覆盖升级并读取旧 app 私有历史。
 2. debug 使用 `.nativepreview` 后缀，便于和当前 Tauri 版并排安装测试。
 3. UI 先复刻当前发送页肌肉记忆，连接逻辑后接入，不先重做设计。
-4. Room schema 先覆盖设备、历史主表、历史 item，迁移器后续读取旧 `history.json`。
+4. Room schema 覆盖设备、历史主表和历史 item；release 覆盖安装时迁移器读取旧 `history.json`。
 5. 当前已接入手动 Mac 配置、Room 历史列表、旧 `history.json` 一次性迁移、v1 文本发送和剪贴板直发兜底。
 6. 当前已接入 UDP 广播发现、已知设备 `/discover` 校验、Mac 端配对请求和状态轮询。
 7. 当前已接入前台服务版后台剪贴板同步，使用 v1 `clipboard_sync` 角色接收 Mac 剪贴板。
