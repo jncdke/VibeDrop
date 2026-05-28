@@ -454,7 +454,7 @@ fun VibeDropApp(container: AppContainer) {
                 )
             }
             BottomNav(
-                selectedTab = selectedTab.coerceAtMost(1),
+                selectedTab = if (selectedTab <= 1) selectedTab else -1,
                 onSelect = { selectedTab = it }
             )
         }
