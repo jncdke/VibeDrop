@@ -10,6 +10,12 @@ interface HistoryDao {
     @Query("SELECT * FROM history_entries ORDER BY timestampMillis DESC LIMIT :limit OFFSET :offset")
     fun observeRecent(limit: Int, offset: Int = 0): Flow<List<HistoryEntryEntity>>
 
+    @Query("SELECT * FROM history_entries ORDER BY timestampMillis DESC LIMIT :limit OFFSET :offset")
+    suspend fun getRecent(limit: Int, offset: Int = 0): List<HistoryEntryEntity>
+
+    @Query("SELECT * FROM history_entries WHERE id = :id LIMIT 1")
+    suspend fun findEntry(id: String): HistoryEntryEntity?
+
     @Query("SELECT COUNT(*) FROM history_entries")
     suspend fun countEntries(): Int
 

@@ -72,11 +72,11 @@ class DesktopConnectionController(
 
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                     webSocket.close(code, reason)
-                    update(ConnectionSnapshot(ConnectionStatus.Disconnected, reason.ifBlank { null }))
+                    update(ConnectionSnapshot(ConnectionStatus.Disconnected, reason.takeIf { it.isNotBlank() }))
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    update(ConnectionSnapshot(ConnectionStatus.Disconnected, reason.ifBlank { null }))
+                    update(ConnectionSnapshot(ConnectionStatus.Disconnected, reason.takeIf { it.isNotBlank() }))
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {

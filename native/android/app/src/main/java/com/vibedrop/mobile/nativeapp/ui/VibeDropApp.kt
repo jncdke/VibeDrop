@@ -1,9 +1,11 @@
 package com.vibedrop.mobile.nativeapp.ui
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -26,10 +28,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -38,30 +44,55 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import android.widget.Toast
 import com.vibedrop.mobile.nativeapp.core.model.ConnectionSnapshot
 import com.vibedrop.mobile.nativeapp.core.model.ConnectionStatus
 import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
+import com.vibedrop.mobile.nativeapp.data.AppContainer
+import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
 import com.vibedrop.mobile.nativeapp.network.DesktopConnectionController
 import com.vibedrop.mobile.nativeapp.platform.readClipboardText
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @Composable
-fun VibeDropApp() {
+fun VibeDropApp(container: AppContainer) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
-    val devices = remember { previewDevices() }
-    val controllers = remember {
-        devices.associateWith {
-            DesktopConnectionController(
-                device = it,
-                clientId = "native_android_preview",
-                clientName = "VibeDrop Native Preview"
-            )
+    val devices by container.deviceRepository.observeDevices().collectAsState(initial = emptyList())
+    val history by container.historyRepository.observeRecent().collectAsState(initial = emptyList())
+    val controllers = remember(devices) {
+        devices.associateBy(
+            keySelector = { it.id },
+            valueTransform = {
+                DesktopConnectionController(
+                    device = it,
+                    clientId = "native_android_preview",
+                    clientName = "VibeDrop Native Preview"
+                )
+            }
+        )
+    }
+
+    LaunchedEffect(Unit) {
+        val result = withContext(Dispatchers.IO) {
+            container.legacyHistoryImporter.importIfNeeded()
+        }
+        if (result.error != null) {
+            Toast.makeText(context, "旧历史迁移失败：${result.error}", Toast.LENGTH_LONG).show()
+        } else if (result.imported > 0) {
+            Toast.makeText(context, "已迁移旧历史 ${result.imported} 条", Toast.LENGTH_SHORT).show()
         }
     }
 
-    DisposableEffect(Unit) {
+    DisposableEffect(controllers) {
         controllers.values.forEach { it.connect() }
         onDispose {
             controllers.values.forEach { it.close() }
@@ -73,16 +104,38 @@ fun VibeDropApp() {
         color = Color(0xFFF4F8FC)
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            Header()
+            Header(onSettings = { selectedTab = 2 })
             when (selectedTab) {
                 0 -> SendScreen(
+                    devices = devices,
                     controllers = controllers,
+                    onOpenSettings = { selectedTab = 2 },
+                    onRecordSentText = { device, text, pressEnter ->
+                        scope.launch(Dispatchers.IO) {
+                            container.historyRepository.recordSentText(device, text, pressEnter)
+                        }
+                    },
                     modifier = Modifier.weight(1f)
                 )
-                else -> HistoryPlaceholder(modifier = Modifier.weight(1f))
+                1 -> HistoryScreen(
+                    entries = history,
+                    modifier = Modifier.weight(1f)
+                )
+                else -> SettingsScreen(
+                    onSaveDevice = { name, host, port, pin ->
+                        scope.launch(Dispatchers.IO) {
+                            container.deviceRepository.saveManualDesktop(name, host, port, pin)
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, "已保存 Mac：${name.ifBlank { host }}", Toast.LENGTH_SHORT).show()
+                                selectedTab = 0
+                            }
+                        }
+                    },
+                    modifier = Modifier.weight(1f)
+                )
             }
             BottomNav(
-                selectedTab = selectedTab,
+                selectedTab = selectedTab.coerceAtMost(1),
                 onSelect = { selectedTab = it }
             )
         }
@@ -90,7 +143,7 @@ fun VibeDropApp() {
 }
 
 @Composable
-private fun Header() {
+private fun Header(onSettings: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -115,7 +168,7 @@ private fun Header() {
             fontWeight = FontWeight.ExtraBold,
             color = Color(0xFF111827)
         )
-        OutlinedButton(onClick = { }) {
+        OutlinedButton(onClick = onSettings) {
             Text("设置", fontWeight = FontWeight.Bold)
         }
     }
@@ -123,19 +176,30 @@ private fun Header() {
 
 @Composable
 private fun SendScreen(
-    controllers: Map<DesktopDevice, DesktopConnectionController>,
+    devices: List<DesktopDevice>,
+    controllers: Map<String, DesktopConnectionController>,
+    onOpenSettings: () -> Unit,
+    onRecordSentText: (DesktopDevice, String, Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val drafts = remember { mutableStateMapOf<String, String>() }
 
+    if (devices.isEmpty()) {
+        EmptyDeviceState(
+            modifier = modifier,
+            onOpenSettings = onOpenSettings
+        )
+        return
+    }
+
     LazyColumn(
         modifier = modifier.fillMaxWidth(),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(18.dp),
+        contentPadding = PaddingValues(18.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
-        items(controllers.keys.toList(), key = { it.id }) { device ->
-            val controller = controllers.getValue(device)
+        items(devices, key = { it.id }) { device ->
+            val controller = controllers.getValue(device.id)
             SendDeviceCard(
                 device = device,
                 connection = controller.connection,
@@ -150,6 +214,7 @@ private fun SendScreen(
                     }
                     if (controller.sendText(text, pressEnter)) {
                         drafts[device.id] = ""
+                        onRecordSentText(device, text, pressEnter)
                     } else {
                         Toast.makeText(context, "发送失败：连接不可用", Toast.LENGTH_SHORT).show()
                     }
@@ -160,6 +225,38 @@ private fun SendScreen(
                     }
                 }
             )
+        }
+    }
+}
+
+@Composable
+private fun EmptyDeviceState(
+    modifier: Modifier,
+    onOpenSettings: () -> Unit
+) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = "还没有保存的 Mac",
+                color = Color(0xFF111827),
+                fontSize = 22.sp,
+                fontWeight = FontWeight.ExtraBold
+            )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = "先在设置里填入 Mac 的 host、端口和 PIN。",
+                color = Color(0xFF667085),
+                fontSize = 15.sp
+            )
+            Spacer(Modifier.height(18.dp))
+            Button(onClick = onOpenSettings) {
+                Text("去设置")
+            }
         }
     }
 }
@@ -195,12 +292,23 @@ private fun SendDeviceCard(
                         .padding(start = 12.dp),
                     color = Color(0xFF111827),
                     fontWeight = FontWeight.ExtraBold,
-                    fontSize = 20.sp
+                    fontSize = 20.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
                 Text(
                     text = statusLabel(connection.status),
                     color = Color(0xFF667085),
                     fontSize = 15.sp
+                )
+            }
+
+            if (!connection.lastError.isNullOrBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = connection.lastError,
+                    color = Color(0xFFE5484D),
+                    fontSize = 13.sp
                 )
             }
 
@@ -273,18 +381,180 @@ private fun SendDeviceCard(
 }
 
 @Composable
-private fun HistoryPlaceholder(modifier: Modifier = Modifier) {
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(24.dp),
-        contentAlignment = Alignment.Center
+private fun HistoryScreen(
+    entries: List<HistoryEntryEntity>,
+    modifier: Modifier = Modifier
+) {
+    LazyColumn(
+        modifier = modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(18.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text(
-            text = "历史页原生实现将在 Room 迁移后接入",
-            color = Color(0xFF667085),
-            fontSize = 17.sp
-        )
+        item {
+            Text(
+                text = "历史",
+                fontSize = 28.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color(0xFF111827)
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "当前原生库 ${entries.size} 条最近记录",
+                fontSize = 15.sp,
+                color = Color(0xFF667085)
+            )
+        }
+        if (entries.isEmpty()) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White)
+                ) {
+                    Text(
+                        text = "暂无历史记录。发送成功后会写入 Room 数据库。",
+                        modifier = Modifier.padding(18.dp),
+                        color = Color(0xFF667085)
+                    )
+                }
+            }
+        }
+        items(entries, key = { it.id }) { entry ->
+            HistoryCard(entry)
+        }
+    }
+}
+
+@Composable
+private fun HistoryCard(entry: HistoryEntryEntity) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = formatTime(entry.timestampMillis),
+                color = Color(0xFF667085),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.height(5.dp))
+            Text(
+                text = entry.text.orEmpty().ifBlank { kindLabel(entry.kind) },
+                color = Color(0xFF111827),
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                HistoryChip(kindLabel(entry.kind))
+                HistoryChip(entry.status)
+                entry.receiverName?.takeIf { it.isNotBlank() }?.let { HistoryChip(it) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryChip(text: String) {
+    Text(
+        text = text,
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(Color(0xFFEFF4FA))
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+        color = Color(0xFF526174),
+        fontSize = 12.sp,
+        fontWeight = FontWeight.Bold,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
+    )
+}
+
+@Composable
+private fun SettingsScreen(
+    onSaveDevice: (name: String, host: String, port: Int, pin: String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var name by rememberSaveable { mutableStateOf("MacBook") }
+    var host by rememberSaveable { mutableStateOf("overlorddeMacBook-Air-4.local") }
+    var portText by rememberSaveable { mutableStateOf("9001") }
+    var pin by rememberSaveable { mutableStateOf("1234") }
+    val context = LocalContext.current
+
+    LazyColumn(
+        modifier = modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(18.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item {
+            Text(
+                text = "设置",
+                fontSize = 28.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color(0xFF111827)
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "当前阶段先支持手动保存 Mac。后续会接入 UDP/HTTP 发现和配对。",
+                color = Color(0xFF667085),
+                fontSize = 15.sp
+            )
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text("手动 Mac", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        label = { Text("显示名称") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = host,
+                        onValueChange = { host = it },
+                        label = { Text("Host 或 IP") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = portText,
+                        onValueChange = { portText = it.filter(Char::isDigit).take(5) },
+                        label = { Text("端口") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = pin,
+                        onValueChange = { pin = it },
+                        label = { Text("PIN") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Button(
+                        onClick = {
+                            val port = portText.toIntOrNull()
+                            if (host.isBlank() || pin.isBlank() || port == null) {
+                                Toast.makeText(context, "Host、端口和 PIN 都要填写", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+                            onSaveDevice(name, host, port, pin)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(54.dp)
+                    ) {
+                        Text("保存 Mac", fontWeight = FontWeight.ExtraBold)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -339,25 +609,14 @@ private fun statusLabel(status: ConnectionStatus): String = when (status) {
     ConnectionStatus.Error -> "连接失败"
 }
 
-private fun previewDevices(): List<DesktopDevice> = listOf(
-    DesktopDevice(
-        id = "desktop_demo_macbook",
-        stableId = "desktop_demo_macbook",
-        displayName = "overlorddeMacBook-Air-4.local",
-        host = "overlorddeMacBook-Air-4.local",
-        ip = "192.168.3.10",
-        port = 9001,
-        pin = "1234",
-        connection = ConnectionSnapshot(ConnectionStatus.Connected)
-    ),
-    DesktopDevice(
-        id = "desktop_demo_macmini",
-        stableId = "desktop_demo_macmini",
-        displayName = "minideMac-mini.local",
-        host = "minideMac-mini.local",
-        ip = "192.168.3.2",
-        port = 9001,
-        pin = "1234",
-        connection = ConnectionSnapshot(ConnectionStatus.Connecting)
-    )
-)
+private fun kindLabel(kind: String): String = when (kind) {
+    "image" -> "图片"
+    "video" -> "视频"
+    "file" -> "文件"
+    "media" -> "媒体"
+    else -> "text"
+}
+
+private fun formatTime(timestampMillis: Long): String {
+    return SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.CHINA).format(Date(timestampMillis))
+}

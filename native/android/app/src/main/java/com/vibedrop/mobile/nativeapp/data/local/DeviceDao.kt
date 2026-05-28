@@ -13,6 +13,9 @@ interface DeviceDao {
     @Query("SELECT * FROM devices WHERE id = :id LIMIT 1")
     suspend fun findById(id: String): DeviceEntity?
 
+    @Query("SELECT COUNT(*) FROM devices")
+    suspend fun countDevices(): Int
+
     @Upsert
     suspend fun upsert(device: DeviceEntity)
 }
