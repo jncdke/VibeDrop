@@ -247,6 +247,22 @@ class DesktopConnectionController(
         return accepted
     }
 
+    fun sendIncomingFileError(
+        transferId: String,
+        error: String
+    ): Boolean {
+        if (!connection.canSend) return false
+        val accepted = socket?.send(
+            JSONObject()
+                .put("action", VibeDropActions.IncomingFileError)
+                .put("transfer_id", transferId)
+                .put("error", error)
+                .toString()
+        ) == true
+        log("send_file_error_notice", endpointDetail().put("transferId", transferId).put("error", error).put("accepted", accepted))
+        return accepted
+    }
+
     fun trackIncomingFileAck(transferId: String) {
         pendingIncomingFileAcks[transferId] = CompletableDeferred()
     }

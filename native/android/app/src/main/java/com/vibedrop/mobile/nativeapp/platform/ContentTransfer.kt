@@ -100,6 +100,7 @@ suspend fun sendUriToDesktopInbox(
         throw IllegalStateException("连接不可用")
     }
 
+    var completeSent = false
     try {
         onProgress(
             ContentTransferProgress(
@@ -139,6 +140,7 @@ suspend fun sendUriToDesktopInbox(
         if (!controller.sendIncomingFileComplete(transferId)) {
             throw IllegalStateException("发送完成消息失败")
         }
+        completeSent = true
         onProgress(
             ContentTransferProgress(
                 stage = ContentTransferStage.Saving,
@@ -162,6 +164,12 @@ suspend fun sendUriToDesktopInbox(
             savedPath = ack.savedPath
         )
     } catch (error: Exception) {
+        if (!completeSent) {
+            controller.sendIncomingFileError(
+                transferId = transferId,
+                error = error.message ?: "Android 发送文件失败"
+            )
+        }
         controller.cancelIncomingFileAck(transferId)
         throw error
     }
