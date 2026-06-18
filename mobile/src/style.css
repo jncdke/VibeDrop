@@ -359,7 +359,14 @@ img {
     box-shadow: 0 0 0 4px rgba(10, 132, 255, 0.1);
 }
 
-.home-vault-sync .primary-btn {
+.home-vault-sync-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 10px;
+}
+
+.home-vault-sync-actions .primary-btn,
+.home-vault-sync-actions .secondary-btn {
     margin-top: 0;
 }
 

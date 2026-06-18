@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -106,6 +107,113 @@ def run_sync(sync_script: pathlib.Path, vault_root: pathlib.Path, viewer_url: st
         raise RuntimeError(f"sync returned non-json output: {result.stdout[:500]}") from exc
 
 
+def load_json_file(path: pathlib.Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def find_latest_android_payload(
+    vault_root: pathlib.Path,
+    device_id: str = "",
+) -> tuple[dict[str, Any], pathlib.Path]:
+    android_inbox = vault_root / "inbox" / "android"
+    if not android_inbox.exists():
+        raise FileNotFoundError("Android inbox 不存在")
+
+    candidate_groups: list[list[pathlib.Path]] = []
+    if device_id:
+        candidate_groups.append(list((android_inbox / safe_segment(device_id)).glob("*.json")))
+    candidate_groups.append(list(android_inbox.glob("*/*.json")))
+
+    seen_paths: set[pathlib.Path] = set()
+    for candidates in candidate_groups:
+        unique_candidates = [path for path in candidates if path not in seen_paths]
+        seen_paths.update(unique_candidates)
+        unique_candidates.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+        for path in unique_candidates:
+            try:
+                payload = normalize_payload(load_json_file(path))
+            except Exception:
+                continue
+            return payload, path
+
+    raise FileNotFoundError("没有找到 Android 历史快照")
+
+
+def compact_history_item(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {"fileName": str(item)}
+    allowed_keys = (
+        "kind",
+        "fileName",
+        "mimeType",
+        "sizeBytes",
+        "saveTarget",
+        "durationMs",
+        "width",
+        "height",
+    )
+    return {key: item[key] for key in allowed_keys if item.get(key) not in (None, "")}
+
+
+def compact_history_entry(entry: Any) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        return {
+            "timestamp": iso_now(),
+            "text": str(entry),
+            "status": "success",
+            "kind": "text",
+        }
+
+    allowed_keys = (
+        "id",
+        "timestamp",
+        "timestamp_iso",
+        "text",
+        "status",
+        "target",
+        "targetHost",
+        "targetAlias",
+        "targetName",
+        "targetDeviceName",
+        "targetServerId",
+        "serverId",
+        "direction",
+        "kind",
+        "saveTarget",
+        "fileName",
+        "mimeType",
+        "itemCount",
+    )
+    result = {key: entry[key] for key in allowed_keys if entry.get(key) not in (None, "")}
+    items = entry.get("items")
+    if isinstance(items, list) and items:
+        compact_items = [compact_history_item(item) for item in items]
+        result["items"] = compact_items
+        result.setdefault("itemCount", len(compact_items))
+
+    result.setdefault("text", entry.get("fileName") or "")
+    result.setdefault("status", "success")
+    result.setdefault("kind", "text")
+    return result
+
+
+def clamp_limit(value: str, default: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return default
+    return min(parsed, maximum)
+
+
+def prepare_restore_history(history: list[Any], mode: str, limit: int) -> list[Any]:
+    selected = history[:limit] if limit else history
+    if mode == "full":
+        return selected
+    return [compact_history_entry(entry) for entry in selected]
+
+
 def make_handler(config: argparse.Namespace) -> type[BaseHTTPRequestHandler]:
     vault_root = pathlib.Path(config.vault_root).expanduser().resolve()
     sync_script = pathlib.Path(config.sync_script).expanduser().resolve()
@@ -135,19 +243,56 @@ def make_handler(config: argparse.Namespace) -> type[BaseHTTPRequestHandler]:
             self.send_json(204, {})
 
         def do_GET(self) -> None:
-            if self.path.rstrip("/") != "/health":
-                self.send_json(404, {"ok": False, "error": "not_found"})
+            parsed_path = urllib.parse.urlparse(self.path)
+            path = parsed_path.path.rstrip("/") or "/"
+            if path == "/health":
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "service": "vibedrop-home-vault-receiver",
+                        "vaultRoot": str(vault_root),
+                        "viewerUrl": viewer_url,
+                        "time": iso_now(),
+                    },
+                )
                 return
-            self.send_json(
-                200,
-                {
-                    "ok": True,
-                    "service": "vibedrop-home-vault-receiver",
-                    "vaultRoot": str(vault_root),
-                    "viewerUrl": viewer_url,
-                    "time": iso_now(),
-                },
-            )
+
+            if path == "/api/android-history/latest":
+                if token and self.headers.get("X-VibeDrop-Token") != token:
+                    self.send_json(401, {"ok": False, "error": "unauthorized"})
+                    return
+                try:
+                    query = urllib.parse.parse_qs(parsed_path.query)
+                    device_id = (query.get("deviceId") or query.get("device_id") or [""])[0]
+                    mode = ((query.get("mode") or ["compact"])[0] or "compact").lower()
+                    if mode not in {"compact", "full"}:
+                        raise ValueError("mode 只能是 compact 或 full")
+                    limit = clamp_limit((query.get("limit") or ["0"])[0], 0, 10000)
+                    payload, source_path = find_latest_android_payload(vault_root, device_id)
+                    history = payload["history"]
+                    restored_history = prepare_restore_history(history, mode, limit)
+                    self.send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "schemaVersion": 1,
+                            "app": "VibeDrop",
+                            "deviceId": payload.get("deviceId") or "",
+                            "deviceName": payload.get("deviceName") or "",
+                            "exportedAt": payload.get("exportedAt") or "",
+                            "sourcePath": source_path.relative_to(vault_root).as_posix(),
+                            "mode": mode,
+                            "historyCount": len(history),
+                            "returnedCount": len(restored_history),
+                            "history": restored_history,
+                        },
+                    )
+                except Exception as exc:
+                    self.send_json(500, {"ok": False, "error": str(exc)})
+                return
+
+            self.send_json(404, {"ok": False, "error": "not_found"})
 
         def do_POST(self) -> None:
             if self.path.rstrip("/") != "/api/android-history":
