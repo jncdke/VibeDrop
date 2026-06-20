@@ -31,6 +31,7 @@ const SMART_DISCOVERY_REFRESH_COOLDOWN_MS = 15000;
 const DIAGNOSTICS_REFRESH_INTERVAL_MS = 1000;
 const SEND_CONNECTION_WAIT_MS = 3500;
 const SEND_CONNECTION_POLL_MS = 100;
+const SEND_COMPOSER_DEFERRED_RENDER_DELAY_MS = 180;
 const DEFAULT_HISTORY_FILTERS = {
     device: 'all',
     quickTime: 'all',
@@ -52,6 +53,13 @@ const incomingDesktopTransfers = {};
 const outboundDesktopFileTransfers = {};
 const sendDrafts = new Map();
 let sendDraftFocusState = null;
+let sendCardsLayoutPending = false;
+let sendComposerState = {
+    focusedDeviceId: '',
+    composingDeviceId: '',
+    lastInputAt: 0,
+    deferredRenderTimer: null,
+};
 let pendingSharedContents = [];
 let currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS };
 let historyDatePickerState = {
@@ -2542,19 +2550,87 @@ function getSendDraft(deviceId) {
     return sendDrafts.get(deviceId) || '';
 }
 
+function getSendInputDeviceId(input) {
+    const id = String(input?.id || '');
+    const match = id.match(/^input-(.+)$/);
+    return match ? match[1] : '';
+}
+
+function isSendInputElement(element) {
+    return Boolean(element?.matches?.('#send-cards textarea[id^="input-"]'));
+}
+
+function getProtectedSendComposerDeviceId() {
+    const active = document.activeElement;
+    if (isSendInputElement(active)) {
+        return getSendInputDeviceId(active);
+    }
+    return sendComposerState.composingDeviceId || '';
+}
+
+function flushDeferredSendCardsRender() {
+    clearTimeout(sendComposerState.deferredRenderTimer);
+    sendComposerState.deferredRenderTimer = null;
+    if (!sendCardsLayoutPending) {
+        return;
+    }
+    if (getProtectedSendComposerDeviceId()) {
+        return;
+    }
+    sendCardsLayoutPending = false;
+    renderSendCards(getDevices());
+}
+
+function scheduleDeferredSendCardsRender() {
+    clearTimeout(sendComposerState.deferredRenderTimer);
+    sendComposerState.deferredRenderTimer = setTimeout(
+        flushDeferredSendCardsRender,
+        SEND_COMPOSER_DEFERRED_RENDER_DELAY_MS
+    );
+}
+
+function bindSendComposerEvents(input, deviceId) {
+    input.addEventListener('focus', () => {
+        sendComposerState.focusedDeviceId = deviceId;
+    });
+    input.addEventListener('blur', () => {
+        setSendDraft(deviceId, input.value);
+        if (sendComposerState.focusedDeviceId === deviceId) {
+            sendComposerState.focusedDeviceId = '';
+        }
+        scheduleDeferredSendCardsRender();
+    });
+    input.addEventListener('input', () => {
+        sendComposerState.focusedDeviceId = deviceId;
+        sendComposerState.lastInputAt = Date.now();
+        setSendDraft(deviceId, input.value);
+    });
+    input.addEventListener('compositionstart', () => {
+        sendComposerState.focusedDeviceId = deviceId;
+        sendComposerState.composingDeviceId = deviceId;
+    });
+    input.addEventListener('compositionend', () => {
+        setSendDraft(deviceId, input.value);
+        if (sendComposerState.composingDeviceId === deviceId) {
+            sendComposerState.composingDeviceId = '';
+        }
+        scheduleDeferredSendCardsRender();
+    });
+}
+
 function captureSendDraftsFromDom() {
     sendDraftFocusState = null;
     document.querySelectorAll('#send-cards textarea[id^="input-"]').forEach((input) => {
-        const deviceId = input.id.replace(/^input-/, '');
+        const deviceId = getSendInputDeviceId(input);
         if (deviceId) {
             setSendDraft(deviceId, input.value);
         }
     });
 
     const active = document.activeElement;
-    if (active?.matches?.('#send-cards textarea[id^="input-"]')) {
+    if (isSendInputElement(active)) {
         sendDraftFocusState = {
-            deviceId: active.id.replace(/^input-/, ''),
+            deviceId: getSendInputDeviceId(active),
             selectionStart: active.selectionStart,
             selectionEnd: active.selectionEnd,
         };
@@ -2588,22 +2664,16 @@ function restoreSendDraftFocus() {
         if (typeof input.setSelectionRange === 'function') {
             input.setSelectionRange(start, end);
         }
+        sendDraftFocusState = null;
     });
 }
 
-function renderSendCards(devices) {
-    const container = $('send-cards');
-    captureSendDraftsFromDom();
-    pruneSendDrafts(devices);
-    container.innerHTML = '';
-
-    devices.forEach(dev => {
-        if (!dev.ip) return; // 未配置的设备不显示
-
-        const card = document.createElement('div');
-        card.className = 'mac-card';
-        card.id = `card-${dev.id}`;
-        card.innerHTML = `
+function createSendCard(dev) {
+    const card = document.createElement('div');
+    card.className = 'mac-card';
+    card.id = `card-${dev.id}`;
+    card.dataset.deviceId = dev.id;
+    card.innerHTML = `
             <div class="mac-header">
                 <span class="status-dot" id="dot-${dev.id}"></span>
                 <span class="mac-name" id="name-${dev.id}">${escapeHtml(dev.name)}</span>
@@ -2624,69 +2694,193 @@ function renderSendCards(devices) {
                 <input type="file" id="fileinput-${dev.id}" class="hidden-file-input" multiple>
             </div>
         `;
-        container.appendChild(card);
 
-        // 发送按钮
-        const sendBtn = card.querySelector(`#sendbtn-${dev.id}`);
-        const enterBtn = card.querySelector(`#enterbtn-${dev.id}`);
-        const sendEnterBtn = card.querySelector(`#sendenterbtn-${dev.id}`);
-        const imageBtn = card.querySelector(`#imagebtn-${dev.id}`);
-        const fileBtn = card.querySelector(`#filebtn-${dev.id}`);
-        const imageInput = card.querySelector(`#imageinput-${dev.id}`);
-        const fileInput = card.querySelector(`#fileinput-${dev.id}`);
-        const input = card.querySelector('textarea');
-        input.value = getSendDraft(dev.id);
-        input.addEventListener('input', () => setSendDraft(dev.id, input.value));
+    const sendBtn = card.querySelector(`#sendbtn-${dev.id}`);
+    const enterBtn = card.querySelector(`#enterbtn-${dev.id}`);
+    const sendEnterBtn = card.querySelector(`#sendenterbtn-${dev.id}`);
+    const imageBtn = card.querySelector(`#imagebtn-${dev.id}`);
+    const fileBtn = card.querySelector(`#filebtn-${dev.id}`);
+    const imageInput = card.querySelector(`#imageinput-${dev.id}`);
+    const fileInput = card.querySelector(`#fileinput-${dev.id}`);
+    const input = card.querySelector('textarea');
+    input.value = getSendDraft(dev.id);
+    bindSendComposerEvents(input, dev.id);
 
-        sendBtn.addEventListener('click', () => sendText(dev.id));
-        enterBtn.addEventListener('click', () => sendEnter(dev.id));
-        sendEnterBtn.addEventListener('click', () => sendTextAndEnter(dev.id));
-        imageBtn.addEventListener('click', () => {
-            const primaryShared = getPrimaryPendingSharedContent();
-            if (pendingSharedContents.length) {
-                if (pendingSharedContents.length > 1) {
-                    showToast('批量内容请使用“传到收件箱”');
-                    return;
-                }
-                if (!primaryShared?.isImage) {
-                    showToast('当前共享内容不是图片，请使用“传到收件箱”');
-                    return;
-                }
-                sendPendingSharedImage(dev.id);
+    sendBtn.addEventListener('click', () => sendText(dev.id));
+    enterBtn.addEventListener('click', () => sendEnter(dev.id));
+    sendEnterBtn.addEventListener('click', () => sendTextAndEnter(dev.id));
+    imageBtn.addEventListener('click', () => {
+        const primaryShared = getPrimaryPendingSharedContent();
+        if (pendingSharedContents.length) {
+            if (pendingSharedContents.length > 1) {
+                showToast('批量内容请使用“传到收件箱”');
                 return;
             }
-            imageInput.click();
-        });
-        fileBtn.addEventListener('click', () => {
-            if (pendingSharedContents.length) {
-                if (pendingSharedContents.length > 1) {
-                    sendPendingSharedFilesBatch(dev.id);
-                } else {
-                    sendPendingSharedFile(dev.id);
-                }
+            if (!primaryShared?.isImage) {
+                showToast('当前共享内容不是图片，请使用“传到收件箱”');
                 return;
             }
-            fileInput.click();
-        });
-        imageInput.addEventListener('change', async (event) => {
-            const [file] = event.target.files || [];
-            event.target.value = '';
-            if (file) {
-                await sendSelectedImage(dev.id, file);
-            }
-        });
-        fileInput.addEventListener('change', async (event) => {
-            const files = Array.from(event.target.files || []);
-            event.target.value = '';
-            if (files.length > 1) {
-                await sendSelectedFilesBatch(dev.id, files);
-            } else if (files[0]) {
-                const [file] = files;
-                await sendSelectedFile(dev.id, file);
-            }
-        });
+            sendPendingSharedImage(dev.id);
+            return;
+        }
+        imageInput.click();
     });
-    restoreSendDraftFocus();
+    fileBtn.addEventListener('click', () => {
+        if (pendingSharedContents.length) {
+            if (pendingSharedContents.length > 1) {
+                sendPendingSharedFilesBatch(dev.id);
+            } else {
+                sendPendingSharedFile(dev.id);
+            }
+            return;
+        }
+        fileInput.click();
+    });
+    imageInput.addEventListener('change', async (event) => {
+        const [file] = event.target.files || [];
+        event.target.value = '';
+        if (file) {
+            await sendSelectedImage(dev.id, file);
+        }
+    });
+    fileInput.addEventListener('change', async (event) => {
+        const files = Array.from(event.target.files || []);
+        event.target.value = '';
+        if (files.length > 1) {
+            await sendSelectedFilesBatch(dev.id, files);
+        } else if (files[0]) {
+            const [file] = files;
+            await sendSelectedFile(dev.id, file);
+        }
+    });
+
+    return card;
+}
+
+function getSendCardDeviceId(card) {
+    return card?.dataset?.deviceId || String(card?.id || '').replace(/^card-/, '');
+}
+
+function updateSendCardDeviceMeta(card, dev) {
+    if (!card || !dev?.id) {
+        return;
+    }
+    card.dataset.deviceId = dev.id;
+    card.dataset.endpoint = dev.ip ? `${dev.ip}:${dev.port || DESKTOP_DISCOVERY_DEFAULT_PORT}` : '';
+    const name = $(`name-${dev.id}`);
+    if (!name) {
+        return;
+    }
+    const conn = connections[dev.id];
+    name.textContent = (conn?.authenticated && conn.hostname)
+        ? conn.hostname
+        : (dev.name || dev.hostName || dev.ip || '未命名设备');
+}
+
+function syncNewSendCardConnectionState(deviceId) {
+    const conn = connections[deviceId];
+    if (isConnectionReady(conn)) {
+        updateDeviceUI(deviceId, 'connected', conn.hostname || undefined);
+    } else if (conn?.ws && conn.ws.readyState === WebSocket.CONNECTING) {
+        updateDeviceUI(deviceId, 'connecting');
+    } else if (conn?.ws && conn.ws.readyState === WebSocket.OPEN && !conn.authenticated) {
+        updateDeviceUI(deviceId, 'connecting', '认证中...');
+    }
+}
+
+function isSendCardOrderAligned(container, orderedIds) {
+    const currentIds = Array.from(container.children)
+        .map((card) => getSendCardDeviceId(card))
+        .filter(Boolean);
+    return currentIds.length === orderedIds.length
+        && currentIds.every((id, index) => id === orderedIds[index]);
+}
+
+function reorderSendCards(container, orderedIds) {
+    let cursor = container.firstElementChild;
+    orderedIds.forEach((deviceId) => {
+        const card = $(`card-${deviceId}`);
+        if (!card || card.parentElement !== container) {
+            return;
+        }
+        if (card === cursor) {
+            cursor = cursor.nextElementSibling;
+            return;
+        }
+        container.insertBefore(card, cursor);
+    });
+}
+
+function renderSendCards(devices) {
+    const container = $('send-cards');
+    if (!container) return;
+
+    captureSendDraftsFromDom();
+    pruneSendDrafts(devices);
+
+    const visibleDevices = devices.filter((dev) => dev?.ip);
+    const visibleIds = visibleDevices.map((dev) => dev.id);
+    const visibleIdSet = new Set(visibleIds);
+    const protectedDeviceId = getProtectedSendComposerDeviceId();
+    const existingCards = new Map();
+    let layoutPending = false;
+
+    Array.from(container.children).forEach((card) => {
+        const deviceId = getSendCardDeviceId(card);
+        if (deviceId) {
+            existingCards.set(deviceId, card);
+        }
+    });
+
+    visibleDevices.forEach((dev) => {
+        let card = existingCards.get(dev.id);
+        const isNewCard = !card;
+        if (!card) {
+            card = createSendCard(dev);
+            container.appendChild(card);
+        } else {
+            updateSendCardDeviceMeta(card, dev);
+        }
+        existingCards.delete(dev.id);
+
+        const input = $(`input-${dev.id}`);
+        if (input) {
+            if (protectedDeviceId === dev.id) {
+                setSendDraft(dev.id, input.value);
+            } else {
+                const draft = getSendDraft(dev.id);
+                if (input.value !== draft) {
+                    input.value = draft;
+                }
+            }
+        }
+
+        if (isNewCard) {
+            syncNewSendCardConnectionState(dev.id);
+        }
+    });
+
+    existingCards.forEach((card, deviceId) => {
+        if (deviceId === protectedDeviceId) {
+            layoutPending = true;
+            return;
+        }
+        card.remove();
+    });
+
+    if (protectedDeviceId) {
+        if (!visibleIdSet.has(protectedDeviceId) || !isSendCardOrderAligned(container, visibleIds)) {
+            layoutPending = true;
+        }
+        sendDraftFocusState = null;
+    } else {
+        reorderSendCards(container, visibleIds);
+        restoreSendDraftFocus();
+    }
+
+    if (layoutPending) {
+        sendCardsLayoutPending = true;
+    }
 }
 
 // ============================================
