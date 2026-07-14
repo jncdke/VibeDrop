@@ -14,7 +14,8 @@ env:
 jobs:
   android:
     name: Build Android APK
-    runs-on: ubuntu-latest
+    # 图标生成脚本依赖 macOS 工具链（与 ci.yml 保持一致），不能跑在 Linux 上
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -84,7 +85,7 @@ jobs:
             echo "::error::缺少 ANDROID_KEYSTORE_BASE64 secret，请在仓库 Settings → Secrets and variables → Actions 里添加"
             exit 1
           fi
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
+          printf '%s' "$KEYSTORE_BASE64" | python3 -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" > /tmp/release.keystore
           APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
           UNSIGNED="mobile/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
           "$APKSIGNER" sign \
