@@ -25,7 +25,7 @@
         </header>
 
         <!-- 设置页面 -->
-        <section id="settings-view" class="view">
+        <section id="settings-view" class="view hidden">
             <div class="settings-header">
                 <button id="settings-back-btn" class="icon-btn back-btn" title="返回">返回</button>
                 <div class="settings-title-group">
@@ -47,6 +47,21 @@
                     正在等待扫描结果。确保桌面端和手机在同一局域网，且桌面端已打开。
                 </div>
             </section>
+
+            <details id="connection-diagnostics-panel" class="settings-card diagnostics-panel">
+                <summary class="advanced-connect-summary">
+                    <div class="advanced-connect-copy">
+                        <h3>连接诊断</h3>
+                        <p class="hint">查看前端连接、原生后台剪贴板和最近一次智能发现的实时状态。默认折叠，展开后才刷新。</p>
+                    </div>
+                    <span class="advanced-connect-toggle">实时状态</span>
+                </summary>
+                <div class="advanced-connect-body diagnostics-body">
+                    <div id="connection-diagnostics-summary" class="diagnostics-summary">展开后加载诊断信息。</div>
+                    <div id="connection-diagnostics-error" class="diagnostics-error hidden"></div>
+                    <div id="connection-diagnostics-sections" class="diagnostics-sections"></div>
+                </div>
+            </details>
 
             <details id="advanced-connect-panel" class="settings-card advanced-connect-panel">
                 <summary class="advanced-connect-summary">
@@ -94,19 +109,33 @@
 
             <div class="settings-card data-card">
                 <h3>数据管理</h3>
-                <div class="history-actions">
-                    <button id="import-history-btn" class="secondary-btn">导入历史</button>
-                    <button id="export-history-btn" class="secondary-btn">导出历史</button>
-                    <button id="share-history-btn" class="secondary-btn">分享历史</button>
-                    <button id="clear-history-btn" class="danger-btn">清空历史</button>
+                <div class="home-vault-sync">
+                    <div class="home-vault-sync-copy">
+                        <div class="home-vault-sync-label">家庭服务器</div>
+                        <div class="home-vault-sync-hint">把当前手机历史直接同步到 Mac mini Home Vault，也可以从 Vault 拉回历史。</div>
+                    </div>
+                    <input id="home-vault-url-input" class="home-vault-url-input" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="http://minideMac-mini.local:8788">
+                    <div class="home-vault-sync-actions">
+                        <button id="sync-home-vault-btn" class="primary-btn" type="button">同步到 Mac mini</button>
+                        <button id="restore-home-vault-btn" class="secondary-btn" type="button">从 Mac mini 恢复</button>
+                    </div>
+                    <div id="home-vault-restore-progress" class="home-vault-progress hidden" aria-hidden="true">
+                        <div class="home-vault-progress-head">
+                            <span id="home-vault-restore-progress-label">准备恢复</span>
+                            <span id="home-vault-restore-progress-percent">0%</span>
+                        </div>
+                        <div class="home-vault-progress-track">
+                            <div id="home-vault-restore-progress-bar" class="home-vault-progress-bar"></div>
+                        </div>
+                        <div id="home-vault-restore-progress-detail" class="home-vault-progress-detail">等待开始</div>
+                    </div>
+                    <div id="home-vault-sync-status" class="home-vault-sync-status">未同步</div>
                 </div>
-                <input type="file" id="import-file-input" accept=".json" style="display:none">
-                <div id="import-result" class="test-result" style="display:none"></div>
             </div>
         </section>
 
         <!-- 发送页面 -->
-        <section id="send-view" class="view hidden">
+        <section id="send-view" class="view">
             <div id="share-inbox" class="share-inbox hidden">
                 <div class="share-inbox-header">
                     <div class="share-inbox-kicker">来自系统分享</div>

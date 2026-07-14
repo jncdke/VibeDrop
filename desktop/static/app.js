@@ -26,7 +26,21 @@ const MEDIA_OPENER_KINDS = ['image', 'video'];
 const NEARBY_REORDER_LONG_PRESS_MS = 260;
 const NEARBY_REORDER_CANCEL_DISTANCE = 10;
 const NEARBY_REORDER_HINT_KEY = 'vibedrop_nearby_reorder_hint_seen';
+const HOME_VAULT_DEFAULT_URL = 'http://192.168.3.2:8788';
 const SMART_DISCOVERY_REFRESH_COOLDOWN_MS = 15000;
+const DIAGNOSTICS_REFRESH_INTERVAL_MS = 1000;
+const CONNECTION_EVENT_LOG_KEY = 'vibedrop_connection_events';
+const CONNECTION_EVENT_LOG_LIMIT = 240;
+const CONNECTION_EVENT_LOG_RENDER_LIMIT = 30;
+const SEND_CONNECTION_WAIT_MS = 3500;
+const SEND_CONNECTION_POLL_MS = 100;
+const CONNECTION_RECOVERY_DEBOUNCE_MS = 400;
+const CONNECTION_RECOVERY_COOLDOWN_MS = 2500;
+const CONNECTION_RECOVERY_FORCE_DISCOVERY_COOLDOWN_MS = 12000;
+const CONNECTION_STALE_AFTER_MS = HEARTBEAT_TIMEOUT + HEARTBEAT_INTERVAL;
+const RECONNECT_FORCE_DISCOVERY_AFTER_ATTEMPTS = 2;
+const SEND_COMPOSER_DEFERRED_RENDER_DELAY_MS = 180;
+const LEGACY_HISTORY_FALLBACK_LIMIT = 200;
 const DEFAULT_HISTORY_FILTERS = {
     device: 'all',
     quickTime: 'all',
@@ -40,12 +54,114 @@ const DEFAULT_HISTORY_FILTERS = {
     query: '',
 };
 
+function debugLog(type, details = {}) {
+    appendConnectionEvent('frontend', type, details);
+}
+
+function readConnectionEventLog() {
+    try {
+        const raw = localStorage.getItem(CONNECTION_EVENT_LOG_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed)
+            ? parsed
+                .filter((item) => item && item.ts && item.type)
+                .map((item) => ({
+                    ts: Number(item.ts || 0),
+                    source: String(item.source || 'frontend'),
+                    type: String(item.type || 'event'),
+                    details: sanitizeConnectionEventDetails(item.details || {}),
+                }))
+                .filter((item) => Number.isFinite(item.ts) && item.ts > 0)
+            : [];
+    } catch {
+        return [];
+    }
+}
+
+function appendConnectionEvent(source, type, details = {}) {
+    const event = {
+        ts: Date.now(),
+        source: String(source || 'frontend'),
+        type: String(type || 'event'),
+        details: enrichConnectionEventDetails(details),
+    };
+
+    try {
+        const items = readConnectionEventLog();
+        items.push(event);
+        const trimmed = items.slice(-CONNECTION_EVENT_LOG_LIMIT);
+        localStorage.setItem(CONNECTION_EVENT_LOG_KEY, JSON.stringify(trimmed));
+    } catch {
+        // 诊断日志不能影响主流程。
+    }
+
+    if ($('connection-diagnostics-panel')?.open) {
+        renderConnectionDiagnostics();
+    }
+}
+
+function enrichConnectionEventDetails(details = {}) {
+    const safeDetails = sanitizeConnectionEventDetails(details);
+    const deviceId = safeDetails.deviceId || safeDetails.id || '';
+    if (!deviceId) {
+        return safeDetails;
+    }
+
+    const device = findDeviceByAnyId(deviceId, getDevices());
+    if (device) {
+        safeDetails.deviceName = safeDetails.deviceName || device.name || device.hostName || device.ip || '';
+        safeDetails.endpoint = safeDetails.endpoint || (device.ip ? `${device.ip}:${device.port || DESKTOP_DISCOVERY_DEFAULT_PORT}` : '');
+    }
+    return safeDetails;
+}
+
+function sanitizeConnectionEventDetails(value, depth = 0) {
+    const blockedKeys = new Set(['text', 'content', 'clipboardText', 'base64', 'dataUrl', 'data', 'chunk']);
+    if (value == null) {
+        return value;
+    }
+    if (typeof value === 'string') {
+        return value.length > 240 ? `${value.slice(0, 240)}...` : value;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+        return value;
+    }
+    if (Array.isArray(value)) {
+        if (depth >= 2) {
+            return `[array:${value.length}]`;
+        }
+        return value.slice(0, 20).map((item) => sanitizeConnectionEventDetails(item, depth + 1));
+    }
+    if (typeof value === 'object') {
+        if (depth >= 2) {
+            return '[object]';
+        }
+        const output = {};
+        Object.entries(value).slice(0, 30).forEach(([key, item]) => {
+            if (blockedKeys.has(key)) {
+                output[key] = '[redacted]';
+            } else {
+                output[key] = sanitizeConnectionEventDetails(item, depth + 1);
+            }
+        });
+        return output;
+    }
+    return String(value);
+}
+
 // ---- 状态 ----
 const connections = {}; // key = device.id, value = { ws, authenticated, hostname, ... }
 const incomingDesktopTransfers = {};
 const outboundDesktopFileTransfers = {};
 const sendDrafts = new Map();
 let sendDraftFocusState = null;
+let sendCardsLayoutPending = false;
+let sendComposerState = {
+    focusedDeviceId: '',
+    composingDeviceId: '',
+    lastInputAt: 0,
+    deferredRenderTimer: null,
+};
 let pendingSharedContents = [];
 let currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS };
 let historyDatePickerState = {
@@ -76,6 +192,21 @@ let nearbyDesktopState = {
 let smartDiscoveryRefreshState = {
     inFlight: null,
     lastStartedAt: 0,
+};
+let connectionDiagnosticsState = {
+    pollTimer: null,
+    inFlight: null,
+    frontend: null,
+    background: null,
+    discovery: null,
+    error: '',
+};
+let connectionRecoveryState = {
+    timer: null,
+    inFlight: null,
+    lastAttemptAt: 0,
+    lastForceDiscoveryAt: 0,
+    lastVisibleAt: Date.now(),
 };
 let nearbyDesktopReorderState = {
     pointerId: null,
@@ -142,6 +273,7 @@ let knownDeviceHostNamesCache = {
     values: new Map(),
 };
 let photoswipeReady = typeof window.PhotoSwipe === 'function';
+let nativeHistoryStoreEnabled = false;
 
 window.addEventListener('vibedrop:photoswipe-ready', () => {
     photoswipeReady = typeof window.PhotoSwipe === 'function';
@@ -156,25 +288,194 @@ let lastNativeCapabilityState = supportsNativeFileReceive();
 // ---- 初始化 ----
 document.addEventListener('DOMContentLoaded', async () => {
     clientIdentity = getClientIdentity();
-    await loadPersistentHistory(); // 从文件恢复历史（优先于 localStorage）
-    loadSettings();
-    syncNativeBackgroundClipboardConfig(clientIdentity);
+    // 先把 UI 和连接跑起来（都是毫秒级操作），几千条历史的大加载放到后面，
+    // 否则冷启动时首页要白屏等待历史初始化完成。
+    nativeHistoryStoreEnabled = supportsNativeHistoryStore();
+    const hasSavedDevices = loadSettings();
+    if (!hasSavedDevices) {
+        syncNativeBackgroundClipboardConfig(clientIdentity, []);
+    }
     initNavigation();
     initSettingsButton();
     initMediaOpenerSettings();
     initNearbyDesktopDiscovery();
+    initConnectionDiagnostics();
+    initConnectionRecoveryLifecycle();
     initHistoryActions();
+    initHomeVaultSync();
     initHistoryFilterControls();
     initHistoryHeatmapInteractions();
     initHistoryMediaPreview();
     initHistoryMediaViewer();
     initNativeShareInbox();
     startNativeCapabilityWatcher();
-    await loadPendingSharedContent();
-    void requestSmartDiscoveryRefresh('startup');
+
+    // 延后一拍再做历史大加载：浏览器要等当前 JS 任务结束才绘制首帧，
+    // 直接在这里同步读几千条历史会把首屏堵成空白。
+    setTimeout(async () => {
+        await initializeHistoryStorage();
+        // 历史加载完成后，刷新依赖历史数据的界面部分
+        renderHistoryFilters(getDevices());
+        scheduleHistoryRender();
+        await loadPendingSharedContent();
+    }, 50);
 });
 
-// ---- 持久化存储（Tauri 文件系统）----
+// ---- 持久化存储（Android SQLite 优先，旧文件/localStorage 兜底）----
+function supportsNativeHistoryStore() {
+    return Boolean(
+        window.NativeHistory
+        && typeof window.NativeHistory.loadHistory === 'function'
+        && typeof window.NativeHistory.replaceHistory === 'function'
+        && typeof window.NativeHistory.upsertHistoryEntry === 'function'
+    );
+}
+
+function parseHistoryArray(raw) {
+    if (!raw) {
+        return [];
+    }
+    try {
+        const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function historyDedupeKey(entry) {
+    return [
+        entry?.timestamp || entry?.timestamp_iso || '',
+        entry?.text || entry?.fileName || '',
+        entry?.targetServerId || entry?.serverId || entry?.target || entry?.targetName || '',
+    ].join('|');
+}
+
+function mergeHistoryArraysForMigration(...sources) {
+    const merged = [];
+    const seen = new Set();
+    for (const source of sources) {
+        for (const entry of source) {
+            if (!entry || typeof entry !== 'object') {
+                continue;
+            }
+            const normalized = normalizeImportedHistoryEntry(entry);
+            normalized.text = String(normalized.text || normalized.fileName || '');
+            const key = historyDedupeKey(normalized);
+            if (seen.has(key)) {
+                continue;
+            }
+            seen.add(key);
+            merged.push(normalized);
+        }
+    }
+    merged.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    return merged;
+}
+
+const HISTORY_MIGRATION_FLAG_KEY = 'vibedrop_history_migration_done_v1';
+
+// 异步读取 SQLite 历史：同步桥调用会把 JS 线程堵到整库读完（冷启动首页卡死的元凶），
+// 新桥接口在原生后台线程读库、读完回调这里的 Promise。
+const nativeHistoryLoadCallbacks = new Map();
+let nativeHistoryLoadSeq = 0;
+window.__vibedropNativeHistoryLoaded = (requestId, payload) => {
+    const resolve = nativeHistoryLoadCallbacks.get(requestId);
+    if (resolve) {
+        nativeHistoryLoadCallbacks.delete(requestId);
+        resolve(typeof payload === 'string' ? payload : '[]');
+    }
+};
+
+function loadNativeHistoryRaw() {
+    if (typeof window.NativeHistory?.loadHistoryAsync === 'function') {
+        return new Promise((resolve) => {
+            const requestId = `hist-${++nativeHistoryLoadSeq}`;
+            nativeHistoryLoadCallbacks.set(requestId, resolve);
+            try {
+                window.NativeHistory.loadHistoryAsync(requestId);
+            } catch (error) {
+                nativeHistoryLoadCallbacks.delete(requestId);
+                console.warn('异步读取历史失败，回退同步读取', error);
+                resolve(window.NativeHistory.loadHistory());
+            }
+        });
+    }
+    return Promise.resolve(window.NativeHistory.loadHistory());
+}
+
+async function initializeHistoryStorage() {
+    nativeHistoryStoreEnabled = supportsNativeHistoryStore();
+    if (!nativeHistoryStoreEnabled) {
+        await loadPersistentHistory();
+        return;
+    }
+
+    const nativeHistory = parseHistoryArray(await loadNativeHistoryRaw());
+
+    // 快路径：旧数据源已经一次性并入 SQLite 之后，启动只读 SQLite 单一来源，
+    // 不再每次都读旧 history.json / localStorage 并全量合并（那是历史迁移的一次性工作）。
+    if (localStorage.getItem(HISTORY_MIGRATION_FLAG_KEY) === '1' && nativeHistory.length) {
+        setStoredHistoryRaw(JSON.stringify(nativeHistory), {
+            persistNative: false,
+            persistLegacyFallback: false,
+        });
+        return;
+    }
+
+    let legacyFileHistory = [];
+    if (supportsNativeFileReceive()) {
+        try {
+            legacyFileHistory = parseHistoryArray(await invokeNative('load_history'));
+        } catch (error) {
+            console.log('读取旧 history.json 失败:', error);
+        }
+    }
+    // localStorage 最后读：本函数在后台执行，前面两个慢读取期间
+    // 可能有新记录通过 addHistory 写进 localStorage，最后读才不会漏掉它们。
+    const legacyLocalHistory = parseHistoryArray(localStorage.getItem(HISTORY_KEY) || '[]');
+
+    const merged = nativeHistory.length
+        ? mergeHistoryArraysForMigration(nativeHistory, legacyLocalHistory, legacyFileHistory)
+        : mergeHistoryArraysForMigration(legacyLocalHistory, legacyFileHistory);
+    const raw = JSON.stringify(merged);
+    setStoredHistoryRaw(raw, {
+        persistNative: false,
+        persistLegacyFallback: false,
+    });
+
+    // 合并结果完整写入 SQLite 并打上迁移完成标记。
+    // （原逻辑只在 SQLite 为空时写入一次，导致旧文件里的独有记录
+    //   永远进不了 SQLite，只能靠每次启动现场合并才显示。）
+    if (merged.length) {
+        try {
+            const result = JSON.parse(window.NativeHistory.replaceHistory(raw) || '{}');
+            if (result.ok === false) {
+                throw new Error(result.error || 'SQLite 保存失败');
+            }
+            localStorage.setItem(HISTORY_MIGRATION_FLAG_KEY, '1');
+        } catch (error) {
+            console.warn('迁移历史到 SQLite 失败', error);
+        }
+    } else {
+        localStorage.setItem(HISTORY_MIGRATION_FLAG_KEY, '1');
+    }
+
+    writeLegacyHistoryFallback(raw);
+}
+
+function loadNativeHistoryIntoCache() {
+    if (!nativeHistoryStoreEnabled || !window.NativeHistory?.loadHistory) {
+        return 0;
+    }
+    const history = parseHistoryArray(window.NativeHistory.loadHistory());
+    setStoredHistoryRaw(JSON.stringify(history), {
+        persistNative: false,
+        persistLegacyFallback: true,
+    });
+    return history.length;
+}
+
 async function loadPersistentHistory() {
     if (!supportsNativeFileReceive()) return;
     try {
@@ -186,6 +487,9 @@ async function loadPersistentHistory() {
 }
 
 function persistHistory() {
+    if (nativeHistoryStoreEnabled) {
+        return;
+    }
     if (!supportsNativeFileReceive()) return;
     const data = localStorage.getItem(HISTORY_KEY) || '[]';
     invokeNative('save_history', { data }).catch(() => {});
@@ -226,40 +530,46 @@ function startNativeCapabilityWatcher() {
 
 function handleNativeCapabilityReady() {
     clientIdentity = getClientIdentity();
-    syncNativeBackgroundClipboardConfig(clientIdentity);
     void loadPersistentHistory();
     void loadPendingSharedContent();
     reconnectDevicesForNativeCapability();
     renderNearbyDesktops();
-    void requestSmartDiscoveryRefresh('native-capability-ready');
 }
 
 function reconnectDevicesForNativeCapability() {
     console.log('原生接收能力已就绪，重连已保存设备以刷新 can_receive_files 能力');
-    void connectAll({ refreshDiscovery: true });
+    void connectAll({
+        refreshDiscovery: true,
+        alignNativeBackgroundConfig: true,
+        forceDiscovery: true,
+        discoveryReason: 'native-capability-ready',
+    });
 }
 
-function syncNativeBackgroundClipboardConfig(identity = clientIdentity) {
+function buildNativeBackgroundClipboardDevices(devices = getDevices()) {
+    return devices
+        .filter((device) => device && device.id && device.ip && device.pin && isUsableDesktopEndpoint(device))
+        .map((device) => ({
+            id: device.id,
+            name: device.name || '设备',
+            ip: String(device.ip || '').trim(),
+            port: String(device.port || '9001').trim() || '9001',
+            pin: String(device.pin || '').trim(),
+        }));
+}
+
+function syncNativeBackgroundClipboardConfig(identity = clientIdentity, devices = getDevices()) {
     if (!window.NativeBackgroundClipboard || !window.NativeBackgroundClipboard.syncConfig) {
         return;
     }
 
     try {
-        const devices = getDevices()
-            .filter((device) => device && device.id && device.ip && device.pin)
-            .map((device) => ({
-                id: device.id,
-                name: device.name || '设备',
-                ip: String(device.ip || '').trim(),
-                port: String(device.port || '9001').trim() || '9001',
-                pin: String(device.pin || '').trim(),
-            }));
         const payload = JSON.stringify({
             identity: identity ? {
                 id: identity.id,
                 name: identity.name,
             } : null,
-            devices,
+            devices: buildNativeBackgroundClipboardDevices(devices),
         });
         window.NativeBackgroundClipboard.syncConfig(payload);
     } catch (error) {
@@ -474,6 +784,37 @@ function normalizeDeviceRecord(device) {
     };
 }
 
+function normalizeEndpointHost(value) {
+    return String(value || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+}
+
+function isLoopbackEndpointHost(value) {
+    const host = normalizeEndpointHost(value);
+    return host === 'localhost'
+        || host === '::1'
+        || host === '0:0:0:0:0:0:0:1'
+        || /^127(?:\.\d{1,3}){0,3}$/.test(host);
+}
+
+function shouldRejectLoopbackDesktopEndpoint(value) {
+    return supportsNativeFileReceive() && isLoopbackEndpointHost(value);
+}
+
+function getUnusableDesktopEndpointReason(device) {
+    const ip = String(device?.ip || '').trim();
+    if (!ip) {
+        return 'missing_ip';
+    }
+    if (shouldRejectLoopbackDesktopEndpoint(ip)) {
+        return 'android_loopback';
+    }
+    return '';
+}
+
+function isUsableDesktopEndpoint(device) {
+    return !getUnusableDesktopEndpointReason(device);
+}
+
 function normalizeDesktopName(value) {
     return String(value || '').trim().toLowerCase();
 }
@@ -487,13 +828,66 @@ function normalizeMachineIdentity(value) {
 }
 
 function getStoredHistoryRaw() {
+    if (storedHistoryEntriesCache.raw !== null) {
+        return storedHistoryEntriesCache.raw;
+    }
     return localStorage.getItem(HISTORY_KEY) || '[]';
 }
 
-function setStoredHistoryRaw(raw) {
+function writeLegacyHistoryFallback(raw) {
+    try {
+        const history = parseHistoryArray(raw);
+        const fallback = history.slice(0, LEGACY_HISTORY_FALLBACK_LIMIT).map((entry) => {
+            const items = Array.isArray(entry.items)
+                ? entry.items.map((item) => ({
+                    kind: item.kind,
+                    fileName: item.fileName,
+                    mimeType: item.mimeType,
+                    sizeBytes: item.sizeBytes,
+                    objectHash: item.objectHash,
+                    objectPath: item.objectPath,
+                    missingReason: item.missingReason,
+                }))
+                : undefined;
+            const {
+                thumbnailDataUrl,
+                media,
+                ...rest
+            } = entry;
+            return {
+                ...rest,
+                ...(items ? { items } : {}),
+            };
+        });
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(fallback));
+    } catch (error) {
+        console.warn('写入 localStorage 精简历史失败', error);
+    }
+}
+
+function setStoredHistoryRaw(raw, {
+    persistNative = true,
+    persistLegacyFallback = true,
+} = {}) {
     const nextRaw = typeof raw === 'string' ? raw : '[]';
     const previousRaw = storedHistoryEntriesCache.raw;
-    localStorage.setItem(HISTORY_KEY, nextRaw);
+    if (nativeHistoryStoreEnabled) {
+        if (persistNative) {
+            try {
+                const result = JSON.parse(window.NativeHistory.replaceHistory(nextRaw) || '{}');
+                if (result.ok === false) {
+                    throw new Error(result.error || 'SQLite 保存失败');
+                }
+            } catch (error) {
+                console.warn('写入 SQLite 历史失败', error);
+            }
+        }
+        if (persistLegacyFallback) {
+            writeLegacyHistoryFallback(nextRaw);
+        }
+    } else {
+        localStorage.setItem(HISTORY_KEY, nextRaw);
+    }
     storedHistoryEntriesCache = {
         raw: nextRaw,
         value: null,
@@ -516,6 +910,16 @@ function setStoredHistoryRaw(raw) {
 function clearStoredHistory() {
     const hadHistory = storedHistoryEntriesCache.raw !== null;
     localStorage.removeItem(HISTORY_KEY);
+    if (nativeHistoryStoreEnabled && window.NativeHistory?.deleteHistory) {
+        try {
+            const result = JSON.parse(window.NativeHistory.deleteHistory() || '{}');
+            if (result.ok === false) {
+                throw new Error(result.error || 'SQLite 清空失败');
+            }
+        } catch (error) {
+            console.warn('清空 SQLite 历史失败', error);
+        }
+    }
     storedHistoryEntriesCache = {
         raw: null,
         value: [],
@@ -854,6 +1258,7 @@ function ensureConnection(deviceId) {
     if (!connections[deviceId]) {
         connections[deviceId] = {
             ws: null, authenticated: false, hostname: null,
+            endpoint: '', ip: '', port: '', pin: '',
             heartbeatTimer: null, timeoutTimer: null, reconnectTimer: null,
             heartbeatPending: false, heartbeatStartedAt: 0, lastMessageAt: 0,
             reconnectAttempts: 0,
@@ -876,7 +1281,7 @@ function getClientIdentity() {
                     id: parsed.id,
                     name: buildClientDisplayName(parsed.id, nativeInfo) || parsed.name || buildClientDisplayName(parsed.id),
                 };
-                persistClientIdentity(identity);
+                persistClientIdentity(identity, { syncNative: false });
                 return identity;
             }
         }
@@ -889,14 +1294,16 @@ function getClientIdentity() {
         id,
         name: buildClientDisplayName(id, nativeInfo),
     };
-    persistClientIdentity(identity);
+    persistClientIdentity(identity, { syncNative: false });
     return identity;
 }
 
-function persistClientIdentity(identity) {
+function persistClientIdentity(identity, { syncNative = true } = {}) {
     try {
         localStorage.setItem(CLIENT_IDENTITY_KEY, JSON.stringify(identity));
-        syncNativeBackgroundClipboardConfig(identity);
+        if (syncNative) {
+            syncNativeBackgroundClipboardConfig(identity);
+        }
     } catch (error) {
         console.warn('保存客户端标识失败', error);
     }
@@ -1021,7 +1428,13 @@ function loadSettings() {
         renderSendCards(devices);
         renderHistoryFilters(devices);
         showView('send-view');
-        void connectAll({ refreshDiscovery: true });
+        void connectAll({
+            refreshDiscovery: true,
+            alignNativeBackgroundConfig: true,
+            forceDiscovery: true,
+            discoveryReason: 'startup',
+        });
+        return true;
     } else {
         // 首次打开：创建一个空设备
         const defaultDevices = [{ id: newDeviceId(), name: '设备 1', ip: '', port: '9001', pin: '' }];
@@ -1037,6 +1450,11 @@ function loadSettings() {
         renderDeviceCards(defaultDevices);
         renderSendCards(defaultDevices);
         renderHistoryFilters(defaultDevices);
+        // 首次使用（没有已保存设备）才落在设置页；
+        // 平时启动的默认页由 index.html 直接给出发送页，不用等这里执行。
+        showView('settings-view');
+        document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+        return false;
     }
 }
 
@@ -1160,8 +1578,633 @@ function initNearbyDesktopDiscovery() {
     renderNearbyDesktops();
 }
 
+function initConnectionDiagnostics() {
+    const panel = $('connection-diagnostics-panel');
+    if (!panel) {
+        return;
+    }
+    panel.addEventListener('toggle', () => {
+        renderConnectionDiagnostics();
+        syncConnectionDiagnosticsPolling();
+    });
+    renderConnectionDiagnostics();
+}
+
+function syncConnectionDiagnosticsPolling() {
+    const panel = $('connection-diagnostics-panel');
+    const settingsVisible = Boolean($('settings-view')) && !$('settings-view').classList.contains('hidden');
+    const shouldPoll = Boolean(panel?.open && settingsVisible);
+
+    if (!shouldPoll) {
+        clearInterval(connectionDiagnosticsState.pollTimer);
+        connectionDiagnosticsState.pollTimer = null;
+        return;
+    }
+
+    if (connectionDiagnosticsState.pollTimer) {
+        return;
+    }
+
+    void refreshConnectionDiagnostics();
+    connectionDiagnosticsState.pollTimer = setInterval(() => {
+        void refreshConnectionDiagnostics();
+    }, DIAGNOSTICS_REFRESH_INTERVAL_MS);
+}
+
+async function refreshConnectionDiagnostics() {
+    if (connectionDiagnosticsState.inFlight) {
+        return connectionDiagnosticsState.inFlight;
+    }
+
+    connectionDiagnosticsState.frontend = buildFrontendConnectionDiagnostics();
+    renderConnectionDiagnostics();
+
+    connectionDiagnosticsState.inFlight = (async () => {
+        const settled = await Promise.allSettled([
+            fetchBackgroundClipboardDiagnostics(),
+            fetchDiscoveryDiagnostics(),
+        ]);
+
+        const errors = [];
+        const [backgroundResult, discoveryResult] = settled;
+        connectionDiagnosticsState.background = backgroundResult.status === 'fulfilled'
+            ? backgroundResult.value
+            : null;
+        connectionDiagnosticsState.discovery = discoveryResult.status === 'fulfilled'
+            ? discoveryResult.value
+            : null;
+
+        if (backgroundResult.status === 'rejected') {
+            errors.push(`后台状态读取失败：${backgroundResult.reason?.message || backgroundResult.reason}`);
+        } else if (backgroundResult.value?.error) {
+            errors.push(`后台状态异常：${backgroundResult.value.error}`);
+        }
+
+        if (discoveryResult.status === 'rejected') {
+            errors.push(`发现状态读取失败：${discoveryResult.reason?.message || discoveryResult.reason}`);
+        }
+
+        connectionDiagnosticsState.error = errors.join('；');
+        connectionDiagnosticsState.frontend = buildFrontendConnectionDiagnostics();
+        renderConnectionDiagnostics();
+    })().finally(() => {
+        connectionDiagnosticsState.inFlight = null;
+    });
+
+    return connectionDiagnosticsState.inFlight;
+}
+
+function fetchBackgroundClipboardDiagnostics() {
+    if (!window.NativeBackgroundClipboard || typeof window.NativeBackgroundClipboard.getStatus !== 'function') {
+        return Promise.resolve(null);
+    }
+
+    try {
+        const raw = window.NativeBackgroundClipboard.getStatus();
+        if (!raw) {
+            return Promise.resolve(null);
+        }
+        return Promise.resolve(typeof raw === 'string' ? JSON.parse(raw) : raw);
+    } catch (error) {
+        return Promise.reject(error);
+    }
+}
+
+function fetchDiscoveryDiagnostics() {
+    if (!supportsNativeFileReceive()) {
+        return Promise.resolve(null);
+    }
+    return invokeNative('get_discovery_diagnostics');
+}
+
+function buildFrontendConnectionDiagnostics(devices = getDevices()) {
+    const items = devices.map((device) => {
+        const conn = connections[device.id] || null;
+        return {
+            id: device.id,
+            name: device.name || device.hostName || device.id,
+            ip: device.ip || '',
+            port: String(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+            hostName: device.hostName || '',
+            serverId: device.serverId || '',
+            authenticated: Boolean(conn?.authenticated),
+            currentHost: conn?.hostname || '',
+            hasSocket: Boolean(conn?.ws),
+        };
+    });
+    return {
+        devices: items,
+        deviceCount: items.length,
+        authenticatedCount: items.filter((item) => item.authenticated).length,
+        updatedAtMs: Date.now(),
+    };
+}
+
+function renderConnectionDiagnostics() {
+    const summary = $('connection-diagnostics-summary');
+    const error = $('connection-diagnostics-error');
+    const sections = $('connection-diagnostics-sections');
+    const panel = $('connection-diagnostics-panel');
+    if (!summary || !error || !sections || !panel) {
+        return;
+    }
+
+    if (!panel.open) {
+        summary.textContent = '展开后加载诊断信息。';
+        error.classList.add('hidden');
+        error.textContent = '';
+        sections.innerHTML = '';
+        return;
+    }
+
+    const frontend = connectionDiagnosticsState.frontend || buildFrontendConnectionDiagnostics();
+    const background = connectionDiagnosticsState.background;
+    const discovery = connectionDiagnosticsState.discovery;
+
+    summary.textContent = buildConnectionDiagnosticsSummary(frontend, background, discovery);
+
+    if (connectionDiagnosticsState.error) {
+        error.textContent = connectionDiagnosticsState.error;
+        error.classList.remove('hidden');
+    } else {
+        error.textContent = '';
+        error.classList.add('hidden');
+    }
+
+    sections.innerHTML = [
+        renderConnectionEventLogSection(frontend, background),
+        renderFrontendDiagnosticsSection(frontend),
+        renderBackgroundDiagnosticsSection(background),
+        renderDiscoveryDiagnosticsSection(discovery),
+    ].join('');
+}
+
+function buildConnectionDiagnosticsSummary(frontend, background, discovery) {
+    const frontendText = frontend
+        ? `前台已认证 ${frontend.authenticatedCount}/${frontend.deviceCount || 0}`
+        : '前台状态未加载';
+    const backgroundAuthenticated = Array.isArray(background?.connections)
+        ? background.connections.filter((item) => item.authenticated).length
+        : 0;
+    const backgroundText = background
+        ? `后台已认证 ${backgroundAuthenticated}/${Number(background.configuredDeviceCount || 0)}`
+        : '后台状态未加载';
+    const eventCount = collectConnectionDiagnosticsEvents(background).length;
+    const eventText = eventCount ? `最近事件 ${eventCount} 条` : '最近事件暂无';
+    const discoveryText = summarizeDiscoveryPath(discovery);
+    return [frontendText, backgroundText, eventText, discoveryText].filter(Boolean).join('；');
+}
+
+function renderConnectionEventLogSection(frontend, background) {
+    const events = collectConnectionDiagnosticsEvents(background)
+        .sort((a, b) => b.ts - a.ts)
+        .slice(0, CONNECTION_EVENT_LOG_RENDER_LIMIT);
+    const pillText = events.length ? `最近 ${events.length} 条` : '暂无';
+    const items = events.length
+        ? events.map((event) => {
+            const tone = toneForConnectionEvent(event);
+            const detailText = formatConnectionEventDetails(event, frontend);
+            return `
+                <div class="diagnostics-event ${tone}">
+                    <div class="diagnostics-item-head">
+                        <div class="diagnostics-item-title">${escapeHtml(formatConnectionEventTitle(event))}</div>
+                        ${diagnosticsPillHtml(event.source === 'background' ? '后台' : '前台', tone === 'is-error' ? 'is-error' : '')}
+                    </div>
+                    <div class="diagnostics-item-meta">${escapeHtml(formatDiagnosticsWhen(event.ts))}</div>
+                    <div class="diagnostics-item-subtle">${escapeHtml(detailText || '无附加信息')}</div>
+                </div>
+            `;
+        }).join('')
+        : '<div class="diagnostics-empty">还没有连接事件。保持这个面板展开后，断开、重连、认证失败和发送失败都会记录在这里。</div>';
+
+    return `
+        <section class="diagnostics-section">
+            <div class="diagnostics-section-title">
+                <strong>最近连接事件</strong>
+                ${diagnosticsPillHtml(pillText, events.some((event) => toneForConnectionEvent(event) === 'is-error') ? 'is-error' : '')}
+            </div>
+            <div class="diagnostics-list">${items}</div>
+        </section>
+    `;
+}
+
+function collectConnectionDiagnosticsEvents(background) {
+    const frontendEvents = readConnectionEventLog().map((event) => ({
+        ...event,
+        source: event.source || 'frontend',
+    }));
+    const backgroundEvents = Array.isArray(background?.events)
+        ? background.events.map((event) => ({
+            ts: Number(event.timeMs || event.ts || 0),
+            source: 'background',
+            type: event.type || event.status || 'background:event',
+            details: sanitizeConnectionEventDetails({
+                deviceId: event.deviceId || '',
+                deviceName: event.deviceName || '',
+                endpoint: event.endpoint || [event.ip, event.port].filter(Boolean).join(':'),
+                status: event.status || '',
+                error: event.error || '',
+                detail: event.detail || '',
+            }),
+        })).filter((event) => Number.isFinite(event.ts) && event.ts > 0)
+        : [];
+    return [...frontendEvents, ...backgroundEvents];
+}
+
+function formatConnectionEventTitle(event) {
+    const labelMap = {
+        'connect:start': '开始连接',
+        'connect:open': 'WebSocket 已打开',
+        'connect:auth_ok': '认证成功',
+        'connect:auth_fail': '认证失败',
+        'connect:error': '连接出错',
+        'connect:create_error': '创建连接失败',
+        'connect:close': '连接关闭',
+        'heartbeat:timeout': '心跳超时',
+        'heartbeat:send_error': '心跳发送失败',
+        'reconnect:scheduled': '计划重连',
+        'recovery:scheduled': '计划自愈',
+        'recovery:start': '开始自愈',
+        'recovery:done': '自愈完成',
+        'recovery:error': '自愈失败',
+        'recovery:cooldown': '自愈冷却中',
+        'recovery:join_inflight': '合并到进行中的自愈',
+        'recovery:skip_healthy': '连接健康，跳过自愈',
+        'recovery:page_hidden': '页面进入后台',
+        'network:online': '网络恢复',
+        'network:offline': '网络离线',
+        'ensureReady:timeout': '发送前重连超时',
+        'ensureReady:ready_after_recovery': '自愈后发送连接就绪',
+        'ensureReady:recovery_error': '发送前自愈失败',
+        'sendAction:not_ready_after_ensure': '发送前仍未连接',
+        'sendAction:catch': '发送异常',
+        'desktopRequest:timeout': '桌面请求超时',
+        'desktopRequest:send_error': '桌面请求发送失败',
+        'background:config_reloaded': '后台配置刷新',
+        'background:clipboard_applied': '后台剪贴板写入',
+        'background:connecting': '后台连接中',
+        'background:open': '后台已打开',
+        'background:authenticated': '后台认证成功',
+        'background:failed': '后台连接失败',
+        'background:closed': '后台连接关闭',
+        'background:scheduled_reconnect': '后台等待重连',
+        'background:idle': '后台空闲',
+        'background:connection_removed': '后台设备移除',
+        'background:connections_cleared': '后台连接清空',
+    };
+    return labelMap[event.type] || event.type || '连接事件';
+}
+
+function formatConnectionEventDetails(event, frontend) {
+    const details = event.details || {};
+    const parts = [];
+    const deviceName = details.deviceName || resolveDiagnosticsDeviceName(details.deviceId, frontend);
+    if (deviceName) {
+        parts.push(`设备：${deviceName}`);
+    }
+    if (details.endpoint) {
+        parts.push(`地址：${details.endpoint}`);
+    }
+    if (details.status) {
+        parts.push(`状态：${details.status}`);
+    }
+    if (details.reason) {
+        parts.push(`原因：${details.reason}`);
+    }
+    if (details.error) {
+        parts.push(`错误：${details.error}`);
+    }
+    if (details.action) {
+        parts.push(`动作：${details.action}`);
+    }
+    if (details.readyState !== undefined) {
+        parts.push(`readyState：${details.readyState}`);
+    }
+    if (details.authenticated !== undefined) {
+        parts.push(`authenticated：${details.authenticated ? 'true' : 'false'}`);
+    }
+    if (details.textLength !== undefined) {
+        parts.push(`文本长度：${details.textLength}`);
+    }
+    if (details.unhealthyCount !== undefined || details.deviceCount !== undefined) {
+        parts.push(`异常设备：${details.unhealthyCount ?? 0}/${details.deviceCount ?? 0}`);
+    }
+    if (details.forceDiscovery !== undefined || details.requestedForceDiscovery !== undefined) {
+        parts.push(`强制发现：${details.forceDiscovery || details.requestedForceDiscovery ? 'true' : 'false'}`);
+    }
+    if (details.delay !== undefined || details.delayMs !== undefined) {
+        parts.push(`延迟：${formatDurationMs(details.delay ?? details.delayMs)}`);
+    }
+    if (details.detail) {
+        parts.push(`详情：${details.detail}`);
+    }
+    return parts.join(' · ');
+}
+
+function resolveDiagnosticsDeviceName(deviceId, frontend) {
+    if (!deviceId) {
+        return '';
+    }
+    const frontendDevice = frontend?.devices?.find((item) => item.id === deviceId);
+    if (frontendDevice?.name) {
+        return frontendDevice.name;
+    }
+    return getDeviceDisplayName(deviceId);
+}
+
+function toneForConnectionEvent(event) {
+    const type = String(event?.type || '');
+    const error = event?.details?.error || '';
+    if (error || type.includes('fail') || type.includes('error') || type.includes('timeout') || type.includes('not_ready')) {
+        return 'is-error';
+    }
+    if (type.includes('close') || type.includes('reconnect') || type.includes('connecting') || type.includes('open')) {
+        return 'is-warn';
+    }
+    return '';
+}
+
+function renderFrontendDiagnosticsSection(frontend) {
+    const pillTone = frontend?.authenticatedCount > 0 ? '' : 'is-warn';
+    const pillText = frontend
+        ? `已认证 ${frontend.authenticatedCount}/${frontend.deviceCount || 0}`
+        : '未加载';
+    const items = frontend?.devices?.length
+        ? frontend.devices.map((device) => `
+            <div class="diagnostics-item">
+                <div class="diagnostics-item-head">
+                    <div class="diagnostics-item-title">${escapeHtml(device.name || '未命名设备')}</div>
+                    ${diagnosticsPillHtml(device.authenticated ? '前台已认证' : (device.hasSocket ? '前台已连通' : '前台未连接'), device.authenticated ? '' : 'is-warn')}
+                </div>
+                <div class="diagnostics-item-meta">保存地址：${escapeHtml(device.ip ? `${device.ip}:${device.port}` : '未配置')}</div>
+                <div class="diagnostics-item-subtle">hostName：${escapeHtml(device.hostName || '未记录')} · serverId：${escapeHtml(device.serverId || '未记录')}</div>
+                <div class="diagnostics-item-subtle">最近前台主机名：${escapeHtml(device.currentHost || '暂无')}</div>
+            </div>
+        `).join('')
+        : '<div class="diagnostics-empty">当前没有已保存设备。</div>';
+
+    return `
+        <section class="diagnostics-section">
+            <div class="diagnostics-section-title">
+                <strong>前端主连接</strong>
+                ${diagnosticsPillHtml(pillText, pillTone)}
+            </div>
+            <div class="diagnostics-list">${items}</div>
+        </section>
+    `;
+}
+
+function renderBackgroundDiagnosticsSection(background) {
+    if (!background) {
+        return `
+            <section class="diagnostics-section">
+                <div class="diagnostics-section-title">
+                    <strong>原生后台剪贴板</strong>
+                    ${diagnosticsPillHtml('未加载', 'is-warn')}
+                </div>
+                <div class="diagnostics-empty">当前环境未暴露后台诊断接口，或诊断信息尚未返回。</div>
+            </section>
+        `;
+    }
+
+    const connectionMap = new Map((background.connections || []).map((item) => [item.id, item]));
+    const configuredDevices = Array.isArray(background.configuredDevices) ? background.configuredDevices : [];
+    const items = configuredDevices.length
+        ? configuredDevices.map((device) => {
+            const connection = connectionMap.get(device.id) || null;
+            const status = connection?.status || 'idle';
+            const tone = toneForDiagnosticsStatus(status, Boolean(connection?.authenticated), Boolean(connection?.lastError));
+            const lastUpdate = connection?.lastStateAtMs ? formatDiagnosticsWhen(connection.lastStateAtMs) : '暂无';
+            return `
+                <div class="diagnostics-item">
+                    <div class="diagnostics-item-head">
+                        <div class="diagnostics-item-title">${escapeHtml(device.name || '未命名设备')}</div>
+                        ${diagnosticsPillHtml(formatBackgroundStatusLabel(status, connection), tone)}
+                    </div>
+                    <div class="diagnostics-item-meta">后台目标：${escapeHtml(device.ip ? `${device.ip}:${device.port}` : '未配置')}</div>
+                    <div class="diagnostics-item-subtle">PIN：${device.pinPresent ? '已配置' : '未配置'} · 最近状态更新时间：${escapeHtml(lastUpdate)}</div>
+                    <div class="diagnostics-item-subtle">最近错误：${escapeHtml(connection?.lastError || '无')}</div>
+                </div>
+            `;
+        }).join('')
+        : '<div class="diagnostics-empty">后台当前没有已配置设备。</div>';
+
+    const gateLabel = background.gateActive
+        ? `门控中，剩余 ${formatDurationMs(background.gateRemainingMs || 0)}`
+        : '门控已解除';
+    const gateTone = background.gateActive ? 'is-warn' : '';
+    const appliedText = background.lastClipboardAppliedAtMs
+        ? `最近后台剪贴板写入：${formatDiagnosticsWhen(background.lastClipboardAppliedAtMs)}`
+        : '最近后台剪贴板写入：暂无';
+
+    return `
+        <section class="diagnostics-section">
+            <div class="diagnostics-section-title">
+                <strong>原生后台剪贴板</strong>
+                ${diagnosticsPillHtml(gateLabel, gateTone)}
+            </div>
+            <div class="diagnostics-item">
+                <div class="diagnostics-item-meta">最近配置刷新：${escapeHtml(formatDiagnosticsWhen(background.lastReloadAtMs || 0))}</div>
+                <div class="diagnostics-item-subtle">${escapeHtml(appliedText)}${background.lastClipboardSourceName ? ` · 来源：${escapeHtml(background.lastClipboardSourceName)}` : ''}</div>
+            </div>
+            <div class="diagnostics-list">${items}</div>
+        </section>
+    `;
+}
+
+function renderDiscoveryDiagnosticsSection(discovery) {
+    if (!discovery) {
+        return `
+            <section class="diagnostics-section">
+                <div class="diagnostics-section-title">
+                    <strong>智能发现</strong>
+                    ${diagnosticsPillHtml('未加载', 'is-warn')}
+                </div>
+                <div class="diagnostics-empty">最近一次发现快照尚未返回。</div>
+            </section>
+        `;
+    }
+
+    const summaryTone = discovery.last_error
+        ? 'is-error'
+        : discovery.skip_http_sweep
+            ? ''
+            : Number(discovery.full_http_target_count || 0) > 0
+                ? 'is-warn'
+                : '';
+    const strategyText = summarizeDiscoveryPath(discovery);
+    const interfaceItems = Array.isArray(discovery.candidate_interfaces) && discovery.candidate_interfaces.length
+        ? discovery.candidate_interfaces.map((item) => `
+            <div class="diagnostics-item">
+                <div class="diagnostics-item-head">
+                    <div class="diagnostics-item-title">${escapeHtml(item.interface_name || 'unknown')}</div>
+                    ${diagnosticsPillHtml(item.allow_http_sweep ? '参与 HTTP 扫描' : '不扫 HTTP', item.allow_http_sweep ? '' : 'is-warn')}
+                </div>
+                <div class="diagnostics-item-meta">${escapeHtml(item.ip || '')}</div>
+                <div class="diagnostics-item-subtle">priority=${escapeHtml(String(item.priority ?? ''))} · directed_broadcast=${item.allow_directed_broadcast ? 'true' : 'false'} · http_sweep=${item.allow_http_sweep ? 'true' : 'false'}</div>
+            </div>
+        `).join('')
+        : '<div class="diagnostics-empty">最近一次发现没有记录接口快照。</div>';
+    const directTargets = Array.isArray(discovery.direct_targets) ? discovery.direct_targets : [];
+    const directTargetSummary = directTargets.length
+        ? directTargets.map((target) => `${target.target_host}:${target.port} (${target.target_kind})`).join('，')
+        : '无';
+    const mergedResults = Array.isArray(discovery.merged_results) ? discovery.merged_results : [];
+    const mergedResultSummary = mergedResults.length
+        ? mergedResults.map((item) => `${item.hostname || '未命名电脑'} -> ${item.ip}:${item.port}`).join('，')
+        : '无';
+
+    return `
+        <section class="diagnostics-section">
+            <div class="diagnostics-section-title">
+                <strong>智能发现</strong>
+                ${diagnosticsPillHtml(strategyText, summaryTone)}
+            </div>
+            <div class="diagnostics-item">
+                <div class="diagnostics-item-meta">开始：${escapeHtml(formatDiagnosticsWhen(discovery.last_started_at_ms || 0))} · 结束：${escapeHtml(formatDiagnosticsWhen(discovery.last_finished_at_ms || 0))}</div>
+                <div class="diagnostics-item-subtle">耗时：${escapeHtml(formatDurationMs(discovery.last_duration_ms || 0))} · UDP 结果：${escapeHtml(String(discovery.udp_result_count || 0))} · 定向命中：${escapeHtml(`${discovery.direct_http_result_count || 0}/${discovery.expected_direct_devices || 0}`)} · 全量 HTTP 目标：${escapeHtml(String(discovery.full_http_target_count || 0))} · 合并结果：${escapeHtml(String(discovery.merged_result_count || 0))}</div>
+                <div class="diagnostics-item-subtle">定向目标：${escapeHtml(directTargetSummary)}</div>
+                <div class="diagnostics-item-subtle">发现结果：${escapeHtml(mergedResultSummary)}</div>
+                <div class="diagnostics-item-subtle">最近错误：${escapeHtml(discovery.last_error || '无')}</div>
+            </div>
+            <div class="diagnostics-list">${interfaceItems}</div>
+        </section>
+    `;
+}
+
+function summarizeDiscoveryPath(discovery) {
+    if (!discovery) {
+        return '发现状态未加载';
+    }
+    if (discovery.in_progress) {
+        return '发现进行中';
+    }
+    if (discovery.last_error) {
+        return '最近发现失败';
+    }
+    if (discovery.skip_http_sweep) {
+        return '定向探测命中，已跳过子网扫描';
+    }
+    if (Number(discovery.full_http_target_count || 0) > 0) {
+        return `回退子网扫描 ${discovery.full_http_target_count} 个目标`;
+    }
+    return '最近发现已完成';
+}
+
+function diagnosticsPillHtml(text, tone = '') {
+    const className = tone ? `diagnostics-pill ${tone}` : 'diagnostics-pill';
+    return `<span class="${className}">${escapeHtml(text)}</span>`;
+}
+
+function toneForDiagnosticsStatus(status, authenticated = false, hasError = false) {
+    if (hasError) {
+        return 'is-error';
+    }
+    if (authenticated) {
+        return '';
+    }
+    return status === 'connecting' || status === 'open' || status === 'scheduled_reconnect'
+        ? 'is-warn'
+        : 'is-warn';
+}
+
+function formatBackgroundStatusLabel(status, connection = null) {
+    const labels = {
+        idle: '空闲',
+        connecting: '连接中',
+        open: '已打开待认证',
+        authenticated: '已认证',
+        failed: '连接失败',
+        scheduled_reconnect: '等待重连',
+        closed: '已关闭',
+    };
+    if (connection?.authenticated) {
+        return '已认证';
+    }
+    return labels[status] || status || '未知';
+}
+
+function formatDiagnosticsWhen(valueMs) {
+    const ms = Number(valueMs || 0);
+    if (!ms) {
+        return '暂无';
+    }
+    const date = new Date(ms);
+    if (Number.isNaN(date.getTime())) {
+        return '暂无';
+    }
+    return `${date.toLocaleTimeString('zh-CN', { hour12: false })} · ${formatRelativeTimeFromNow(ms)}`;
+}
+
+function formatRelativeTimeFromNow(valueMs) {
+    const delta = Date.now() - Number(valueMs || 0);
+    if (!Number.isFinite(delta)) {
+        return '未知';
+    }
+    if (delta < 1000) {
+        return '刚刚';
+    }
+    const seconds = Math.floor(delta / 1000);
+    if (seconds < 60) {
+        return `${seconds} 秒前`;
+    }
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) {
+        return `${minutes} 分钟前`;
+    }
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) {
+        return `${hours} 小时前`;
+    }
+    const days = Math.floor(hours / 24);
+    return `${days} 天前`;
+}
+
+function formatDurationMs(durationMs) {
+    const ms = Number(durationMs || 0);
+    if (!Number.isFinite(ms) || ms <= 0) {
+        return '0 ms';
+    }
+    if (ms < 1000) {
+        return `${Math.round(ms)} ms`;
+    }
+    const seconds = ms / 1000;
+    if (seconds < 60) {
+        return `${seconds.toFixed(seconds >= 10 ? 1 : 2)} s`;
+    }
+    const minutes = Math.floor(seconds / 60);
+    const remainSeconds = Math.round(seconds % 60);
+    return `${minutes} 分 ${remainSeconds} 秒`;
+}
+
 function hasSavedDevicesForSmartDiscovery() {
     return getDevices().some((device) => device && (device.ip || device.serverId || device.hostName));
+}
+
+function buildNativeDiscoveryHints(devices = getDevices(), historyEntries = readStoredHistoryEntries()) {
+    return devices
+        .map((device) => normalizeDeviceRecord(device))
+        .map((device) => {
+            const hostnames = Array.from(new Set([
+                device.hostName,
+                ...getKnownDeviceHostNames(device, historyEntries),
+            ]
+                .map((value) => normalizeDesktopName(value))
+                .filter((value) => value && looksLikeTargetHost(value))));
+            const rawIp = String(device.ip || '').trim();
+            const ip = shouldRejectLoopbackDesktopEndpoint(rawIp) ? '' : rawIp;
+            if (!ip && !hostnames.length) {
+                return null;
+            }
+            return {
+                deviceId: device.id,
+                serverId: device.serverId || '',
+                ip,
+                port: Number(device.port || DESKTOP_DISCOVERY_DEFAULT_PORT) || DESKTOP_DISCOVERY_DEFAULT_PORT,
+                hostnames,
+            };
+        })
+        .filter(Boolean);
 }
 
 function requestSmartDiscoveryRefresh(reason = 'endpoint-refresh', { force = false } = {}) {
@@ -1183,6 +2226,7 @@ function requestSmartDiscoveryRefresh(reason = 'endpoint-refresh', { force = fal
     smartDiscoveryRefreshState.inFlight = discoverNearbyDesktops({
         silent: true,
         syncKnownDevices: true,
+        prioritizeSavedDevices: true,
     })
         .catch((error) => {
             console.warn(`[smart-discovery] endpoint refresh failed: ${reason}`, error);
@@ -1195,7 +2239,11 @@ function requestSmartDiscoveryRefresh(reason = 'endpoint-refresh', { force = fal
     return smartDiscoveryRefreshState.inFlight;
 }
 
-async function discoverNearbyDesktops({ silent = false, syncKnownDevices = false } = {}) {
+async function discoverNearbyDesktops({
+    silent = false,
+    syncKnownDevices = false,
+    prioritizeSavedDevices = false,
+} = {}) {
     if (!supportsNearbyDesktopDiscovery()) {
         nearbyDesktopState.scanError = '当前浏览器模式不支持自动扫描，请继续使用手动 IP / PIN。';
         nearbyDesktopState.items = [];
@@ -1209,14 +2257,21 @@ async function discoverNearbyDesktops({ silent = false, syncKnownDevices = false
     renderNearbyDesktops();
 
     try {
-        const discovered = await invokeNative('discover_desktops');
+        const payload = {};
+        if (prioritizeSavedDevices) {
+            const knownDevices = buildNativeDiscoveryHints();
+            if (knownDevices.length) {
+                payload.knownDevices = knownDevices;
+            }
+        }
+        const discovered = await invokeNative('discover_desktops', payload);
         nearbyDesktopState.items = Array.isArray(discovered) ? discovered.map((item) => ({
             ...item,
             ip: item.ip || '',
             hostname: item.hostname || '未命名电脑',
             port: Number(item.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
             server_id: item.server_id || '',
-        })) : [];
+        })).filter((item) => !shouldRejectLoopbackDesktopEndpoint(item.ip)) : [];
 
         if (syncKnownDevices && nearbyDesktopState.items.length) {
             syncKnownDevicesWithDiscovery(nearbyDesktopState.items);
@@ -2046,19 +3101,87 @@ function getSendDraft(deviceId) {
     return sendDrafts.get(deviceId) || '';
 }
 
+function getSendInputDeviceId(input) {
+    const id = String(input?.id || '');
+    const match = id.match(/^input-(.+)$/);
+    return match ? match[1] : '';
+}
+
+function isSendInputElement(element) {
+    return Boolean(element?.matches?.('#send-cards textarea[id^="input-"]'));
+}
+
+function getProtectedSendComposerDeviceId() {
+    const active = document.activeElement;
+    if (isSendInputElement(active)) {
+        return getSendInputDeviceId(active);
+    }
+    return sendComposerState.composingDeviceId || '';
+}
+
+function flushDeferredSendCardsRender() {
+    clearTimeout(sendComposerState.deferredRenderTimer);
+    sendComposerState.deferredRenderTimer = null;
+    if (!sendCardsLayoutPending) {
+        return;
+    }
+    if (getProtectedSendComposerDeviceId()) {
+        return;
+    }
+    sendCardsLayoutPending = false;
+    renderSendCards(getDevices());
+}
+
+function scheduleDeferredSendCardsRender() {
+    clearTimeout(sendComposerState.deferredRenderTimer);
+    sendComposerState.deferredRenderTimer = setTimeout(
+        flushDeferredSendCardsRender,
+        SEND_COMPOSER_DEFERRED_RENDER_DELAY_MS
+    );
+}
+
+function bindSendComposerEvents(input, deviceId) {
+    input.addEventListener('focus', () => {
+        sendComposerState.focusedDeviceId = deviceId;
+    });
+    input.addEventListener('blur', () => {
+        setSendDraft(deviceId, input.value);
+        if (sendComposerState.focusedDeviceId === deviceId) {
+            sendComposerState.focusedDeviceId = '';
+        }
+        scheduleDeferredSendCardsRender();
+    });
+    input.addEventListener('input', () => {
+        sendComposerState.focusedDeviceId = deviceId;
+        sendComposerState.lastInputAt = Date.now();
+        setSendDraft(deviceId, input.value);
+    });
+    input.addEventListener('compositionstart', () => {
+        sendComposerState.focusedDeviceId = deviceId;
+        sendComposerState.composingDeviceId = deviceId;
+    });
+    input.addEventListener('compositionend', () => {
+        setSendDraft(deviceId, input.value);
+        if (sendComposerState.composingDeviceId === deviceId) {
+            sendComposerState.composingDeviceId = '';
+        }
+        scheduleDeferredSendCardsRender();
+    });
+}
+
 function captureSendDraftsFromDom() {
     sendDraftFocusState = null;
     document.querySelectorAll('#send-cards textarea[id^="input-"]').forEach((input) => {
-        const deviceId = input.id.replace(/^input-/, '');
+        const deviceId = getSendInputDeviceId(input);
         if (deviceId) {
             setSendDraft(deviceId, input.value);
         }
     });
 
     const active = document.activeElement;
-    if (active?.matches?.('#send-cards textarea[id^="input-"]')) {
+    if (isSendInputElement(active)) {
         sendDraftFocusState = {
-            deviceId: active.id.replace(/^input-/, ''),
+            deviceId: getSendInputDeviceId(active),
             selectionStart: active.selectionStart,
             selectionEnd: active.selectionEnd,
         };
@@ -2092,22 +3215,16 @@ function restoreSendDraftFocus() {
         if (typeof input.setSelectionRange === 'function') {
             input.setSelectionRange(start, end);
         }
+        sendDraftFocusState = null;
     });
 }
 
-function renderSendCards(devices) {
-    const container = $('send-cards');
-    captureSendDraftsFromDom();
-    pruneSendDrafts(devices);
-    container.innerHTML = '';
-
-    devices.forEach(dev => {
-        if (!dev.ip) return; // 未配置的设备不显示
-
-        const card = document.createElement('div');
-        card.className = 'mac-card';
-        card.id = `card-${dev.id}`;
-        card.innerHTML = `
+function createSendCard(dev) {
+    const card = document.createElement('div');
+    card.className = 'mac-card';
+    card.id = `card-${dev.id}`;
+    card.dataset.deviceId = dev.id;
+    card.innerHTML = `
             <div class="mac-header">
                 <span class="status-dot" id="dot-${dev.id}"></span>
                 <span class="mac-name" id="name-${dev.id}">${escapeHtml(dev.name)}</span>
@@ -2128,69 +3245,193 @@ function renderSendCards(devices) {
                 <input type="file" id="fileinput-${dev.id}" class="hidden-file-input" multiple>
             </div>
         `;
-        container.appendChild(card);
 
-        // 发送按钮
-        const sendBtn = card.querySelector(`#sendbtn-${dev.id}`);
-        const enterBtn = card.querySelector(`#enterbtn-${dev.id}`);
-        const sendEnterBtn = card.querySelector(`#sendenterbtn-${dev.id}`);
-        const imageBtn = card.querySelector(`#imagebtn-${dev.id}`);
-        const fileBtn = card.querySelector(`#filebtn-${dev.id}`);
-        const imageInput = card.querySelector(`#imageinput-${dev.id}`);
-        const fileInput = card.querySelector(`#fileinput-${dev.id}`);
-        const input = card.querySelector('textarea');
-        input.value = getSendDraft(dev.id);
-        input.addEventListener('input', () => setSendDraft(dev.id, input.value));
+    const sendBtn = card.querySelector(`#sendbtn-${dev.id}`);
+    const enterBtn = card.querySelector(`#enterbtn-${dev.id}`);
+    const sendEnterBtn = card.querySelector(`#sendenterbtn-${dev.id}`);
+    const imageBtn = card.querySelector(`#imagebtn-${dev.id}`);
+    const fileBtn = card.querySelector(`#filebtn-${dev.id}`);
+    const imageInput = card.querySelector(`#imageinput-${dev.id}`);
+    const fileInput = card.querySelector(`#fileinput-${dev.id}`);
+    const input = card.querySelector('textarea');
+    input.value = getSendDraft(dev.id);
+    bindSendComposerEvents(input, dev.id);
 
-        sendBtn.addEventListener('click', () => sendText(dev.id));
-        enterBtn.addEventListener('click', () => sendEnter(dev.id));
-        sendEnterBtn.addEventListener('click', () => sendTextAndEnter(dev.id));
-        imageBtn.addEventListener('click', () => {
-            const primaryShared = getPrimaryPendingSharedContent();
-            if (pendingSharedContents.length) {
-                if (pendingSharedContents.length > 1) {
-                    showToast('批量内容请使用“传到收件箱”');
-                    return;
-                }
-                if (!primaryShared?.isImage) {
-                    showToast('当前共享内容不是图片，请使用“传到收件箱”');
-                    return;
-                }
-                sendPendingSharedImage(dev.id);
+    sendBtn.addEventListener('click', () => sendText(dev.id));
+    enterBtn.addEventListener('click', () => sendEnter(dev.id));
+    sendEnterBtn.addEventListener('click', () => sendTextAndEnter(dev.id));
+    imageBtn.addEventListener('click', () => {
+        const primaryShared = getPrimaryPendingSharedContent();
+        if (pendingSharedContents.length) {
+            if (pendingSharedContents.length > 1) {
+                showToast('批量内容请使用“传到收件箱”');
                 return;
             }
-            imageInput.click();
-        });
-        fileBtn.addEventListener('click', () => {
-            if (pendingSharedContents.length) {
-                if (pendingSharedContents.length > 1) {
-                    sendPendingSharedFilesBatch(dev.id);
-                } else {
-                    sendPendingSharedFile(dev.id);
-                }
+            if (!primaryShared?.isImage) {
+                showToast('当前共享内容不是图片，请使用“传到收件箱”');
                 return;
             }
-            fileInput.click();
-        });
-        imageInput.addEventListener('change', async (event) => {
-            const [file] = event.target.files || [];
-            event.target.value = '';
-            if (file) {
-                await sendSelectedImage(dev.id, file);
-            }
-        });
-        fileInput.addEventListener('change', async (event) => {
-            const files = Array.from(event.target.files || []);
-            event.target.value = '';
-            if (files.length > 1) {
-                await sendSelectedFilesBatch(dev.id, files);
-            } else if (files[0]) {
-                const [file] = files;
-                await sendSelectedFile(dev.id, file);
-            }
-        });
+            sendPendingSharedImage(dev.id);
+            return;
+        }
+        imageInput.click();
     });
-    restoreSendDraftFocus();
+    fileBtn.addEventListener('click', () => {
+        if (pendingSharedContents.length) {
+            if (pendingSharedContents.length > 1) {
+                sendPendingSharedFilesBatch(dev.id);
+            } else {
+                sendPendingSharedFile(dev.id);
+            }
+            return;
+        }
+        fileInput.click();
+    });
+    imageInput.addEventListener('change', async (event) => {
+        const [file] = event.target.files || [];
+        event.target.value = '';
+        if (file) {
+            await sendSelectedImage(dev.id, file);
+        }
+    });
+    fileInput.addEventListener('change', async (event) => {
+        const files = Array.from(event.target.files || []);
+        event.target.value = '';
+        if (files.length > 1) {
+            await sendSelectedFilesBatch(dev.id, files);
+        } else if (files[0]) {
+            const [file] = files;
+            await sendSelectedFile(dev.id, file);
+        }
+    });
+
+    return card;
+}
+
+function getSendCardDeviceId(card) {
+    return card?.dataset?.deviceId || String(card?.id || '').replace(/^card-/, '');
+}
+
+function updateSendCardDeviceMeta(card, dev) {
+    if (!card || !dev?.id) {
+        return;
+    }
+    card.dataset.deviceId = dev.id;
+    card.dataset.endpoint = dev.ip ? `${dev.ip}:${dev.port || DESKTOP_DISCOVERY_DEFAULT_PORT}` : '';
+    const name = $(`name-${dev.id}`);
+    if (!name) {
+        return;
+    }
+    const conn = connections[dev.id];
+    name.textContent = (conn?.authenticated && conn.hostname)
+        ? conn.hostname
+        : (dev.name || dev.hostName || dev.ip || '未命名设备');
+}
+
+function syncNewSendCardConnectionState(deviceId) {
+    const conn = connections[deviceId];
+    if (isConnectionReady(conn)) {
+        updateDeviceUI(deviceId, 'connected', conn.hostname || undefined);
+    } else if (conn?.ws && conn.ws.readyState === WebSocket.CONNECTING) {
+        updateDeviceUI(deviceId, 'connecting');
+    } else if (conn?.ws && conn.ws.readyState === WebSocket.OPEN && !conn.authenticated) {
+        updateDeviceUI(deviceId, 'connecting', '认证中...');
+    }
+}
+
+function isSendCardOrderAligned(container, orderedIds) {
+    const currentIds = Array.from(container.children)
+        .map((card) => getSendCardDeviceId(card))
+        .filter(Boolean);
+    return currentIds.length === orderedIds.length
+        && currentIds.every((id, index) => id === orderedIds[index]);
+}
+
+function reorderSendCards(container, orderedIds) {
+    let cursor = container.firstElementChild;
+    orderedIds.forEach((deviceId) => {
+        const card = $(`card-${deviceId}`);
+        if (!card || card.parentElement !== container) {
+            return;
+        }
+        if (card === cursor) {
+            cursor = cursor.nextElementSibling;
+            return;
+        }
+        container.insertBefore(card, cursor);
+    });
+}
+
+function renderSendCards(devices) {
+    const container = $('send-cards');
+    if (!container) return;
+
+    captureSendDraftsFromDom();
+    pruneSendDrafts(devices);
+
+    const visibleDevices = devices.filter((dev) => dev?.ip);
+    const visibleIds = visibleDevices.map((dev) => dev.id);
+    const visibleIdSet = new Set(visibleIds);
+    const protectedDeviceId = getProtectedSendComposerDeviceId();
+    const existingCards = new Map();
+    let layoutPending = false;
+
+    Array.from(container.children).forEach((card) => {
+        const deviceId = getSendCardDeviceId(card);
+        if (deviceId) {
+            existingCards.set(deviceId, card);
+        }
+    });
+
+    visibleDevices.forEach((dev) => {
+        let card = existingCards.get(dev.id);
+        const isNewCard = !card;
+        if (!card) {
+            card = createSendCard(dev);
+            container.appendChild(card);
+        } else {
+            updateSendCardDeviceMeta(card, dev);
+        }
+        existingCards.delete(dev.id);
+
+        const input = $(`input-${dev.id}`);
+        if (input) {
+            if (protectedDeviceId === dev.id) {
+                setSendDraft(dev.id, input.value);
+            } else {
+                const draft = getSendDraft(dev.id);
+                if (input.value !== draft) {
+                    input.value = draft;
+                }
+            }
+        }
+
+        if (isNewCard) {
+            syncNewSendCardConnectionState(dev.id);
+        }
+    });
+
+    existingCards.forEach((card, deviceId) => {
+        if (deviceId === protectedDeviceId) {
+            layoutPending = true;
+            return;
+        }
+        card.remove();
+    });
+
+    if (protectedDeviceId) {
+        if (!visibleIdSet.has(protectedDeviceId) || !isSendCardOrderAligned(container, visibleIds)) {
+            layoutPending = true;
+        }
+        sendDraftFocusState = null;
+    } else {
+        reorderSendCards(container, visibleIds);
+        restoreSendDraftFocus();
+    }
+
+    if (layoutPending) {
+        sendCardsLayoutPending = true;
+    }
 }
 
 // ============================================
@@ -2574,6 +3815,8 @@ function showView(viewId) {
     if (viewId === 'history-view') {
         scheduleHistoryRender();
     }
+    renderConnectionDiagnostics();
+    syncConnectionDiagnosticsPolling();
 }
 
 function scheduleHistoryRender() {
@@ -3547,14 +4790,267 @@ function initHistoryHeatmapInteractions() {
 // WebSocket 连接
 // ============================================
 
-async function connectAll({ refreshDiscovery = false } = {}) {
+function initConnectionRecoveryLifecycle() {
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+            connectionRecoveryState.lastVisibleAt = Date.now();
+            scheduleConnectionRecovery('visibility-visible', {
+                forceDiscovery: true,
+                onlyIfUnhealthy: true,
+            });
+        } else {
+            debugLog('recovery:page_hidden', { visibilityState: document.visibilityState });
+        }
+    });
+
+    window.addEventListener('pageshow', (event) => {
+        scheduleConnectionRecovery('pageshow', {
+            forceDiscovery: Boolean(event.persisted),
+            onlyIfUnhealthy: true,
+        });
+    });
+
+    window.addEventListener('focus', () => {
+        scheduleConnectionRecovery('window-focus', {
+            forceDiscovery: false,
+            onlyIfUnhealthy: true,
+        });
+    });
+
+    window.addEventListener('online', () => {
+        debugLog('network:online');
+        scheduleConnectionRecovery('network-online', {
+            forceDiscovery: true,
+            onlyIfUnhealthy: true,
+        });
+    });
+
+    window.addEventListener('offline', () => {
+        debugLog('network:offline');
+    });
+}
+
+function getDesktopConnectionEndpoint(ip, port = DESKTOP_DISCOVERY_DEFAULT_PORT) {
+    return `${String(ip || '').trim()}:${String(port || DESKTOP_DISCOVERY_DEFAULT_PORT).trim() || DESKTOP_DISCOVERY_DEFAULT_PORT}`;
+}
+
+function getConnectionTargetIdSet(targetDeviceIds) {
+    if (!Array.isArray(targetDeviceIds) || targetDeviceIds.length === 0) {
+        return null;
+    }
+    return new Set(targetDeviceIds.map((id) => String(id || '').trim()).filter(Boolean));
+}
+
+function shouldIncludeConnectionTarget(device, targetIdSet) {
+    return !targetIdSet || targetIdSet.has(device.id);
+}
+
+function markUnusableDesktopEndpoint(device) {
+    if (!device?.id) return;
+    const reason = getUnusableDesktopEndpointReason(device);
+    if (!reason) return;
+
+    const conn = connections[device.id];
+    if (conn) {
+        clearTimers(conn);
+        if (conn.ws) {
+            const previousWs = conn.ws;
+            conn.ws = null;
+            previousWs.close();
+        }
+        conn.authenticated = false;
+        conn.hostname = null;
+    }
+
+    const detail = reason === 'android_loopback' ? '手机端不可用地址' : '未配置地址';
+    updateDeviceUI(device.id, 'error', detail);
+    debugLog('connect:skipped_unusable_endpoint', {
+        deviceId: device.id,
+        reason,
+        endpoint: getDesktopConnectionEndpoint(device.ip, device.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+    });
+}
+
+function markUnusableDesktopEndpoints(devices = getDevices(), targetIdSet = null) {
+    devices
+        .filter((device) => device && device.id && !isUsableDesktopEndpoint(device))
+        .filter((device) => shouldIncludeConnectionTarget(device, targetIdSet))
+        .forEach((device) => markUnusableDesktopEndpoint(device));
+}
+
+function getConnectionHealthSnapshot(devices = getDevices()) {
+    const now = Date.now();
+    const items = devices
+        .filter((device) => device && device.id && isUsableDesktopEndpoint(device))
+        .map((device) => {
+            const conn = connections[device.id] || null;
+            const ready = isConnectionReady(conn);
+            const lastMessageAgeMs = conn?.lastMessageAt ? now - Number(conn.lastMessageAt) : null;
+            const stale = ready && lastMessageAgeMs != null && lastMessageAgeMs > CONNECTION_STALE_AFTER_MS;
+            const readyState = conn?.ws ? conn.ws.readyState : null;
+            const reasons = [];
+            if (!conn) reasons.push('no_connection');
+            if (conn && !conn.ws) reasons.push('no_socket');
+            if (conn?.ws && conn.ws.readyState !== WebSocket.OPEN) reasons.push(`ws_${conn.ws.readyState}`);
+            if (conn && !conn.authenticated) reasons.push('not_authenticated');
+            if (stale) reasons.push('stale_heartbeat');
+            return {
+                id: device.id,
+                name: device.name || device.hostName || device.ip || device.id,
+                endpoint: getDesktopConnectionEndpoint(device.ip, device.port || DESKTOP_DISCOVERY_DEFAULT_PORT),
+                ready,
+                stale,
+                readyState,
+                authenticated: Boolean(conn?.authenticated),
+                lastMessageAgeMs,
+                reasons,
+                unhealthy: !ready || stale,
+            };
+        });
+
+    return {
+        checkedAtMs: now,
+        deviceCount: items.length,
+        unhealthyCount: items.filter((item) => item.unhealthy).length,
+        staleCount: items.filter((item) => item.stale).length,
+        items,
+    };
+}
+
+function scheduleConnectionRecovery(reason, {
+    forceDiscovery = false,
+    onlyIfUnhealthy = true,
+    delayMs = CONNECTION_RECOVERY_DEBOUNCE_MS,
+} = {}) {
+    const snapshot = getConnectionHealthSnapshot();
+    if (!snapshot.deviceCount) {
+        return;
+    }
+    if (onlyIfUnhealthy && snapshot.unhealthyCount === 0) {
+        return;
+    }
+
+    clearTimeout(connectionRecoveryState.timer);
+    connectionRecoveryState.timer = setTimeout(() => {
+        void runConnectionRecovery(reason, { forceDiscovery, onlyIfUnhealthy });
+    }, Math.max(0, delayMs));
+
+    debugLog('recovery:scheduled', {
+        reason,
+        forceDiscovery,
+        unhealthyCount: snapshot.unhealthyCount,
+        deviceCount: snapshot.deviceCount,
+        unhealthyDevices: snapshot.items
+            .filter((item) => item.unhealthy)
+            .map((item) => ({
+                deviceId: item.id,
+                deviceName: item.name,
+                endpoint: item.endpoint,
+                reasons: item.reasons,
+            })),
+    });
+}
+
+async function runConnectionRecovery(reason, {
+    forceDiscovery = false,
+    onlyIfUnhealthy = true,
+} = {}) {
+    if (connectionRecoveryState.inFlight) {
+        debugLog('recovery:join_inflight', { reason });
+        return connectionRecoveryState.inFlight;
+    }
+
+    const snapshot = getConnectionHealthSnapshot();
+    if (!snapshot.deviceCount) {
+        return null;
+    }
+    if (onlyIfUnhealthy && snapshot.unhealthyCount === 0) {
+        debugLog('recovery:skip_healthy', { reason, deviceCount: snapshot.deviceCount });
+        return null;
+    }
+
+    const now = Date.now();
+    const sinceLastAttempt = now - Number(connectionRecoveryState.lastAttemptAt || 0);
+    if (sinceLastAttempt < CONNECTION_RECOVERY_COOLDOWN_MS) {
+        const delayMs = CONNECTION_RECOVERY_COOLDOWN_MS - sinceLastAttempt;
+        debugLog('recovery:cooldown', { reason, delayMs });
+        scheduleConnectionRecovery(reason, { forceDiscovery, onlyIfUnhealthy, delayMs });
+        return null;
+    }
+
+    const sinceForceDiscovery = now - Number(connectionRecoveryState.lastForceDiscoveryAt || 0);
+    const shouldForceDiscovery = Boolean(forceDiscovery && sinceForceDiscovery >= CONNECTION_RECOVERY_FORCE_DISCOVERY_COOLDOWN_MS);
+    if (shouldForceDiscovery) {
+        connectionRecoveryState.lastForceDiscoveryAt = now;
+    }
+    connectionRecoveryState.lastAttemptAt = now;
+
+    const targetDeviceIds = onlyIfUnhealthy
+        ? snapshot.items.filter((item) => item.unhealthy).map((item) => item.id)
+        : snapshot.items.map((item) => item.id);
+
+    debugLog('recovery:start', {
+        reason,
+        forceDiscovery: shouldForceDiscovery,
+        requestedForceDiscovery: Boolean(forceDiscovery),
+        unhealthyCount: snapshot.unhealthyCount,
+        deviceCount: snapshot.deviceCount,
+        targetDeviceIds,
+    });
+
+    connectionRecoveryState.inFlight = connectAll({
+        refreshDiscovery: true,
+        alignNativeBackgroundConfig: true,
+        forceDiscovery: shouldForceDiscovery,
+        discoveryReason: `recovery:${reason}`,
+        targetDeviceIds,
+        clearNativeBackgroundBeforeDiscovery: false,
+    })
+        .then(() => {
+            const after = getConnectionHealthSnapshot();
+            debugLog('recovery:done', {
+                reason,
+                unhealthyCount: after.unhealthyCount,
+                deviceCount: after.deviceCount,
+            });
+            return after;
+        })
+        .catch((error) => {
+            debugLog('recovery:error', { reason, error: error?.message || String(error) });
+            throw error;
+        })
+        .finally(() => {
+            connectionRecoveryState.inFlight = null;
+        });
+
+    return connectionRecoveryState.inFlight;
+}
+
+async function connectAll({
+    refreshDiscovery = false,
+    alignNativeBackgroundConfig = false,
+    forceDiscovery = false,
+    discoveryReason = 'connect-all',
+    targetDeviceIds = null,
+    clearNativeBackgroundBeforeDiscovery = true,
+} = {}) {
+    const targetIdSet = getConnectionTargetIdSet(targetDeviceIds);
+    if (refreshDiscovery && alignNativeBackgroundConfig && clearNativeBackgroundBeforeDiscovery) {
+        // 先清空原生后台的旧 endpoint，避免扫描更新前继续连错地址。
+        syncNativeBackgroundClipboardConfig(clientIdentity, []);
+    }
+
     if (refreshDiscovery) {
-        await requestSmartDiscoveryRefresh('connect-all', { force: true });
+        await requestSmartDiscoveryRefresh(discoveryReason, { force: forceDiscovery });
     }
 
     const devices = getDevices();
+    markUnusableDesktopEndpoints(devices, targetIdSet);
+    if (alignNativeBackgroundConfig) {
+        syncNativeBackgroundClipboardConfig(clientIdentity, devices);
+    }
     devices.forEach(dev => {
-        if (dev.ip) {
+        if (dev.ip && isUsableDesktopEndpoint(dev) && shouldIncludeConnectionTarget(dev, targetIdSet)) {
             connectDevice(dev.id, dev.ip, dev.port || '9001', dev.pin || '');
         }
     });
@@ -3576,6 +5072,20 @@ function disconnectAll() {
 
 function connectDevice(deviceId, ip, port, pin) {
     const conn = ensureConnection(deviceId);
+    const normalizedPort = String(port || DESKTOP_DISCOVERY_DEFAULT_PORT).trim() || String(DESKTOP_DISCOVERY_DEFAULT_PORT);
+    const normalizedPin = String(pin || '').trim();
+    const endpoint = getDesktopConnectionEndpoint(ip, normalizedPort);
+
+    if (!isUsableDesktopEndpoint({ id: deviceId, ip, port: normalizedPort })) {
+        markUnusableDesktopEndpoint({ id: deviceId, ip, port: normalizedPort });
+        return;
+    }
+
+    if (isConnectionReady(conn) && conn.endpoint === endpoint && conn.pin === normalizedPin) {
+        debugLog('connect:skip_existing_ready', { deviceId, endpoint });
+        updateDeviceUI(deviceId, 'connected', conn.hostname || undefined);
+        return;
+    }
 
     clearTimers(conn);
     if (conn.ws) {
@@ -3584,18 +5094,30 @@ function connectDevice(deviceId, ip, port, pin) {
         previousWs.close();
     }
     conn.authenticated = false;
+    conn.hostname = null;
+    conn.endpoint = endpoint;
+    conn.ip = String(ip || '').trim();
+    conn.port = normalizedPort;
+    conn.pin = normalizedPin;
 
     updateDeviceUI(deviceId, 'connecting');
 
-    const url = `ws://${ip}:${port}/ws`;
+    const url = `ws://${conn.ip}:${conn.port}/ws`;
     console.log(`[${deviceId}] 正在连接: ${url}`);
+    debugLog('connect:start', { deviceId, ip: conn.ip, port: conn.port, endpoint });
     let ws;
     try {
         ws = new WebSocket(url);
     } catch (e) {
         console.error(`[${deviceId}] WebSocket 创建失败:`, e);
+        debugLog('connect:create_error', { deviceId, ip: conn.ip, port: conn.port, endpoint, error: e?.message || String(e) });
         updateDeviceUI(deviceId, 'error', '连接失败');
-        scheduleReconnect(deviceId, ip, port, pin);
+        scheduleReconnect(deviceId, conn.ip, conn.port, conn.pin);
+        scheduleConnectionRecovery('socket-create-error', {
+            forceDiscovery: true,
+            onlyIfUnhealthy: true,
+            delayMs: 0,
+        });
         return;
     }
 
@@ -3608,9 +5130,10 @@ function connectDevice(deviceId, ip, port, pin) {
         if (conn.ws !== ws) return;
         conn.lastMessageAt = Date.now();
         console.log(`[${deviceId}] WebSocket 已连接，发送 PIN 认证`);
+        debugLog('connect:open', { deviceId, readyState: ws.readyState });
         ws.send(JSON.stringify({
             action: 'auth',
-            pin: pin,
+            pin: conn.pin,
             device_id: clientIdentity.id,
             device_name: clientIdentity.name,
             can_receive_files: supportsNativeFileReceive(),
@@ -3667,10 +5190,12 @@ function connectDevice(deviceId, ip, port, pin) {
                 conn.authenticated = true;
                 conn.hostname = data.hostname;
                 conn.reconnectAttempts = 0;
+                debugLog('connect:auth_ok', { deviceId, hostname: data.hostname });
                 reconcileAuthenticatedDesktopIdentity(deviceId, data);
                 updateDeviceUI(deviceId, 'connected', data.hostname);
-                startHeartbeat(deviceId, ip, port, pin);
+                startHeartbeat(deviceId, conn.ip, conn.port, conn.pin);
             } else {
+                debugLog('connect:auth_fail', { deviceId, error: data.error || 'PIN 错误' });
                 updateDeviceUI(deviceId, 'error', data.error || 'PIN 错误');
             }
             return;
@@ -3684,18 +5209,30 @@ function connectDevice(deviceId, ip, port, pin) {
 
     ws.onerror = () => {
         if (conn.ws !== ws) return;
+        debugLog('connect:error', { deviceId });
         updateDeviceUI(deviceId, 'error', '连接出错');
+        scheduleConnectionRecovery('socket-error', {
+            forceDiscovery: false,
+            onlyIfUnhealthy: true,
+            delayMs: 1200,
+        });
     };
 
     ws.onclose = () => {
         if (conn.ws !== ws) return;
+        debugLog('connect:close', { deviceId });
         rejectOutboundDesktopTransfersForDevice(deviceId, '连接已断开');
         conn.ws = null;
         conn.authenticated = false;
         conn.hostname = null;
         updateDeviceUI(deviceId, 'disconnected', '已断开');
         clearTimers(conn);
-        scheduleReconnect(deviceId, ip, port, pin);
+        scheduleReconnect(deviceId, conn.ip, conn.port, conn.pin);
+        scheduleConnectionRecovery('socket-close', {
+            forceDiscovery: false,
+            onlyIfUnhealthy: true,
+            delayMs: 1200,
+        });
     };
 }
 
@@ -3719,6 +5256,17 @@ function startHeartbeat(deviceId, ip, port, pin) {
             const quietFor = now - Number(conn.lastMessageAt || 0);
             if (pendingFor >= HEARTBEAT_TIMEOUT && quietFor >= HEARTBEAT_TIMEOUT) {
                 console.warn(`[${deviceId}] 心跳超时，关闭 WebSocket 以触发重连`);
+                debugLog('heartbeat:timeout', {
+                    deviceId,
+                    pendingFor,
+                    quietFor,
+                    readyState: conn.ws.readyState,
+                });
+                scheduleConnectionRecovery('heartbeat-timeout', {
+                    forceDiscovery: true,
+                    onlyIfUnhealthy: true,
+                    delayMs: 0,
+                });
                 conn.ws.close();
             }
             return;
@@ -3730,6 +5278,15 @@ function startHeartbeat(deviceId, ip, port, pin) {
             conn.heartbeatStartedAt = now;
         } catch (error) {
             console.warn(`[${deviceId}] 心跳发送失败，关闭 WebSocket 以触发重连`, error);
+            debugLog('heartbeat:send_error', {
+                deviceId,
+                error: error?.message || String(error),
+            });
+            scheduleConnectionRecovery('heartbeat-send-error', {
+                forceDiscovery: true,
+                onlyIfUnhealthy: true,
+                delayMs: 0,
+            });
             if (conn.ws) {
                 conn.ws.close();
             }
@@ -3740,13 +5297,29 @@ function startHeartbeat(deviceId, ip, port, pin) {
 function scheduleReconnect(deviceId, ip, port, pin) {
     const conn = connections[deviceId];
     if (!conn) return;
+    if (!isUsableDesktopEndpoint({ id: deviceId, ip, port })) {
+        markUnusableDesktopEndpoint({ id: deviceId, ip, port });
+        return;
+    }
     clearTimeout(conn.reconnectTimer);
-    void requestSmartDiscoveryRefresh(`reconnect:${deviceId}`);
     const attempt = Math.max(0, Number(conn.reconnectAttempts || 0));
+    const forceDiscovery = attempt >= RECONNECT_FORCE_DISCOVERY_AFTER_ATTEMPTS;
+    void requestSmartDiscoveryRefresh(`reconnect:${deviceId}`, { force: forceDiscovery });
     const delay = Math.min(RECONNECT_MAX_INTERVAL, RECONNECT_BASE_INTERVAL * (2 ** Math.min(attempt, 6)));
     conn.reconnectAttempts = attempt + 1;
+    debugLog('reconnect:scheduled', {
+        deviceId,
+        attempt: conn.reconnectAttempts,
+        delay,
+        forceDiscovery,
+        endpoint: `${ip}:${port}`,
+    });
     conn.reconnectTimer = setTimeout(() => {
         const latest = findDeviceByAnyId(deviceId, getDevices());
+        if (latest && !isUsableDesktopEndpoint(latest)) {
+            markUnusableDesktopEndpoint(latest);
+            return;
+        }
         connectDevice(
             deviceId,
             latest?.ip || ip,
@@ -4219,6 +5792,102 @@ function setActionButtonsDisabled(deviceId, disabled) {
     if (fileBtn) fileBtn.disabled = disabled;
 }
 
+function isConnectionReady(conn) {
+    return Boolean(conn?.authenticated && conn.ws && conn.ws.readyState === WebSocket.OPEN);
+}
+
+function getDeviceDisplayName(deviceId) {
+    const device = findDeviceByAnyId(deviceId, getDevices());
+    return device?.name || device?.hostName || device?.ip || '目标电脑';
+}
+
+async function ensureReadyConnectionForSend(deviceId, {
+    timeoutMs = SEND_CONNECTION_WAIT_MS,
+    showConnectingToast = true,
+} = {}) {
+    let conn = connections[deviceId];
+    if (isConnectionReady(conn)) {
+        debugLog('ensureReady:already_ready', {
+            deviceId,
+            readyState: conn.ws.readyState,
+            authenticated: Boolean(conn.authenticated),
+        });
+        return conn;
+    }
+
+    const device = findDeviceByAnyId(deviceId, getDevices());
+    if (!device?.ip) {
+        debugLog('ensureReady:no_device_ip', { deviceId });
+        showToast('设备地址缺失，请到设置里重新选择电脑');
+        updateDeviceUI(deviceId, 'error', '未配置地址');
+        return null;
+    }
+    if (!isUsableDesktopEndpoint(device)) {
+        const reason = getUnusableDesktopEndpointReason(device);
+        debugLog('ensureReady:unusable_endpoint', {
+            deviceId,
+            reason,
+            endpoint: getDesktopConnectionEndpoint(device.ip, device.port || '9001'),
+        });
+        showToast('这个电脑的地址在手机端不可用，请重新扫描或修改 IP');
+        markUnusableDesktopEndpoint(device);
+        return null;
+    }
+
+    const label = getDeviceDisplayName(deviceId);
+    if (showConnectingToast) {
+        showToast(`正在重连 ${label}`);
+    }
+    debugLog('ensureReady:reconnect', { deviceId, ip: device.ip, port: device.port || '9001' });
+    connectDevice(deviceId, device.ip, device.port || '9001', device.pin || '');
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        await sleep(SEND_CONNECTION_POLL_MS);
+        conn = connections[deviceId];
+        if (isConnectionReady(conn)) {
+            debugLog('ensureReady:ready_after_wait', { deviceId });
+            return conn;
+        }
+    }
+
+    debugLog('ensureReady:timeout', {
+        deviceId,
+        readyState: connections[deviceId]?.ws?.readyState,
+        authenticated: Boolean(connections[deviceId]?.authenticated),
+    });
+
+    await runConnectionRecovery(`send-timeout:${deviceId}`, {
+        forceDiscovery: true,
+        onlyIfUnhealthy: true,
+    }).catch((error) => {
+        debugLog('ensureReady:recovery_error', {
+            deviceId,
+            error: error?.message || String(error),
+        });
+        return null;
+    });
+
+    const recoveryDeadline = Date.now() + timeoutMs;
+    while (Date.now() < recoveryDeadline) {
+        await sleep(SEND_CONNECTION_POLL_MS);
+        conn = connections[deviceId];
+        if (isConnectionReady(conn)) {
+            debugLog('ensureReady:ready_after_recovery', { deviceId });
+            return conn;
+        }
+    }
+
+    conn = connections[deviceId];
+    if (isConnectionReady(conn)) {
+        debugLog('ensureReady:ready_after_recovery', { deviceId });
+        return conn;
+    }
+
+    showToast(`${label} 未连接，请稍后再试`);
+    return null;
+}
+
 async function sendDeviceAction(deviceId, {
     action,
     payload = {},
@@ -4230,13 +5899,39 @@ async function sendDeviceAction(deviceId, {
     successToast = '',
     timeoutMs = 5000,
 }) {
-    const conn = connections[deviceId];
     const btn = $(buttonId);
     const input = $(`input-${deviceId}`);
+    let conn = connections[deviceId];
 
-    if (!btn || !conn || !conn.authenticated || !conn.ws) {
+    debugLog('sendAction:start', {
+        deviceId,
+        action,
+        buttonId,
+        hasButton: Boolean(btn),
+        hasInput: Boolean(input),
+        readyState: conn?.ws?.readyState,
+        authenticated: Boolean(conn?.authenticated),
+    });
+
+    if (!btn) {
+        return { ok: false, error: '操作按钮不存在' };
+    }
+
+    if (!isConnectionReady(conn)) {
+        conn = await ensureReadyConnectionForSend(deviceId);
+    }
+
+    if (!isConnectionReady(conn)) {
+        debugLog('sendAction:not_ready_after_ensure', {
+            deviceId,
+            action,
+            readyState: conn?.ws?.readyState,
+            authenticated: Boolean(conn?.authenticated),
+        });
         return { ok: false, error: '未连接' };
     }
+
+    debugLog('sendAction:ready', { deviceId, action });
 
     const originalText = btn.textContent;
     btn.classList.add('sending');
@@ -4245,6 +5940,12 @@ async function sendDeviceAction(deviceId, {
 
     try {
         const result = await sendDesktopRequest(conn, { action, ...payload }, timeoutMs);
+        debugLog('sendAction:result', {
+            deviceId,
+            action,
+            status: result?.status,
+            error: result?.error || '',
+        });
 
         if (result.status === 'ok') {
             if (historyEntry) {
@@ -4274,6 +5975,11 @@ async function sendDeviceAction(deviceId, {
         btn.textContent = '✗';
         return { ok: false, error: result.error || '操作失败' };
     } catch (e) {
+        debugLog('sendAction:catch', {
+            deviceId,
+            action,
+            error: e.message || '操作失败',
+        });
         if (historyEntry) {
             historyEntry.status = 'failed';
             updateHistory(historyEntry);
@@ -4295,11 +6001,23 @@ async function sendDeviceAction(deviceId, {
 }
 
 async function sendText(deviceId) {
-    const conn = connections[deviceId];
-    const input = $(`input-${deviceId}`);
-    const text = input.value.trim();
+    debugLog('sendText:start', { deviceId });
+    const text = await resolveTextToSend(deviceId);
+    if (!text) {
+        debugLog('sendText:no_text', { deviceId });
+        return;
+    }
+    debugLog('sendText:resolved', { deviceId, textLength: text.length });
 
-    if (!text || !conn || !conn.authenticated || !conn.ws) return;
+    const conn = await ensureReadyConnectionForSend(deviceId);
+    if (!isConnectionReady(conn)) {
+        debugLog('sendText:not_ready', {
+            deviceId,
+            readyState: conn?.ws?.readyState,
+            authenticated: Boolean(conn?.authenticated),
+        });
+        return;
+    }
 
     const historyEntry = {
         id: Date.now(),
@@ -4317,6 +6035,7 @@ async function sendText(deviceId) {
         pendingText: '发送中...',
         clearInput: true,
         historyEntry,
+        failureToast: true,
     });
 }
 
@@ -4329,11 +6048,25 @@ async function sendEnter(deviceId) {
 }
 
 async function sendTextAndEnter(deviceId) {
-    const conn = connections[deviceId];
     const input = $(`input-${deviceId}`);
-    const text = input.value.trim();
 
-    if (!text || !conn || !conn.authenticated || !conn.ws) return;
+    debugLog('sendTextAndEnter:start', { deviceId });
+    const text = await resolveTextToSend(deviceId);
+    if (!text) {
+        debugLog('sendTextAndEnter:no_text', { deviceId });
+        return;
+    }
+    debugLog('sendTextAndEnter:resolved', { deviceId, textLength: text.length });
+
+    const conn = await ensureReadyConnectionForSend(deviceId);
+    if (!isConnectionReady(conn)) {
+        debugLog('sendTextAndEnter:not_ready', {
+            deviceId,
+            readyState: conn?.ws?.readyState,
+            authenticated: Boolean(conn?.authenticated),
+        });
+        return;
+    }
 
     const historyEntry = {
         id: Date.now(),
@@ -4360,6 +6093,22 @@ async function sendTextAndEnter(deviceId) {
         input.value = '';
         setSendDraft(deviceId, '');
     }
+}
+
+async function resolveTextToSend(deviceId) {
+    const input = $(`input-${deviceId}`);
+    const typedText = (input?.value || '').trim();
+    if (typedText) {
+        return typedText;
+    }
+
+    const clipboardText = await readClipboardText();
+    if (clipboardText) {
+        return clipboardText;
+    }
+
+    showToast('输入框和剪贴板都没有可发送文字');
+    return '';
 }
 
 function readFileAsDataUrl(file) {
@@ -4502,9 +6251,16 @@ function sendWsJson(ws, payload) {
 
 function sendDesktopRequest(conn, payload, timeoutMs = 5000) {
     if (!conn || !conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
+        debugLog('desktopRequest:not_ready', {
+            action: payload?.action,
+            hasConn: Boolean(conn),
+            readyState: conn?.ws?.readyState,
+            authenticated: Boolean(conn?.authenticated),
+        });
         return Promise.reject(new Error('未连接'));
     }
     if (conn._sendCallback) {
+        debugLog('desktopRequest:busy', { action: payload?.action });
         return Promise.reject(new Error('当前有未完成操作'));
     }
 
@@ -4522,15 +6278,33 @@ function sendDesktopRequest(conn, payload, timeoutMs = 5000) {
             }
             handler(value);
         };
-        const callback = finish(resolve);
+        const callback = finish((value) => {
+            debugLog('desktopRequest:response', {
+                action: payload?.action,
+                status: value?.status,
+                error: value?.error || '',
+            });
+            resolve(value);
+        });
         timer = setTimeout(() => {
+            debugLog('desktopRequest:timeout', { action: payload?.action, timeoutMs });
             finish(reject)(new Error('超时'));
         }, timeoutMs);
 
         conn._sendCallback = callback;
         try {
+            debugLog('desktopRequest:send', {
+                action: payload?.action,
+                textLength: payload?.text ? payload.text.length : 0,
+                readyState: conn.ws.readyState,
+                authenticated: Boolean(conn.authenticated),
+            });
             sendWsJson(conn.ws, payload);
         } catch (error) {
+            debugLog('desktopRequest:send_error', {
+                action: payload?.action,
+                error: error instanceof Error ? error.message : String(error || '发送失败'),
+            });
             finish(reject)(error instanceof Error ? error : new Error(String(error || '发送失败')));
         }
     });
@@ -5422,10 +7196,25 @@ function getHistory() {
     return hydrated;
 }
 
+function persistNativeHistoryEntry(entry) {
+    if (!nativeHistoryStoreEnabled || !window.NativeHistory?.upsertHistoryEntry) {
+        return;
+    }
+    try {
+        const result = JSON.parse(window.NativeHistory.upsertHistoryEntry(JSON.stringify(entry)) || '{}');
+        if (result.ok === false) {
+            throw new Error(result.error || 'SQLite 写入失败');
+        }
+    } catch (error) {
+        console.warn('单条历史写入 SQLite 失败', error);
+    }
+}
+
 function addHistory(entry) {
-    const history = getHistory();
+    const history = readStoredHistoryEntries().slice();
     history.unshift(entry);
-    setStoredHistoryRaw(JSON.stringify(history));
+    setStoredHistoryRaw(JSON.stringify(history), { persistNative: false });
+    persistNativeHistoryEntry(entry);
     persistHistory();
 }
 
@@ -5639,7 +7428,7 @@ function resolveHistoryImportTargetId(targetAlias, targetDeviceName, targetServe
     return '';
 }
 
-function waitForNativeBridgeEvent(eventName, invokeNative) {
+function waitForNativeBridgeEvent(eventName, invokeNative, timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
         let settled = false;
 
@@ -5656,7 +7445,7 @@ function waitForNativeBridgeEvent(eventName, invokeNative) {
             settled = true;
             window.removeEventListener(eventName, handler);
             reject(new Error('原生操作超时'));
-        }, 15000);
+        }, timeoutMs);
 
         window.addEventListener(eventName, handler);
 
@@ -5669,6 +7458,496 @@ function waitForNativeBridgeEvent(eventName, invokeNative) {
             reject(error);
         }
     });
+}
+
+function normalizeHomeVaultUrl(rawUrl = '') {
+    const trimmed = String(rawUrl || '').trim() || HOME_VAULT_DEFAULT_URL;
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
+        ? trimmed
+        : `http://${trimmed}`;
+    return withScheme.replace(/\/+$/, '');
+}
+
+function normalizeHomeVaultHostToken(value = '') {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/\.local$/, '')
+        .replace(/[^a-z0-9]/g, '');
+}
+
+function resolveHomeVaultUrlForNetwork(rawUrl = '') {
+    const normalized = normalizeHomeVaultUrl(rawUrl);
+    let url;
+    try {
+        url = new URL(normalized);
+    } catch (error) {
+        return normalized;
+    }
+
+    const host = url.hostname || '';
+    if (!host.toLowerCase().endsWith('.local')) {
+        return normalized;
+    }
+
+    const targetToken = normalizeHomeVaultHostToken(host);
+    const devices = getDevices();
+    const matched = devices.find((device) => {
+        if (!device?.ip) return false;
+        const labels = [device.name, device.hostName, device.hostname].filter(Boolean);
+        return labels.some((label) => {
+            const labelToken = normalizeHomeVaultHostToken(label);
+            return labelToken && (
+                labelToken === targetToken
+                || labelToken.includes(targetToken)
+                || targetToken.includes(labelToken)
+            );
+        });
+    });
+
+    if (!matched?.ip) {
+        try {
+            const fallback = new URL(HOME_VAULT_DEFAULT_URL);
+            url.hostname = fallback.hostname;
+            if (!url.port && fallback.port) {
+                url.port = fallback.port;
+            }
+            return url.toString().replace(/\/+$/, '');
+        } catch (error) {
+            return normalized;
+        }
+    }
+
+    url.hostname = matched.ip;
+    return url.toString().replace(/\/+$/, '');
+}
+
+function getHomeVaultSettings() {
+    const settings = getStoredSettingsObject();
+    const homeVault = settings.homeVault && typeof settings.homeVault === 'object'
+        ? settings.homeVault
+        : {};
+    return {
+        url: resolveHomeVaultUrlForNetwork(homeVault.url || HOME_VAULT_DEFAULT_URL),
+        lastSyncedAt: homeVault.lastSyncedAt || '',
+        lastEntryCount: Number(homeVault.lastEntryCount || 0),
+        lastRestoredAt: homeVault.lastRestoredAt || '',
+        lastRestoreCount: Number(homeVault.lastRestoreCount || 0),
+    };
+}
+
+function saveHomeVaultSettings(patch = {}) {
+    const settings = getStoredSettingsObject();
+    const current = getHomeVaultSettings();
+    saveStoredSettingsObject({
+        ...settings,
+        homeVault: {
+            ...current,
+            ...patch,
+            url: resolveHomeVaultUrlForNetwork(patch.url || current.url),
+        },
+    });
+}
+
+function setHomeVaultStatus(message, tone = '') {
+    const status = $('home-vault-sync-status');
+    if (!status) return;
+    status.textContent = message;
+    status.classList.toggle('success', tone === 'success');
+    status.classList.toggle('error', tone === 'error');
+}
+
+function formatProgressBytes(sizeBytes) {
+    const value = Number(sizeBytes || 0);
+    if (!Number.isFinite(value) || value <= 0) {
+        return '0 B';
+    }
+    return formatFileSize(value);
+}
+
+function buildHomeVaultRestoreProgressDetail(progress = {}) {
+    const totalEntries = Number(progress.totalEntries || 0);
+    const processedEntries = Number(progress.processedEntries || 0);
+    const totalMedia = Number(progress.totalMedia || progress.mediaReferenceCount || 0);
+    const downloadedMedia = Number(progress.downloadedMedia || progress.downloadedMediaCount || 0);
+    const skippedMedia = Number(progress.skippedMedia || progress.skippedMediaCount || 0);
+    const failedMedia = Number(progress.failedMedia || progress.failedMediaCount || 0);
+    const downloadedBytes = Number(progress.downloadedBytes || 0);
+    const existingEntries = Number(progress.existingEntries || progress.existingEntryCount || 0);
+    const newEntries = Number(progress.newEntries || progress.newEntryCount || 0);
+    const currentFileName = String(progress.currentFileName || '').trim();
+    const currentFileBytes = Number(progress.currentFileBytes || 0);
+    const currentFileTotalBytes = Number(progress.currentFileTotalBytes || 0);
+    const parts = [];
+
+    if (totalEntries || processedEntries) {
+        parts.push(`历史 ${processedEntries}/${totalEntries || '?'}`);
+    }
+    if (existingEntries || newEntries) {
+        parts.push(`新增 ${newEntries}`);
+        parts.push(`覆盖 ${existingEntries}`);
+    }
+    if (totalMedia || downloadedMedia || skippedMedia || failedMedia) {
+        parts.push(`媒体 ${downloadedMedia}/${totalMedia || '?'}`);
+    }
+    if (skippedMedia) {
+        parts.push(`已缓存跳过 ${skippedMedia}`);
+    }
+    if (failedMedia) {
+        parts.push(`失败 ${failedMedia}`);
+    }
+    if (downloadedBytes) {
+        parts.push(`已下载 ${formatProgressBytes(downloadedBytes)}`);
+    }
+    if (currentFileName) {
+        const compactName = currentFileName.length > 38
+            ? `...${currentFileName.slice(-35)}`
+            : currentFileName;
+        const fileProgress = currentFileTotalBytes > 0
+            ? `${formatProgressBytes(currentFileBytes)}/${formatProgressBytes(currentFileTotalBytes)}`
+            : formatProgressBytes(currentFileBytes);
+        parts.push(`当前 ${compactName}${currentFileBytes ? ` ${fileProgress}` : ''}`);
+    }
+
+    return parts.join(' · ') || '等待开始';
+}
+
+function setHomeVaultRestoreProgress(progress = {}, tone = '') {
+    const root = $('home-vault-restore-progress');
+    if (!root) return;
+    const label = $('home-vault-restore-progress-label');
+    const percentText = $('home-vault-restore-progress-percent');
+    const bar = $('home-vault-restore-progress-bar');
+    const detail = $('home-vault-restore-progress-detail');
+    const percent = Math.max(0, Math.min(100, Math.round(Number(progress.percent || 0))));
+    const fallbackLabels = {
+        requesting: '正在连接 Home Vault',
+        manifest: '正在解析恢复清单',
+        processing: '正在恢复历史',
+        writing: '正在写入 SQLite',
+        done: '恢复完成',
+    };
+
+    root.classList.remove('hidden');
+    root.setAttribute('aria-hidden', 'false');
+    root.classList.toggle('success', tone === 'success' || progress.phase === 'done');
+    root.classList.toggle('error', tone === 'error');
+    if (label) {
+        label.textContent = progress.message || fallbackLabels[progress.phase] || '正在恢复';
+    }
+    if (percentText) {
+        percentText.textContent = `${percent}%`;
+    }
+    if (bar) {
+        bar.style.width = `${percent}%`;
+    }
+    if (detail) {
+        detail.textContent = buildHomeVaultRestoreProgressDetail(progress);
+    }
+}
+
+function buildHomeVaultPayload(history) {
+    return {
+        schemaVersion: 1,
+        app: 'VibeDrop',
+        deviceId: clientIdentity.id,
+        deviceName: clientIdentity.name,
+        exportedAt: new Date().toISOString(),
+        history: buildHistoryExportData(history),
+    };
+}
+
+async function syncHomeVaultWithFetch(endpoint, payload) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90000);
+    try {
+        const response = await fetch(`${endpoint}/api/android-history`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: controller.signal,
+        });
+        const resultText = await response.text();
+        let result = {};
+        try {
+            result = resultText ? JSON.parse(resultText) : {};
+        } catch (error) {
+            result = { error: resultText || error.message };
+        }
+        if (!response.ok || result.ok === false) {
+            throw new Error(result.error || `HTTP ${response.status}`);
+        }
+        return result;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function restoreHomeVaultWithFetch(endpoint, deviceId, mode = 'compact') {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90000);
+    try {
+        const url = new URL(`${endpoint}/api/android-history/latest`);
+        if (deviceId) {
+            url.searchParams.set('deviceId', deviceId);
+        }
+        url.searchParams.set('mode', mode);
+        const response = await fetch(url.toString(), {
+            method: 'GET',
+            headers: { 'Accept': 'application/json' },
+            signal: controller.signal,
+        });
+        const resultText = await response.text();
+        let result = {};
+        try {
+            result = resultText ? JSON.parse(resultText) : {};
+        } catch (error) {
+            result = { error: resultText || error.message };
+        }
+        if (!response.ok || result.ok === false) {
+            throw new Error(result.error || `HTTP ${response.status}`);
+        }
+        return result;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function syncHomeVaultHistory() {
+    const history = getHistory();
+    if (history.length === 0) {
+        showToast('暂无历史可同步');
+        return;
+    }
+
+    const input = $('home-vault-url-input');
+    const endpoint = resolveHomeVaultUrlForNetwork(input?.value || HOME_VAULT_DEFAULT_URL);
+    if (input) {
+        input.value = endpoint;
+    }
+    saveHomeVaultSettings({ url: endpoint });
+
+    const button = $('sync-home-vault-btn');
+    if (button) {
+        button.disabled = true;
+        button.textContent = '同步中...';
+    }
+    setHomeVaultStatus(`正在同步 ${history.length} 条历史到 ${endpoint}...`);
+
+    const payload = buildHomeVaultPayload(history);
+    try {
+        let result;
+        if (window.NativeHomeVault && window.NativeHomeVault.syncHistory) {
+            result = await waitForNativeBridgeEvent('native-home-vault-sync-result', () => {
+                window.NativeHomeVault.syncHistory(endpoint, JSON.stringify(payload));
+            }, 120000);
+            if (!result.ok) {
+                throw new Error(result.error || '同步失败');
+            }
+            if (result.body) {
+                try {
+                    result = {
+                        ...JSON.parse(result.body),
+                        status: result.status,
+                    };
+                } catch (error) {
+                    result = {
+                        ok: true,
+                        status: result.status,
+                    };
+                }
+            }
+        } else {
+            result = await syncHomeVaultWithFetch(endpoint, payload);
+        }
+
+        const syncedCount = result.historyCount || history.length;
+        const totalCount = result.syncReport?.totalEntryCountInDb
+            || result.syncReport?.uniqueEntryCount
+            || syncedCount;
+        const syncedAt = new Date().toISOString();
+        saveHomeVaultSettings({
+            url: endpoint,
+            lastSyncedAt: syncedAt,
+            lastEntryCount: syncedCount,
+        });
+        setHomeVaultStatus(`已同步 ${syncedCount} 条，Vault 当前 ${totalCount} 条。`, 'success');
+        showToast('已同步到 Mac mini Vault');
+    } catch (error) {
+        const message = error?.name === 'AbortError' ? '同步超时' : (error?.message || '同步失败');
+        setHomeVaultStatus(`同步失败：${message}`, 'error');
+        showToast(`同步失败：${message}`);
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '同步到 Mac mini';
+        }
+    }
+}
+
+async function restoreHomeVaultHistory() {
+    const input = $('home-vault-url-input');
+    const endpoint = resolveHomeVaultUrlForNetwork(input?.value || HOME_VAULT_DEFAULT_URL);
+    if (input) {
+        input.value = endpoint;
+    }
+    saveHomeVaultSettings({ url: endpoint });
+
+    const button = $('restore-home-vault-btn');
+    const syncButton = $('sync-home-vault-btn');
+    if (button) {
+        button.disabled = true;
+        button.textContent = '恢复中...';
+    }
+    if (syncButton) {
+        syncButton.disabled = true;
+    }
+    setHomeVaultStatus(`正在从 ${endpoint} 拉取历史...`);
+    setHomeVaultRestoreProgress({
+        phase: 'requesting',
+        message: '正在连接 Home Vault...',
+        percent: 0,
+    });
+    const progressHandler = (event) => {
+        setHomeVaultRestoreProgress(event.detail || {});
+    };
+    window.addEventListener('native-home-vault-restore-progress', progressHandler);
+
+    try {
+        let result;
+        const deviceId = clientIdentity.id || '';
+        const restoreMode = nativeHistoryStoreEnabled ? 'full-media' : 'compact';
+        if (window.NativeHomeVault && typeof window.NativeHomeVault.restoreHistory === 'function') {
+            result = await waitForNativeBridgeEvent('native-home-vault-restore-result', () => {
+                window.NativeHomeVault.restoreHistory(endpoint, deviceId, restoreMode);
+            }, restoreMode === 'full-media' ? 15 * 60 * 1000 : 120000);
+            if (!result.ok) {
+                throw new Error(result.error || '恢复失败');
+            }
+            if (result.mode === 'full-media' || (!result.body && result.restoredCount != null)) {
+                const currentCount = loadNativeHistoryIntoCache();
+                clearHistoryHeatmapSelection();
+                scheduleHistoryRender();
+                const restoredAt = new Date().toISOString();
+                saveHomeVaultSettings({
+                    url: endpoint,
+                    lastRestoredAt: restoredAt,
+                    lastRestoreCount: result.restoredCount || currentCount,
+                });
+                const mediaText = `媒体 ${result.downloadedMediaCount || 0}/${result.mediaReferenceCount || 0}`;
+                const skippedText = result.skippedMediaCount ? `，缓存跳过 ${result.skippedMediaCount}` : '';
+                const failedText = result.failedMediaCount ? `，失败 ${result.failedMediaCount}` : '';
+                setHomeVaultRestoreProgress({
+                    ...result,
+                    phase: 'done',
+                    message: '恢复完成',
+                    percent: 100,
+                    totalEntries: result.returnedCount || result.restoredCount || currentCount,
+                    processedEntries: result.returnedCount || result.restoredCount || currentCount,
+                    totalMedia: result.mediaReferenceCount || 0,
+                    downloadedMedia: result.downloadedMediaCount || 0,
+                    skippedMedia: result.skippedMediaCount || 0,
+                    failedMedia: result.failedMediaCount || 0,
+                    existingEntries: result.existingEntryCount || 0,
+                    newEntries: result.newEntryCount || 0,
+                }, 'success');
+                const entryText = result.existingEntryCount != null
+                    ? `新增 ${result.newEntryCount || 0} 条，覆盖 ${result.existingEntryCount || 0} 条`
+                    : `已全量恢复 ${result.restoredCount || currentCount} 条`;
+                setHomeVaultStatus(`${entryText}，${mediaText}${skippedText}${failedText}。`, 'success');
+                showToast(`已从 Mac mini 全量恢复 ${result.restoredCount || currentCount} 条`);
+                return;
+            }
+            if (result.body) {
+                try {
+                    result = {
+                        ...JSON.parse(result.body),
+                        status: result.status,
+                    };
+                } catch (error) {
+                    throw new Error('恢复响应不是有效 JSON');
+                }
+            }
+        } else {
+            result = await restoreHomeVaultWithFetch(endpoint, deviceId, 'compact');
+        }
+
+        if (!Array.isArray(result.history)) {
+            throw new Error('Vault 返回的 history 不是数组');
+        }
+
+        const mergeResult = mergeImportedHistoryEntries(result.history);
+        const restoredAt = new Date().toISOString();
+        saveHomeVaultSettings({
+            url: endpoint,
+            lastRestoredAt: restoredAt,
+            lastRestoreCount: mergeResult.added,
+        });
+        const returnedCount = result.returnedCount || result.history.length;
+        setHomeVaultRestoreProgress({
+            phase: 'done',
+            message: '恢复完成',
+            percent: 100,
+            totalEntries: returnedCount,
+            processedEntries: returnedCount,
+        }, 'success');
+        setHomeVaultStatus(`已恢复 ${mergeResult.added} 条，跳过 ${mergeResult.skipped} 条重复。Vault 返回 ${returnedCount} 条。`, 'success');
+        showToast(`已从 Mac mini 恢复 ${mergeResult.added} 条`);
+    } catch (error) {
+        const message = error?.name === 'AbortError' ? '恢复超时' : (error?.message || '恢复失败');
+        setHomeVaultRestoreProgress({
+            phase: 'error',
+            message: `恢复失败：${message}`,
+            percent: 100,
+        }, 'error');
+        setHomeVaultStatus(`恢复失败：${message}`, 'error');
+        showToast(`恢复失败：${message}`);
+    } finally {
+        window.removeEventListener('native-home-vault-restore-progress', progressHandler);
+        if (button) {
+            button.disabled = false;
+            button.textContent = '从 Mac mini 恢复';
+        }
+        if (syncButton) {
+            syncButton.disabled = false;
+        }
+    }
+}
+
+function initHomeVaultSync() {
+    const input = $('home-vault-url-input');
+    const button = $('sync-home-vault-btn');
+    const restoreButton = $('restore-home-vault-btn');
+    if (!input || !button) {
+        return;
+    }
+
+    const settings = getHomeVaultSettings();
+    input.value = settings.url;
+    if (settings.lastSyncedAt) {
+        const date = new Date(settings.lastSyncedAt);
+        const label = Number.isNaN(date.getTime())
+            ? settings.lastSyncedAt
+            : date.toLocaleString('zh-CN');
+        setHomeVaultStatus(`上次同步：${label} · ${settings.lastEntryCount || 0} 条`, 'success');
+    } else if (settings.lastRestoredAt) {
+        const date = new Date(settings.lastRestoredAt);
+        const label = Number.isNaN(date.getTime())
+            ? settings.lastRestoredAt
+            : date.toLocaleString('zh-CN');
+        setHomeVaultStatus(`上次恢复：${label} · ${settings.lastRestoreCount || 0} 条`, 'success');
+    }
+
+    input.addEventListener('change', () => {
+        const url = resolveHomeVaultUrlForNetwork(input.value);
+        input.value = url;
+        saveHomeVaultSettings({ url });
+        setHomeVaultStatus('服务器地址已保存');
+    });
+    button.addEventListener('click', () => syncHomeVaultHistory());
+    if (restoreButton) {
+        restoreButton.addEventListener('click', () => restoreHomeVaultHistory());
+    }
 }
 
 async function exportHistory() {
@@ -5801,11 +8080,12 @@ async function shareHistory() {
 }
 
 function updateHistory(entry) {
-    const history = getHistory();
+    const history = readStoredHistoryEntries().slice();
     const idx = history.findIndex(h => h.id === entry.id);
     if (idx !== -1) {
         history[idx] = entry;
-        setStoredHistoryRaw(JSON.stringify(history));
+        setStoredHistoryRaw(JSON.stringify(history), { persistNative: false });
+        persistNativeHistoryEntry(entry);
         persistHistory();
     }
 }
@@ -5820,34 +8100,6 @@ function clearHistory() {
 // ---- 历史 UI ----
 
 function initHistoryActions() {
-    $('clear-history-btn').addEventListener('click', () => {
-        if (confirm('确定清空所有发送历史？')) {
-            clearHistory();
-        }
-    });
-
-    const exportBtn = $('export-history-btn');
-    if (exportBtn) {
-        exportBtn.addEventListener('click', () => exportHistory());
-    }
-
-    const shareBtn = $('share-history-btn');
-    if (shareBtn) {
-        shareBtn.addEventListener('click', () => shareHistory());
-    }
-
-    const importBtn = $('import-history-btn');
-    const importInput = $('import-file-input');
-    if (importBtn && importInput) {
-        importBtn.addEventListener('click', () => importInput.click());
-        importInput.addEventListener('change', (e) => {
-            if (e.target.files.length > 0) {
-                importHistory(e.target.files[0]);
-                e.target.value = '';
-            }
-        });
-    }
-
     const historyList = $('history-list');
     if (historyList) {
         historyList.addEventListener('click', async (event) => {
@@ -6411,6 +8663,45 @@ function truncateFilenamePreserveExtension(filename, maxBaseLength = 16, maxTota
     return `${base.slice(0, allowedBaseLength)}…${ext}`;
 }
 
+function mergeImportedHistoryEntries(imported) {
+    if (!Array.isArray(imported)) {
+        throw new Error('history 必须是 JSON 数组');
+    }
+
+    const existing = getHistory();
+    const existingKeys = new Set(
+        existing.map(h => `${h.timestamp}|${h.text || ''}`)
+    );
+
+    let added = 0;
+    let skipped = 0;
+
+    for (const rawEntry of imported) {
+        const entry = normalizeImportedHistoryEntry(rawEntry);
+        entry.text = String(entry.text || entry.fileName || '');
+        const key = `${entry.timestamp}|${entry.text}`;
+        if (existingKeys.has(key)) {
+            skipped++;
+        } else {
+            existing.push(entry);
+            existingKeys.add(key);
+            added++;
+        }
+    }
+
+    existing.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    setStoredHistoryRaw(JSON.stringify(existing));
+    persistHistory();
+    scheduleHistoryRender();
+
+    return {
+        added,
+        skipped,
+        total: imported.length,
+        currentCount: existing.length,
+    };
+}
+
 function importHistory(file) {
     const resultDiv = $('import-result');
     resultDiv.style.display = 'block';
@@ -6427,33 +8718,9 @@ function importHistory(file) {
                 return;
             }
 
-            const existing = getHistory();
-            const existingKeys = new Set(
-                existing.map(h => `${h.timestamp}|${h.text}`)
-            );
-
-            let added = 0;
-            let skipped = 0;
-
-            for (const rawEntry of imported) {
-                const entry = normalizeImportedHistoryEntry(rawEntry);
-                const key = `${entry.timestamp}|${entry.text}`;
-                if (existingKeys.has(key)) {
-                    skipped++;
-                } else {
-                    existing.push(entry);
-                    existingKeys.add(key);
-                    added++;
-                }
-            }
-
-            existing.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-            setStoredHistoryRaw(JSON.stringify(existing));
-            persistHistory();
-
-            resultDiv.innerHTML = `已导入 ${added} 条，跳过 ${skipped} 条重复`;
+            const result = mergeImportedHistoryEntries(imported);
+            resultDiv.innerHTML = `已导入 ${result.added} 条，跳过 ${result.skipped} 条重复`;
             resultDiv.style.color = '#147d33';
-            scheduleHistoryRender();
         } catch (err) {
             resultDiv.innerHTML = `解析失败：${err.message}`;
             resultDiv.style.color = '#c73b31';
@@ -7059,6 +9326,43 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ---- 剪贴板读取（Android 原生桥优先 → Tauri 原生 → 浏览器 API）----
+async function readClipboardText() {
+    const readers = [
+        () => {
+            if (window.NativeClipboard && typeof window.NativeClipboard.readText === 'function') {
+                return window.NativeClipboard.readText();
+            }
+            return null;
+        },
+        () => {
+            if (window.__TAURI__ && window.__TAURI__.clipboardManager && typeof window.__TAURI__.clipboardManager.readText === 'function') {
+                return window.__TAURI__.clipboardManager.readText();
+            }
+            return null;
+        },
+        () => {
+            if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+                return navigator.clipboard.readText();
+            }
+            return null;
+        },
+    ];
+
+    for (const read of readers) {
+        try {
+            const text = await read();
+            if (typeof text === 'string' && text.trim()) {
+                return text.trim();
+            }
+        } catch (e) {
+            console.warn('读取剪贴板失败，尝试下一个 API', e);
+        }
+    }
+
+    return '';
 }
 
 // ---- 剪贴板写入（透明 Activity 优先 → Tauri 原生 → 浏览器 API）----
