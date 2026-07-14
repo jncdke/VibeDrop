@@ -111,6 +111,13 @@
    - 读取文件失败
    - 写入收件箱失败
    - 文件大小校验失败
+4. macOS 原生端从桌面拖拽、选择文件或 Finder 分享发送到手机时，必须展示真实进度，而不是只有“发送中”。进度至少包含：
+   - 正在准备 / 正在发送 / 等待手机保存 / 已完成 / 失败
+   - 已发送字节数、总字节数和百分比
+   - 当前目标手机名称
+5. 进度事件由传输运行层产生，UI 层只订阅和渲染状态。这样测试可以直接验证分片发送进度，不需要启动 SwiftUI 界面。
+6. macOS 拖拽入口不能只接受 `public.file-url`。Photos、预览、Quick Look 或其它 App 可能只提供 `NSItemProvider` 文件表示或 Photos object reference；原生端应先尝试 `loadFileRepresentation` 复制到临时目录，必要时再用 Photos 选择导出兜底，传输结束后清理临时目录。
+7. Android 原生端发送到 Mac 收件箱时，文件按钮必须复刻旧 Tauri 的即时进度反馈：单文件显示百分比和“保存中”，多文件显示 `当前/总数 · 百分比`，系统分享入口也同样显示进度。
 
 ## 5. 协议设计
 
@@ -124,6 +131,10 @@
 - `mime_type`
 - `size_bytes`
 - `is_archive`
+- `save_target`：可选，发送到桌面收件箱时为 `desktop_inbox`
+- `history_session_id`：可选，多文件批次共享同一个历史 session id
+- `history_item_index`：可选，多文件批次中的 0-based item 位置
+- `history_item_count`：可选，多文件批次总数
 
 接收方如果能建立临时接收状态，立即返回标准 `status: ok`。
 如果失败，立即返回标准 `status: error`。

@@ -1,0 +1,6 @@
+{
+  "action": "incoming_history_session_start",
+  "session_id": "session_demo_001",
+  "item_count": 2,
+  "save_target": "gallery"
+}

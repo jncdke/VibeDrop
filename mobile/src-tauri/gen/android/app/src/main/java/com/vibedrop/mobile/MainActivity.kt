@@ -43,6 +43,7 @@ import java.net.HttpURLConnection
 import java.net.SocketException
 import java.net.URL
 import java.net.URLConnection
+import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -79,6 +80,12 @@ class MainActivity : TauriActivity() {
       put("isImage", isImage)
     }
   }
+
+  private data class HomeVaultResponse(
+    val statusCode: Int,
+    val body: String,
+    val network: String
+  )
 
   private var appWebView: WebView? = null
   private var pendingExportFilename: String? = null
@@ -805,62 +812,162 @@ class MainActivity : TauriActivity() {
     fun syncHistory(endpoint: String, data: String) {
       Thread {
         val result = JSONObject()
-        var connection: HttpURLConnection? = null
         try {
           val targetUrl = buildHomeVaultSyncUrl(endpoint)
           val bytes = data.toByteArray(Charsets.UTF_8)
           val url = URL(targetUrl)
           val wifiNetwork = if (isLocalHomeVaultTarget(url)) findWifiNetwork() else null
-          val rawConnection = openHomeVaultConnection(url, wifiNetwork)
-          connection = (rawConnection as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 10_000
-            readTimeout = 120_000
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            setRequestProperty("Accept", "application/json")
-            setRequestProperty("X-VibeDrop-Client", "android")
-            setFixedLengthStreamingMode(bytes.size)
-          }
+          val response = executeHomeVaultRequest(
+            wifiNetwork,
+            createConnection = { network ->
+              (openHomeVaultConnection(url, network) as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 10_000
+                readTimeout = 120_000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("X-VibeDrop-Client", "android")
+                setFixedLengthStreamingMode(bytes.size)
+              }
+            },
+            exchange = { connection ->
+              connection.outputStream.use { output ->
+                output.write(bytes)
+              }
+              val statusCode = connection.responseCode
+              statusCode to readHttpResponseBody(connection, statusCode)
+            }
+          )
 
-          connection.outputStream.use { output ->
-            output.write(bytes)
-          }
-
-          val statusCode = connection.responseCode
-          val body = readHttpResponseBody(connection, statusCode)
-          result.put("ok", statusCode in 200..299)
-          result.put("status", statusCode)
-          result.put("body", body)
+          result.put("ok", response.statusCode in 200..299)
+          result.put("status", response.statusCode)
+          result.put("body", response.body)
           result.put("url", targetUrl)
-          result.put("network", if (wifiNetwork != null) "wifi" else "default")
-          if (statusCode !in 200..299) {
-            result.put("error", extractErrorMessage(body) ?: "HTTP $statusCode")
+          result.put("network", response.network)
+          if (response.statusCode !in 200..299) {
+            result.put("error", extractErrorMessage(response.body) ?: "HTTP ${response.statusCode}")
           }
         } catch (e: Exception) {
           Log.e(TAG, "同步 Home Vault 失败", e)
           result.put("ok", false)
           result.put("error", e.message ?: "同步失败")
         } finally {
-          connection?.disconnect()
           emitBridgeEvent("native-home-vault-sync-result", result)
         }
       }.start()
     }
 
+    @JavascriptInterface
+    fun restoreHistory(endpoint: String, deviceId: String, mode: String) {
+      Thread {
+        val result = JSONObject()
+        try {
+          val targetUrl = buildHomeVaultRestoreUrl(endpoint, deviceId, mode)
+          val url = URL(targetUrl)
+          val wifiNetwork = if (isLocalHomeVaultTarget(url)) findWifiNetwork() else null
+          val response = executeHomeVaultRequest(
+            wifiNetwork,
+            createConnection = { network ->
+              (openHomeVaultConnection(url, network) as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 10_000
+                readTimeout = 120_000
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("X-VibeDrop-Client", "android")
+              }
+            },
+            exchange = { connection ->
+              val statusCode = connection.responseCode
+              statusCode to readHttpResponseBody(connection, statusCode)
+            }
+          )
+
+          result.put("ok", response.statusCode in 200..299)
+          result.put("status", response.statusCode)
+          result.put("body", response.body)
+          result.put("url", targetUrl)
+          result.put("network", response.network)
+          if (response.statusCode !in 200..299) {
+            result.put("error", extractErrorMessage(response.body) ?: "HTTP ${response.statusCode}")
+          }
+        } catch (e: Exception) {
+          Log.e(TAG, "从 Home Vault 恢复失败", e)
+          result.put("ok", false)
+          result.put("error", e.message ?: "恢复失败")
+        } finally {
+          emitBridgeEvent("native-home-vault-restore-result", result)
+        }
+      }.start()
+    }
+
+    private fun executeHomeVaultRequest(
+      wifiNetwork: Network?,
+      createConnection: (Network?) -> HttpURLConnection,
+      exchange: (HttpURLConnection) -> Pair<Int, String>
+    ): HomeVaultResponse {
+      var connection: HttpURLConnection? = null
+      try {
+        connection = createConnection(wifiNetwork)
+        val (statusCode, body) = exchange(connection)
+        return HomeVaultResponse(
+          statusCode = statusCode,
+          body = body,
+          network = if (wifiNetwork != null) "wifi" else "default"
+        )
+      } catch (e: SocketException) {
+        if (wifiNetwork == null || !isVpnBypassDenied(e)) {
+          throw e
+        }
+        Log.w(TAG, "Home Vault Wi-Fi 网络绑定请求失败，降级使用默认网络重试", e)
+        connection?.disconnect()
+        connection = createConnection(null)
+        val (statusCode, body) = exchange(connection)
+        return HomeVaultResponse(
+          statusCode = statusCode,
+          body = body,
+          network = "default"
+        )
+      } finally {
+        connection?.disconnect()
+      }
+    }
+
     private fun buildHomeVaultSyncUrl(endpoint: String): String {
-      val trimmed = endpoint.trim().trimEnd('/')
-      val base = when {
-        trimmed.startsWith("http://") || trimmed.startsWith("https://") -> trimmed
-        trimmed.isNotBlank() -> "http://$trimmed"
-        else -> "http://minideMac-mini.local:8788"
-      }.trimEnd('/')
+      val base = normalizeHomeVaultBaseUrl(endpoint)
 
       return if (base.endsWith("/api/android-history")) {
         base
       } else {
         "$base/api/android-history"
       }
+    }
+
+    private fun buildHomeVaultRestoreUrl(endpoint: String, deviceId: String, mode: String): String {
+      val base = normalizeHomeVaultBaseUrl(endpoint)
+      val apiBase = if (base.endsWith("/api/android-history")) {
+        "$base/latest"
+      } else {
+        "$base/api/android-history/latest"
+      }
+      val query = mutableListOf("mode=${encodeQuery(mode.ifBlank { "compact" })}")
+      if (deviceId.isNotBlank()) {
+        query.add("deviceId=${encodeQuery(deviceId)}")
+      }
+      return "$apiBase?${query.joinToString("&")}"
+    }
+
+    private fun normalizeHomeVaultBaseUrl(endpoint: String): String {
+      val trimmed = endpoint.trim().trimEnd('/')
+      return when {
+        trimmed.startsWith("http://") || trimmed.startsWith("https://") -> trimmed
+        trimmed.isNotBlank() -> "http://$trimmed"
+        else -> "http://minideMac-mini.local:8788"
+      }.trimEnd('/')
+    }
+
+    private fun encodeQuery(value: String): String {
+      return URLEncoder.encode(value, "UTF-8")
     }
 
     private fun isLocalHomeVaultTarget(url: URL): Boolean {
@@ -895,17 +1002,14 @@ class MainActivity : TauriActivity() {
         wifiNetwork.openConnection(url)
       } catch (e: SocketException) {
         if (isVpnBypassDenied(e)) {
-          throw IllegalStateException(
-            "当前 VPN 禁止 VibeDrop 绕过 VPN 访问局域网。请临时关闭 VPN，或在 VPN 里允许 VibeDrop / 192.168.3.0/24 直连。",
-            e
-          )
+          Log.w(TAG, "系统拒绝绑定 Wi-Fi 网络，Home Vault 将降级使用默认网络", e)
+          url.openConnection()
+        } else {
+          throw e
         }
-        throw e
       } catch (e: SecurityException) {
-        throw IllegalStateException(
-          "系统不允许 VibeDrop 绑定 Wi-Fi 网络。请临时关闭 VPN，或在 VPN 里允许 VibeDrop 直连局域网。",
-          e
-        )
+        Log.w(TAG, "缺少绑定 Wi-Fi 网络权限，Home Vault 将降级使用默认网络", e)
+        url.openConnection()
       }
     }
 

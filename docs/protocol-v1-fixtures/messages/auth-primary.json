@@ -1,0 +1,10 @@
+{
+  "action": "auth",
+  "pin": "1234",
+  "device_id": "client_android_demo",
+  "base_device_id": "client_android_demo",
+  "device_name": "一加 Ace 5",
+  "can_receive_files": true,
+  "receives_clipboard": false,
+  "device_role": "primary"
+}

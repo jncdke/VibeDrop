@@ -1534,6 +1534,98 @@ fn build_discover_response(state: &ServerState, advertised_ip: String) -> Discov
 
 const MIN_WINDOW_WIDTH: f64 = 320.0;
 const MIN_WINDOW_HEIGHT: f64 = 420.0;
+// 超过该长度的文字改用「剪贴板 + Cmd+V」注入：
+// 逐字模拟打字时，高速事件流会被目标 App（网页/终端输入框）的输入法或
+// 事件队列乱序消费，导致个别字符跳到整段开头/结尾；粘贴是原子操作，不会乱序。
+const TYPE_TEXT_PASTE_THRESHOLD_CHARS: usize = 30;
+const TYPE_TEXT_CHUNK_CHARS: usize = 8;
+const TYPE_TEXT_CHUNK_DELAY_MS: u64 = 12;
+const PASTE_SETTLE_BEFORE_MS: u64 = 150;
+const PASTE_SETTLE_AFTER_MS: u64 = 400;
+const CLIPBOARD_SUPPRESS_WINDOW_SECS: u64 = 10;
+
+type ClipboardSuppressList = Arc<Mutex<Vec<(String, std::time::Instant)>>>;
+
+fn type_text_chunked(enigo: &mut Enigo, text: &str) -> Result<(), String> {
+    let chars: Vec<char> = text.chars().collect();
+    for chunk in chars.chunks(TYPE_TEXT_CHUNK_CHARS) {
+        let piece: String = chunk.iter().collect();
+        enigo.text(&piece).map_err(|e| format!("{:?}", e))?;
+        std::thread::sleep(std::time::Duration::from_millis(TYPE_TEXT_CHUNK_DELAY_MS));
+    }
+    Ok(())
+}
+
+fn suppress_clipboard_broadcast(suppress: &ClipboardSuppressList, text: &str) {
+    let mut guard = suppress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|(_, at)| at.elapsed().as_secs() < CLIPBOARD_SUPPRESS_WINDOW_SECS);
+    guard.push((text.to_string(), std::time::Instant::now()));
+}
+
+fn is_clipboard_broadcast_suppressed(suppress: &ClipboardSuppressList, text: &str) -> bool {
+    let mut guard = suppress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|(_, at)| at.elapsed().as_secs() < CLIPBOARD_SUPPRESS_WINDOW_SECS);
+    guard.iter().any(|(item, _)| item == text)
+}
+
+// 直接构造自带 Command 标志位的 V 键事件来触发粘贴。
+// 不用「按下 Meta → 点 V → 松开 Meta」三段式：分开发送时目标 App 可能在
+// 修饰键状态登记前就处理了 V 键，表现为偶发粘贴失败或输入一个裸 "v"。
+// 修饰键内嵌在按键事件里则不存在这个时序竞态。
+fn send_cmd_v_event() -> Result<(), String> {
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    const KVK_ANSI_V: u16 = 9;
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| "无法创建键盘事件源".to_string())?;
+    let key_down = CGEvent::new_keyboard_event(source.clone(), KVK_ANSI_V, true)
+        .map_err(|_| "无法创建粘贴按键事件".to_string())?;
+    key_down.set_flags(CGEventFlags::CGEventFlagCommand);
+    key_down.post(CGEventTapLocation::HID);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let key_up = CGEvent::new_keyboard_event(source, KVK_ANSI_V, false)
+        .map_err(|_| "无法创建粘贴按键抬起事件".to_string())?;
+    key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+    key_up.post(CGEventTapLocation::HID);
+    Ok(())
+}
+
+fn paste_inject_text(text: &str, suppress: &ClipboardSuppressList) -> Result<(), String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("无法访问剪贴板: {}", e))?;
+    let previous = clipboard.get_text().ok().filter(|t| !t.is_empty());
+
+    suppress_clipboard_broadcast(suppress, text);
+    if let Some(prev) = &previous {
+        suppress_clipboard_broadcast(suppress, prev);
+    }
+
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|e| format!("无法写入剪贴板: {}", e))?;
+    std::thread::sleep(std::time::Duration::from_millis(PASTE_SETTLE_BEFORE_MS));
+
+    send_cmd_v_event()?;
+
+    std::thread::sleep(std::time::Duration::from_millis(PASTE_SETTLE_AFTER_MS));
+    if let Some(prev) = previous {
+        let _ = clipboard.set_text(prev);
+    }
+    Ok(())
+}
+
+fn inject_text(
+    enigo: &mut Enigo,
+    text: &str,
+    suppress: &ClipboardSuppressList,
+) -> Result<(), String> {
+    if text.chars().count() <= TYPE_TEXT_PASTE_THRESHOLD_CHARS {
+        type_text_chunked(enigo, text)
+    } else {
+        paste_inject_text(text, suppress)
+    }
+}
 const DESKTOP_TO_MOBILE_CHUNK_BYTES: usize = 192 * 1024;
 const DESKTOP_INBOX_DIR_NAME: &str = "VibeDrop 收件箱";
 const DESKTOP_TO_MOBILE_ACK_TIMEOUT_SECS: u64 = 90;
@@ -1619,9 +1711,14 @@ fn main() {
     // enigo 键盘模拟线程
     let (input_tx, mut input_rx) = mpsc::channel::<InputRequest>(32);
 
+    // 注入文本时抑制剪贴板监听误广播（enigo 线程写入、监听线程读取）
+    let clipboard_suppress: ClipboardSuppressList = Arc::new(Mutex::new(Vec::new()));
+    let clipboard_suppress_for_input = Arc::clone(&clipboard_suppress);
+
     std::thread::spawn(move || {
         let mut enigo = Enigo::new(&Settings::default())
             .expect("无法初始化键盘模拟。请在系统设置中授予辅助功能权限。");
+        let suppress = clipboard_suppress_for_input;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1631,15 +1728,15 @@ fn main() {
         rt.block_on(async {
             while let Some(req) = input_rx.recv().await {
                 let reply = match req.action {
-                    InputAction::TypeText(text) => {
-                        enigo.text(&text).map_err(|e| format!("{:?}", e))
+                    InputAction::TypeText(text) => inject_text(&mut enigo, &text, &suppress),
+                    InputAction::TypeTextAndEnter(text) => {
+                        match inject_text(&mut enigo, &text, &suppress) {
+                            Ok(()) => enigo
+                                .key(Key::Return, Direction::Click)
+                                .map_err(|e| format!("文字已发送，但回车失败: {:?}", e)),
+                            Err(e) => Err(e),
+                        }
                     }
-                    InputAction::TypeTextAndEnter(text) => match enigo.text(&text) {
-                        Ok(()) => enigo
-                            .key(Key::Return, Direction::Click)
-                            .map_err(|e| format!("文字已发送，但回车失败: {:?}", e)),
-                        Err(e) => Err(format!("{:?}", e)),
-                    },
                     InputAction::PressEnter => enigo
                         .key(Key::Return, Direction::Click)
                         .map_err(|e| format!("{:?}", e)),
@@ -1688,6 +1785,7 @@ fn main() {
     let clipboard_tx_clone = clipboard_tx.clone();
 
     // 剪贴板监听线程（每 500ms 检查变化）
+    let clipboard_suppress_for_watcher = Arc::clone(&clipboard_suppress);
     std::thread::spawn(move || {
         let mut clipboard = arboard::Clipboard::new().expect("无法初始化剪贴板");
         let mut last_text = clipboard.get_text().unwrap_or_default();
@@ -1698,6 +1796,10 @@ fn main() {
             if let Ok(current) = clipboard.get_text() {
                 if current != last_text && !current.is_empty() {
                     last_text = current.clone();
+                    if is_clipboard_broadcast_suppressed(&clipboard_suppress_for_watcher, &current)
+                    {
+                        continue;
+                    }
                     info!(
                         "剪贴板变化: {}...",
                         &last_text.chars().take(50).collect::<String>()

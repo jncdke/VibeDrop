@@ -1,0 +1,654 @@
+package com.vibedrop.mobile.nativeapp.data.repository
+
+import com.vibedrop.mobile.nativeapp.core.model.DesktopDevice
+import com.vibedrop.mobile.nativeapp.data.local.HistoryDao
+import com.vibedrop.mobile.nativeapp.data.local.HistoryEntryEntity
+import com.vibedrop.mobile.nativeapp.data.local.HistoryItemEntity
+import com.vibedrop.mobile.nativeapp.platform.AndroidDeviceIdentity
+import com.vibedrop.mobile.nativeapp.platform.ContentTransferResult
+import com.vibedrop.mobile.nativeapp.platform.IncomingFileResult
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.UUID
+import java.util.Locale
+import java.util.TimeZone
+
+class HistoryRepository(
+    private val historyDao: HistoryDao,
+    private val identity: AndroidDeviceIdentity
+) {
+    fun observeRecent(limit: Int = 120): Flow<List<HistoryEntryEntity>> {
+        return historyDao.observeRecent(limit)
+    }
+
+    fun observeRecentWithItems(limit: Int = 120): Flow<List<HistoryEntryWithItems>> {
+        return combine(
+            historyDao.observeRecent(limit),
+            historyDao.observeAllItems()
+        ) { entries, items ->
+            val itemsByEntryId = items.groupBy { it.entryId }
+            entries.map { entry ->
+                HistoryEntryWithItems(
+                    entry = entry,
+                    items = itemsByEntryId[entry.id].orEmpty()
+                )
+            }
+        }
+    }
+
+    fun observeAllWithItems(): Flow<List<HistoryEntryWithItems>> {
+        return combine(
+            historyDao.observeAllEntries(),
+            historyDao.observeAllItems()
+        ) { entries, items ->
+            val itemsByEntryId = items.groupBy { it.entryId }
+            entries.map { entry ->
+                HistoryEntryWithItems(
+                    entry = entry,
+                    items = itemsByEntryId[entry.id].orEmpty()
+                )
+            }
+        }
+    }
+
+    suspend fun loadAllEntries(): List<HistoryEntryEntity> = historyDao.getAllEntries()
+
+    suspend fun loadAllEntriesWithItems(): List<HistoryEntryWithItems> {
+        val entries = historyDao.getAllEntries()
+        val itemsByEntryId = historyDao.getAllItems().groupBy { it.entryId }
+        return entries.map { entry ->
+            HistoryEntryWithItems(
+                entry = entry,
+                items = itemsByEntryId[entry.id].orEmpty()
+            )
+        }
+    }
+
+    suspend fun countEntries(): Int = historyDao.countEntries()
+
+    suspend fun recordSentText(
+        target: DesktopDevice,
+        text: String,
+        pressEnter: Boolean,
+        status: String = "success"
+    ) {
+        val entry = HistoryEntryEntity(
+            id = "native:${UUID.randomUUID()}",
+            timestampMillis = System.currentTimeMillis(),
+            direction = "mobile_to_desktop",
+            kind = "text",
+            status = status,
+            text = text,
+            senderDeviceId = identity.deviceId,
+            senderName = identity.deviceName,
+            senderBaseDeviceId = identity.baseDeviceId,
+            senderRole = "primary",
+            receiverDeviceId = target.stableId,
+            receiverName = target.displayName,
+            receiverBaseDeviceId = target.stableId,
+            receiverRole = "desktop",
+            receiverHost = target.host,
+            receiverIp = target.ip,
+            receiverPort = target.port,
+            sessionId = null,
+            itemCount = null,
+            saveTarget = if (pressEnter) "type_enter" else "type",
+            rawJson = null
+        )
+        historyDao.upsertEntry(entry)
+    }
+
+    suspend fun recordSentContent(
+        target: DesktopDevice,
+        fileName: String,
+        mimeType: String,
+        sizeBytes: Long,
+        sourceUri: String?,
+        transferId: String?,
+        savedPath: String?,
+        saveTarget: String,
+        status: String = "success",
+        error: String? = null
+    ) {
+        val kind = kindFromMime(mimeType)
+        val label = kindLabel(kind)
+        val entryId = transferId?.takeIf { it.isNotBlank() }?.let { "native-outbound:$it" }
+            ?: "native:${UUID.randomUUID()}"
+        val entry = HistoryEntryEntity(
+            id = entryId,
+            timestampMillis = System.currentTimeMillis(),
+            direction = "mobile_to_desktop",
+            kind = kind,
+            status = status,
+            text = "[$label] $fileName",
+            senderDeviceId = identity.deviceId,
+            senderName = identity.deviceName,
+            senderBaseDeviceId = identity.baseDeviceId,
+            senderRole = "primary",
+            receiverDeviceId = target.stableId,
+            receiverName = target.displayName,
+            receiverBaseDeviceId = target.stableId,
+            receiverRole = "desktop",
+            receiverHost = target.host,
+            receiverIp = target.ip,
+            receiverPort = target.port,
+            sessionId = transferId,
+            itemCount = 1,
+            saveTarget = saveTarget,
+            rawJson = null
+        )
+        val item = HistoryItemEntity(
+            id = "$entryId:item:0",
+            entryId = entryId,
+            itemIndex = 0,
+            kind = kind,
+            fileName = fileName,
+            mimeType = mimeType,
+            sizeBytes = sizeBytes.takeIf { it >= 0L },
+            localPath = sourceUri,
+            savedPath = savedPath,
+            thumbnailPath = null,
+            thumbnailDataUrl = null,
+            status = status,
+            error = error
+        )
+        historyDao.upsertEntry(entry)
+        historyDao.upsertItems(listOf(item))
+    }
+
+    suspend fun recordSentContentBatch(
+        target: DesktopDevice,
+        results: List<ContentTransferResult>,
+        saveTarget: String
+    ) {
+        val normalizedResults = results.filter { it.fileName.isNotBlank() }
+        if (normalizedResults.isEmpty()) return
+        if (normalizedResults.size == 1) {
+            val item = normalizedResults[0]
+            recordSentContent(
+                target = target,
+                fileName = item.fileName,
+                mimeType = item.mimeType,
+                sizeBytes = item.sizeBytes,
+                sourceUri = item.sourceUri,
+                transferId = item.transferId,
+                savedPath = item.savedPath,
+                saveTarget = saveTarget,
+                status = item.status,
+                error = item.error
+            )
+            return
+        }
+
+        val entryId = "native-outbound-batch:${UUID.randomUUID()}"
+        val sessionId = "native-batch:${UUID.randomUUID()}"
+        val items = normalizedResults.mapIndexed { index, result ->
+            val kind = kindFromMime(result.mimeType)
+            HistoryItemEntity(
+                id = "$entryId:item:$index",
+                entryId = entryId,
+                itemIndex = index,
+                kind = kind,
+                fileName = result.fileName,
+                mimeType = result.mimeType,
+                sizeBytes = result.sizeBytes.takeIf { it >= 0L },
+                localPath = result.sourceUri,
+                savedPath = result.savedPath,
+                thumbnailPath = null,
+                thumbnailDataUrl = null,
+                status = result.status,
+                error = result.error
+            )
+        }
+        val summary = historyItemsSummary(items)
+        val entry = HistoryEntryEntity(
+            id = entryId,
+            timestampMillis = System.currentTimeMillis(),
+            direction = "mobile_to_desktop",
+            kind = summary.first,
+            status = computeSessionStatus(items),
+            text = summary.second,
+            senderDeviceId = identity.deviceId,
+            senderName = identity.deviceName,
+            senderBaseDeviceId = identity.baseDeviceId,
+            senderRole = "primary",
+            receiverDeviceId = target.stableId,
+            receiverName = target.displayName,
+            receiverBaseDeviceId = target.stableId,
+            receiverRole = "desktop",
+            receiverHost = target.host,
+            receiverIp = target.ip,
+            receiverPort = target.port,
+            sessionId = sessionId,
+            itemCount = items.size,
+            saveTarget = saveTarget,
+            rawJson = null
+        )
+        historyDao.upsertEntry(entry)
+        historyDao.upsertItems(items)
+    }
+
+    suspend fun recordReceivedFile(
+        source: DesktopDevice,
+        result: IncomingFileResult
+    ) {
+        if (!result.historySessionId.isNullOrBlank()) {
+            recordReceivedSessionFile(source, result)
+            return
+        }
+
+        recordReceivedFileWithoutSession(source, result)
+    }
+
+    suspend fun recordIncomingHistorySession(
+        source: DesktopDevice,
+        rawJson: String
+    ) {
+        val payload = runCatching { JSONObject(rawJson) }.getOrNull() ?: return
+        val sessionId = payload.firstString("session_id", "sessionId")
+        if (sessionId.isBlank()) return
+
+        val entryId = desktopInboundEntryId(sessionId)
+        val existing = historyDao.findEntry(entryId)
+        val existingItems = historyDao.getItemsForEntry(entryId).associateBy { it.itemIndex }
+        val payloadItems = payload.optJSONArray("items") ?: JSONArray()
+        val parsedItems = mutableListOf<HistoryItemEntity>()
+        for (index in 0 until payloadItems.length()) {
+            val item = payloadItems.optJSONObject(index) ?: continue
+            val existingItem = existingItems[index]
+            parsedItems += HistoryItemEntity(
+                id = "$entryId:item:$index",
+                entryId = entryId,
+                itemIndex = index,
+                kind = item.firstString("kind").ifBlank { kindFromMime(item.firstString("mime_type", "mimeType")) },
+                fileName = item.firstString("file_name", "fileName").ifBlank { "文件" },
+                mimeType = item.firstString("mime_type", "mimeType").ifBlank { "application/octet-stream" },
+                sizeBytes = item.optLongOrNull("size_bytes") ?: item.optLongOrNull("sizeBytes"),
+                localPath = item.firstString("file_path", "filePath").takeIf { it.isNotBlank() },
+                savedPath = existingItem?.savedPath ?: item.firstString("saved_path", "savedPath").takeIf { it.isNotBlank() },
+                thumbnailPath = existingItem?.thumbnailPath,
+                thumbnailDataUrl = existingItem?.thumbnailDataUrl ?: item.firstString("thumbnail_data_url", "thumbnailDataUrl").takeIf { it.isNotBlank() },
+                status = existingItem?.status ?: item.firstString("status").ifBlank { "pending" },
+                error = existingItem?.error ?: item.firstString("error").takeIf { it.isNotBlank() }
+            )
+        }
+        val mergedItems = if (parsedItems.isEmpty()) existingItems.values.sortedBy { it.itemIndex } else parsedItems
+        val summary = historyItemsSummary(mergedItems)
+        val timestamp = payload.firstString("timestamp").let { value ->
+            if (value.isBlank()) existing?.timestampMillis ?: System.currentTimeMillis() else parseTimestampMillis(value)
+        }
+        val entry = HistoryEntryEntity(
+            id = entryId,
+            timestampMillis = timestamp,
+            direction = "desktop_to_mobile",
+            kind = payload.firstString("kind").ifBlank { existing?.kind ?: summary.first },
+            status = computeSessionStatus(mergedItems).ifBlank { existing?.status ?: "pending" },
+            text = payload.firstString("text").ifBlank { existing?.text ?: summary.second },
+            senderDeviceId = source.stableId,
+            senderName = source.displayName,
+            senderBaseDeviceId = source.stableId,
+            senderRole = "desktop",
+            senderHost = source.host,
+            senderIp = source.ip,
+            senderPort = source.port,
+            receiverDeviceId = identity.deviceId,
+            receiverName = identity.deviceName,
+            receiverBaseDeviceId = identity.baseDeviceId,
+            receiverRole = "primary",
+            sessionId = sessionId,
+            itemCount = payload.optIntOrNull("item_count") ?: payload.optIntOrNull("itemCount") ?: mergedItems.size.coerceAtLeast(1),
+            saveTarget = payload.firstString("save_target", "saveTarget").ifBlank { existing?.saveTarget ?: "download" },
+            rawJson = rawJson
+        )
+        historyDao.upsertEntry(entry)
+        if (mergedItems.isNotEmpty()) {
+            historyDao.upsertItems(mergedItems)
+        }
+    }
+
+    suspend fun importEntry(entry: HistoryEntryEntity) {
+        if (historyDao.findEntry(entry.id) == null) {
+            historyDao.upsertEntry(entry)
+        }
+    }
+
+    suspend fun importArchive(rawJson: String): Int {
+        val array = extractHistoryArchiveEntries(rawJson)
+        var imported = 0
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val entry = item.toHistoryEntry(index) ?: continue
+            if (historyDao.findEntry(entry.id) == null) {
+                historyDao.upsertEntry(entry)
+                imported += 1
+            }
+            val historyItems = item.toHistoryItems(entry.id)
+            if (historyItems.isNotEmpty()) {
+                historyDao.deleteItemsForEntry(entry.id)
+                historyDao.upsertItems(historyItems)
+            }
+        }
+        return imported
+    }
+
+    fun exportArchive(entries: List<HistoryEntryWithItems>): String {
+        val history = JSONArray()
+        entries.forEach { entry ->
+            history.put(entry.toHistoryJsonObject())
+        }
+        return JSONObject()
+            .put("schemaVersion", 1)
+            .put("app", "VibeDrop")
+            .put("deviceId", identity.deviceId)
+            .put("deviceName", identity.deviceName)
+            .put("exportedAt", historyIsoTimestamp(System.currentTimeMillis()))
+            .put("history", history)
+            .toString(2)
+    }
+
+    suspend fun clearHistory() {
+        historyDao.deleteAllItems()
+        historyDao.deleteAllEntries()
+    }
+
+    private fun kindFromMime(mimeType: String): String = when {
+        mimeType.startsWith("image/") -> "image"
+        mimeType.startsWith("video/") -> "video"
+        else -> "file"
+    }
+
+    private suspend fun recordReceivedSessionFile(
+        source: DesktopDevice,
+        result: IncomingFileResult
+    ) {
+        val sessionId = result.historySessionId ?: return
+        val entryId = desktopInboundEntryId(sessionId)
+        val existing = historyDao.findEntry(entryId)
+        if (existing == null) {
+            recordReceivedFileWithoutSession(source, result)
+            return
+        }
+
+        val existingItems = historyDao.getItemsForEntry(entryId).toMutableList()
+        val itemIndex = result.historyItemIndex.coerceAtLeast(0)
+        val itemKind = kindFromMime(result.mimeType)
+        val item = HistoryItemEntity(
+            id = "$entryId:item:$itemIndex",
+            entryId = entryId,
+            itemIndex = itemIndex,
+            kind = itemKind,
+            fileName = result.fileName,
+            mimeType = result.mimeType,
+            sizeBytes = result.sizeBytes,
+            localPath = result.savedPath,
+            savedPath = result.savedPath,
+            thumbnailPath = null,
+            thumbnailDataUrl = null,
+            status = "success",
+            error = null
+        )
+
+        if (result.isArchive && result.historyItemCount > 1) {
+            val itemsByIndex = existingItems.associateBy { it.itemIndex }.toMutableMap()
+            for (index in 0 until result.historyItemCount) {
+                val current = itemsByIndex[index]
+                itemsByIndex[index] = if (index == itemIndex) {
+                    item
+                } else {
+                    (current ?: item.copy(id = "$entryId:item:$index", itemIndex = index))
+                        .copy(status = "success", savedPath = result.savedPath)
+                }
+            }
+            existingItems.clear()
+            existingItems.addAll(itemsByIndex.values.sortedBy { it.itemIndex })
+        } else {
+            val index = existingItems.indexOfFirst { it.itemIndex == itemIndex }
+            if (index >= 0) existingItems[index] = item else existingItems.add(item)
+        }
+
+        val sortedItems = existingItems.sortedBy { it.itemIndex }
+        val updated = existing.copy(
+            status = computeSessionStatus(sortedItems),
+            itemCount = existing.itemCount ?: result.historyItemCount,
+            saveTarget = existing.saveTarget ?: result.saveTarget
+        )
+        historyDao.upsertEntry(updated)
+        historyDao.upsertItems(sortedItems)
+    }
+
+    private suspend fun recordReceivedFileWithoutSession(
+        source: DesktopDevice,
+        result: IncomingFileResult
+    ) {
+        val entryId = "native-inbound:${result.transferId}"
+        val kind = kindFromMime(result.mimeType)
+        val label = kindLabel(kind)
+        val entry = HistoryEntryEntity(
+            id = entryId,
+            timestampMillis = System.currentTimeMillis(),
+            direction = "desktop_to_mobile",
+            kind = kind,
+            status = "success",
+            text = "[$label] ${result.fileName}",
+            senderDeviceId = source.stableId,
+            senderName = source.displayName,
+            senderBaseDeviceId = source.stableId,
+            senderRole = "desktop",
+            senderHost = source.host,
+            senderIp = source.ip,
+            senderPort = source.port,
+            receiverDeviceId = identity.deviceId,
+            receiverName = identity.deviceName,
+            receiverBaseDeviceId = identity.baseDeviceId,
+            receiverRole = "primary",
+            sessionId = null,
+            itemCount = 1,
+            saveTarget = result.saveTarget,
+            rawJson = null
+        )
+        val item = HistoryItemEntity(
+            id = "$entryId:item:0",
+            entryId = entryId,
+            itemIndex = 0,
+            kind = kind,
+            fileName = result.fileName,
+            mimeType = result.mimeType,
+            sizeBytes = result.sizeBytes,
+            localPath = result.savedPath,
+            savedPath = result.savedPath,
+            thumbnailPath = null,
+            thumbnailDataUrl = null,
+            status = "success",
+            error = null
+        )
+        historyDao.upsertEntry(entry)
+        historyDao.upsertItems(listOf(item))
+    }
+
+    private fun desktopInboundEntryId(sessionId: String): String = "desktop-inbound:$sessionId"
+
+    private fun computeSessionStatus(items: List<HistoryItemEntity>): String {
+        if (items.isEmpty()) return "pending"
+        if (items.any { it.status == "pending" || it.status.isNullOrBlank() }) return "pending"
+        val successCount = items.count { it.status == "success" }
+        val failedCount = items.count { it.status == "failed" }
+        return when {
+            failedCount == 0 -> "success"
+            successCount == 0 -> "failed"
+            else -> "partial"
+        }
+    }
+
+    private fun historyItemsSummary(items: List<HistoryItemEntity>): Pair<String, String> {
+        if (items.size == 1) {
+            val item = items[0]
+            val kind = item.kind
+            return kind to "[${kindLabel(kind)}] ${item.fileName ?: "文件"}"
+        }
+        val imageCount = items.count { it.kind == "image" }
+        val videoCount = items.count { it.kind == "video" }
+        return when {
+            imageCount == items.size -> "image" to "[图片] ${items.size} 张"
+            videoCount == items.size -> "video" to "[视频] ${items.size} 个"
+            imageCount + videoCount == items.size -> "media" to "[媒体] ${items.size} 项"
+            else -> "file" to "[文件] ${items.size} 项"
+        }
+    }
+
+    private fun kindLabel(kind: String): String = when (kind) {
+        "image" -> "图片"
+        "video" -> "视频"
+        "media" -> "媒体"
+        else -> "文件"
+    }
+
+    private fun JSONObject.toHistoryEntry(index: Int): HistoryEntryEntity? {
+        val timestampMillis = optLongOrNull("timestampMillis")
+            ?: parseTimestampMillis(firstString("timestamp", "timestamp_iso", "createdAt"))
+        val id = firstString("id").ifBlank { "imported:$timestampMillis:$index" }
+        val receiverName = firstString("receiverName", "targetAlias", "targetName", "targetDeviceName", "target")
+        val receiverId = firstString("receiverDeviceId", "targetServerId", "targetId", "serverId", "target")
+            .ifBlank { receiverName }
+        val senderDeviceId = firstString("senderDeviceId", "sourceDeviceId", "sender_device_id", "source_device_id")
+            .ifBlank { identity.deviceId }
+        val senderName = firstString("senderName", "sourceDeviceName", "sender_name", "source_device_name")
+            .ifBlank { identity.deviceName }
+        return HistoryEntryEntity(
+            id = id,
+            timestampMillis = timestampMillis,
+            direction = firstString("direction").ifBlank { "mobile_to_desktop" },
+            kind = firstString("kind").ifBlank { "text" },
+            status = firstString("status").ifBlank { "success" },
+            text = firstString("text"),
+            senderDeviceId = senderDeviceId,
+            senderName = senderName,
+            senderBaseDeviceId = firstString("senderBaseDeviceId", "sourceBaseDeviceId", "sender_base_device_id", "source_base_device_id")
+                .ifBlank { if (senderDeviceId == identity.deviceId) identity.baseDeviceId else "" }
+                .takeIf { it.isNotBlank() },
+            senderRole = firstString("senderRole", "sourceRole", "sender_role", "source_role").takeIf { it.isNotBlank() },
+            senderHost = firstString("senderHost", "sourceHost", "sender_host", "source_host").takeIf { it.isNotBlank() },
+            senderIp = firstString("senderIp", "sourceIp", "sender_ip", "source_ip", "client_ip").takeIf { it.isNotBlank() },
+            senderPort = firstInt("senderPort", "sourcePort", "sender_port", "source_port"),
+            receiverDeviceId = receiverId.takeIf { it.isNotBlank() },
+            receiverName = receiverName.takeIf { it.isNotBlank() },
+            receiverBaseDeviceId = firstString("receiverBaseDeviceId", "targetBaseDeviceId", "receiver_base_device_id", "target_base_device_id")
+                .takeIf { it.isNotBlank() },
+            receiverRole = firstString("receiverRole", "targetRole", "receiver_role", "target_role").takeIf { it.isNotBlank() },
+            receiverHost = firstString("receiverHost", "targetHost", "receiver_host", "target_host", "targetDeviceName", "hostname")
+                .takeIf { it.isNotBlank() },
+            receiverIp = firstString("receiverIp", "targetIp", "receiver_ip", "target_ip").takeIf { it.isNotBlank() },
+            receiverPort = firstInt("receiverPort", "targetPort", "receiver_port", "target_port"),
+            sessionId = firstString("sessionId", "session_id").takeIf { it.isNotBlank() },
+            itemCount = optIntOrNull("itemCount") ?: optIntOrNull("item_count"),
+            saveTarget = firstString("saveTarget", "save_target").takeIf { it.isNotBlank() },
+            rawJson = toString()
+        )
+    }
+
+    private fun JSONObject.toHistoryItems(entryId: String): List<HistoryItemEntity> {
+        val array = optJSONArray("items") ?: optJSONArray("Items")
+        val items = mutableListOf<HistoryItemEntity>()
+        if (array != null) {
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+                val itemIndex = item.optIntOrNull("itemIndex")
+                    ?: item.optIntOrNull("item_index")
+                    ?: index
+                val mimeType = item.firstString("mimeType", "mime_type")
+                val kind = item.firstString("kind").ifBlank { kindFromMime(mimeType) }
+                items += HistoryItemEntity(
+                    id = "$entryId:item:$itemIndex",
+                    entryId = entryId,
+                    itemIndex = itemIndex,
+                    kind = kind,
+                    fileName = item.firstString("fileName", "file_name").takeIf { it.isNotBlank() },
+                    mimeType = mimeType.takeIf { it.isNotBlank() },
+                    sizeBytes = item.optLongOrNull("sizeBytes") ?: item.optLongOrNull("size_bytes"),
+                    localPath = item.firstString("localPath", "local_path", "filePath", "file_path")
+                        .takeIf { it.isNotBlank() },
+                    savedPath = item.firstString("savedPath", "saved_path").takeIf { it.isNotBlank() },
+                    thumbnailPath = item.firstString("thumbnailPath", "thumbnail_path").takeIf { it.isNotBlank() },
+                    thumbnailDataUrl = item.firstString("thumbnailDataUrl", "thumbnail_data_url")
+                        .takeIf { it.isNotBlank() },
+                    status = item.firstString("status").ifBlank { "success" },
+                    error = item.firstString("error").takeIf { it.isNotBlank() }
+                )
+            }
+        }
+        if (items.isEmpty()) {
+            val mimeType = firstString("mimeType", "mime_type")
+            val kind = firstString("kind").ifBlank { kindFromMime(mimeType) }
+            val fileName = firstString("fileName", "file_name")
+            val localPath = firstString("localPath", "local_path", "filePath", "file_path")
+            val savedPath = firstString("savedPath", "saved_path")
+            val thumbnailDataUrl = firstString("thumbnailDataUrl", "thumbnail_data_url")
+            val hasTopLevelMedia = fileName.isNotBlank() || localPath.isNotBlank() || savedPath.isNotBlank() || thumbnailDataUrl.isNotBlank()
+            if (hasTopLevelMedia && kind != "text") {
+                items += HistoryItemEntity(
+                    id = "$entryId:item:0",
+                    entryId = entryId,
+                    itemIndex = 0,
+                    kind = kind,
+                    fileName = fileName.takeIf { it.isNotBlank() },
+                    mimeType = mimeType.takeIf { it.isNotBlank() },
+                    sizeBytes = optLongOrNull("sizeBytes") ?: optLongOrNull("size_bytes"),
+                    localPath = localPath.takeIf { it.isNotBlank() },
+                    savedPath = savedPath.takeIf { it.isNotBlank() },
+                    thumbnailPath = firstString("thumbnailPath", "thumbnail_path").takeIf { it.isNotBlank() },
+                    thumbnailDataUrl = thumbnailDataUrl.takeIf { it.isNotBlank() },
+                    status = firstString("status").ifBlank { "success" },
+                    error = firstString("error").takeIf { it.isNotBlank() }
+                )
+            }
+        }
+        return items.sortedBy { it.itemIndex }
+    }
+
+    private fun JSONObject.firstString(vararg keys: String): String {
+        for (key in keys) {
+            val value = optString(key, "")
+            if (value.isNotBlank() && value != "null") return value
+        }
+        return ""
+    }
+
+    private fun JSONObject.optIntOrNull(key: String): Int? {
+        return if (has(key) && !isNull(key)) optInt(key) else null
+    }
+
+    private fun JSONObject.firstInt(vararg keys: String): Int? {
+        for (key in keys) {
+            if (has(key) && !isNull(key)) return optInt(key)
+        }
+        return null
+    }
+
+    private fun JSONObject.optLongOrNull(key: String): Long? {
+        return if (has(key) && !isNull(key)) optLong(key) else null
+    }
+
+    private fun parseTimestampMillis(value: String): Long {
+        if (value.isBlank()) return System.currentTimeMillis()
+        val formats = listOf(
+            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
+            "yyyy-MM-dd'T'HH:mm:ss'Z'",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+            "yyyy-MM-dd'T'HH:mm:ssXXX",
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy/MM/dd HH:mm:ss"
+        )
+        for (pattern in formats) {
+            val formatter = SimpleDateFormat(pattern, Locale.US)
+            if (pattern.endsWith("'Z'")) {
+                formatter.timeZone = TimeZone.getTimeZone("UTC")
+            }
+            val parsed = runCatching { formatter.parse(value)?.time }.getOrNull()
+            if (parsed != null) return parsed
+        }
+        return runCatching { value.toLong() }.getOrDefault(System.currentTimeMillis())
+    }
+
+}

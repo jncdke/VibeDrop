@@ -1,0 +1,206 @@
+import Foundation
+import NIOCore
+import NIOHTTP1
+
+final class VibeDropHTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
+    static let handlerName = "VibeDropHTTPHandler"
+
+    typealias InboundIn = HTTPServerRequestPart
+    typealias OutboundOut = HTTPServerResponsePart
+
+    private let configuration: MacServerConfiguration
+    private let pairManager: PairRequestManager
+    private let connectedClients: MacConnectedClientRegistry
+    private var requestHead: HTTPRequestHead?
+    private var requestBody: ByteBuffer?
+
+    init(
+        configuration: MacServerConfiguration,
+        pairManager: PairRequestManager,
+        connectedClients: MacConnectedClientRegistry
+    ) {
+        self.configuration = configuration
+        self.pairManager = pairManager
+        self.connectedClients = connectedClients
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        switch unwrapInboundIn(data) {
+        case let .head(head):
+            requestHead = head
+            requestBody = context.channel.allocator.buffer(capacity: 0)
+        case var .body(buffer):
+            requestBody?.writeBuffer(&buffer)
+        case .end:
+            handleRequest(context: context)
+            requestHead = nil
+            requestBody = nil
+        }
+    }
+
+    private func handleRequest(context: ChannelHandlerContext) {
+        guard let head = requestHead else {
+            sendJSON(context: context, status: .badRequest, payload: ["error": "缺少请求头"])
+            return
+        }
+
+        let path = head.uri.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? head.uri
+        switch (head.method, path) {
+        case (.GET, "/discover"):
+            let response = DiscoverResponse(configuration: configuration)
+            sendEncodable(context: context, response)
+        case (.POST, "/pair/request"):
+            handlePairRequest(context: context)
+        case (.GET, let value) where value.hasPrefix("/pair/status/"):
+            let requestId = String(value.dropFirst("/pair/status/".count))
+            let response = pairManager.status(requestId: requestId, configuration: configuration)
+            sendEncodable(context: context, response)
+        case (.POST, "/share-extension/paths"):
+            handleShareExtensionPaths(context: context)
+        default:
+            sendJSON(context: context, status: .notFound, payload: ["error": "not_found"])
+        }
+    }
+
+    private func handlePairRequest(context: ChannelHandlerContext) {
+        do {
+            var body = requestBody ?? context.channel.allocator.buffer(capacity: 0)
+            let bytes = body.readBytes(length: body.readableBytes) ?? []
+            let data = Data(bytes)
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let clientId = object?["client_id"] as? String ?? ""
+            let clientName = object?["client_name"] as? String ?? ""
+            let accepted = try pairManager.requestPairing(
+                clientId: clientId,
+                clientName: clientName,
+                configuration: configuration
+            )
+            sendEncodable(context: context, accepted)
+        } catch {
+            sendJSON(
+                context: context,
+                status: .badRequest,
+                payload: ["error": error.localizedDescription]
+            )
+        }
+    }
+
+    private func handleShareExtensionPaths(context: ChannelHandlerContext) {
+        do {
+            guard Self.isLoopbackRequest(context: context) else {
+                sendJSON(context: context, status: .forbidden, payload: ["error": "仅允许本机共享扩展调用"])
+                return
+            }
+            var body = requestBody ?? context.channel.allocator.buffer(capacity: 0)
+            let bytes = body.readBytes(length: body.readableBytes) ?? []
+            let data = Data(bytes)
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let paths = (object?["paths"] as? [String])?
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .filter { FileManager.default.fileExists(atPath: $0) } ?? []
+            guard !paths.isEmpty else {
+                sendJSON(context: context, status: .badRequest, payload: ["error": "没有可发送的文件或文件夹"])
+                return
+            }
+            guard connectedClients.hasFileReceiver() else {
+                sendJSON(context: context, status: .conflict, payload: ["error": "当前没有支持接收文件的手机在线设备"])
+                return
+            }
+            let source = (object?["source"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let queueURL = try Self.enqueueShareRequest(paths: paths, source: source)
+            sendJSON(
+                context: context,
+                status: .ok,
+                payload: [
+                    "status": "queued",
+                    "request": queueURL.lastPathComponent,
+                    "count": "\(paths.count)"
+                ]
+            )
+        } catch {
+            sendJSON(
+                context: context,
+                status: .internalServerError,
+                payload: ["error": error.localizedDescription]
+            )
+        }
+    }
+
+    private static func enqueueShareRequest(paths: [String], source: String?) throws -> URL {
+        let queueDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".vibedrop", isDirectory: true)
+            .appendingPathComponent("finder-share-requests", isDirectory: true)
+        try FileManager.default.createDirectory(at: queueDirectory, withIntermediateDirectories: true)
+        let requestURL = queueDirectory.appendingPathComponent("share-\(Int(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString).json")
+        let payload: [String: Any] = [
+            "paths": paths,
+            "source": source?.isEmpty == false ? source! : "share-extension"
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: requestURL, options: .atomic)
+        return requestURL
+    }
+
+    private static func isLoopbackRequest(context: ChannelHandlerContext) -> Bool {
+        guard let ipAddress = context.channel.remoteAddress?.ipAddress else {
+            return false
+        }
+        if ipAddress == "::1" || ipAddress == "0:0:0:0:0:0:0:1" {
+            return true
+        }
+        if ipAddress == "127.0.0.1" || ipAddress == "::ffff:127.0.0.1" {
+            return true
+        }
+        return ipAddress.hasPrefix("127.")
+    }
+
+    private func sendEncodable<T: Encodable>(
+        context: ChannelHandlerContext,
+        _ value: T,
+        status: HTTPResponseStatus = .ok
+    ) {
+        do {
+            let data = try JSONEncoder.vibeDropServer.encode(value)
+            sendData(context: context, status: status, data: data)
+        } catch {
+            sendJSON(context: context, status: .internalServerError, payload: ["error": error.localizedDescription])
+        }
+    }
+
+    private func sendJSON(
+        context: ChannelHandlerContext,
+        status: HTTPResponseStatus,
+        payload: [String: String]
+    ) {
+        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
+        sendData(context: context, status: status, data: data)
+    }
+
+    private func sendData(
+        context: ChannelHandlerContext,
+        status: HTTPResponseStatus,
+        data: Data
+    ) {
+        var headers = HTTPHeaders()
+        headers.add(name: "content-type", value: "application/json; charset=utf-8")
+        headers.add(name: "content-length", value: "\(data.count)")
+        headers.add(name: "connection", value: "close")
+        let head = HTTPResponseHead(version: .http1_1, status: status, headers: headers)
+        var buffer = context.channel.allocator.buffer(capacity: data.count)
+        buffer.writeBytes(data)
+        context.write(wrapOutboundOut(.head(head)), promise: nil)
+        context.write(wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
+        context.writeAndFlush(wrapOutboundOut(.end(nil))).whenComplete { _ in
+            context.close(promise: nil)
+        }
+    }
+}
+
+private extension JSONEncoder {
+    static var vibeDropServer: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }
+}

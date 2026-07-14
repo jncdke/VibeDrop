@@ -1,0 +1,6 @@
+{
+  "action": "file_download",
+  "file_name": "legacy-demo.txt",
+  "mime_type": "text/plain",
+  "file_base64": "bGVnYWN5IGZpbGU="
+}

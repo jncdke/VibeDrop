@@ -1,0 +1,8 @@
+{
+  "kind": "desktop",
+  "server_id": "desktop_demo_macbook",
+  "hostname": "overlorddeMacBook-Air-4.local",
+  "ip": "192.168.3.10",
+  "port": 9001,
+  "protocol_version": 1
+}

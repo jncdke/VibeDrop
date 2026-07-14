@@ -1,0 +1,5 @@
+{
+  "action": "incoming_file_saved",
+  "transfer_id": "transfer_demo_001",
+  "saved_path": "/storage/emulated/0/Download/demo.txt"
+}

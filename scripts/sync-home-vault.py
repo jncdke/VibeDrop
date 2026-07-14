@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 
 DEFAULT_REMOTE = "mini@minideMac-mini.local"
@@ -148,6 +148,8 @@ def record_entry_id(record: dict[str, Any]) -> str:
     exported_id = entry.get("id")
     if source.startswith("android") and exported_id is not None and str(exported_id).strip():
         return sha256_text(f"android-entry:{exported_id}")
+    if source.startswith("macbook:") and exported_id is not None and str(exported_id).strip():
+        return sha256_text(f"mac-entry:{exported_id}")
     return sha256_text(record["raw_line"])
 
 
@@ -192,6 +194,7 @@ def canonicalize_device(device: dict[str, str], *, role: str = "") -> dict[str, 
         clean_label(device.get("name")),
         clean_label(device.get("host")),
         clean_label(device.get("server_id")),
+        clean_label(device.get("base_device_id")),
     }
     labels.discard("")
     for canonical in DEVICE_CANONICALS:
@@ -208,15 +211,145 @@ def canonicalize_device(device: dict[str, str], *, role: str = "") -> dict[str, 
 def source_receiver_device(source: str) -> dict[str, str]:
     source = str(source or "")
     if source.startswith("macbook:"):
-        return {"id": "macbook", "name": "MacBook", "host": "", "server_id": ""}
-    return {"id": "", "name": "", "host": "", "server_id": ""}
+        return {"id": "macbook", "name": "MacBook", "host": "", "server_id": "", "base_device_id": ""}
+    return {"id": "", "name": "", "host": "", "server_id": "", "base_device_id": ""}
+
+
+def device_has_identity(device: dict[str, str]) -> bool:
+    return any(
+        clean_label(device.get(key))
+        for key in ["id", "name", "host", "server_id", "base_device_id"]
+    )
+
+
+def entry_has_any_value(entry: dict[str, Any], *keys: str) -> bool:
+    return any(clean_label(pick(entry, key)) for key in keys)
+
+
+def explicit_sender_device(entry: dict[str, Any]) -> dict[str, str]:
+    base_device_id = clean_label(
+        pick(entry, "senderBaseDeviceId", "sourceBaseDeviceId", "sender_base_device_id", "source_base_device_id")
+    )
+    device_id = clean_label(
+        pick(entry, "senderDeviceId", "sourceDeviceId", "sender_device_id", "source_device_id")
+    ) or base_device_id
+    name = clean_label(
+        pick(entry, "senderName", "sourceDeviceName", "sender_name", "source_device_name")
+    ) or device_id or base_device_id
+    host = clean_label(pick(entry, "senderHost", "sourceHost", "sender_host", "source_host"))
+    server_id = clean_label(pick(entry, "senderServerId", "sourceServerId", "sender_server_id", "source_server_id"))
+    return {
+        "id": device_id,
+        "name": name,
+        "host": host,
+        "server_id": server_id,
+        "base_device_id": base_device_id,
+    }
+
+
+def explicit_receiver_device(entry: dict[str, Any]) -> dict[str, str]:
+    base_device_id = clean_label(
+        pick(entry, "receiverBaseDeviceId", "targetBaseDeviceId", "receiver_base_device_id", "target_base_device_id")
+    )
+    server_id = clean_label(
+        pick(entry, "receiverServerId", "targetServerId", "serverId", "receiver_server_id", "target_server_id")
+    )
+    device_id = clean_label(
+        pick(entry, "receiverDeviceId", "targetDeviceId", "targetId", "receiver_device_id", "target_device_id", "target_id")
+    ) or server_id or base_device_id
+    host = clean_label(
+        pick(entry, "receiverHost", "targetHost", "receiver_host", "target_host", "targetDeviceName", "target_device_name", "hostname")
+    )
+    name = (
+        clean_label(pick(entry, "receiverName", "targetName", "targetAlias", "receiver_name", "target_name", "target_alias"))
+        or host
+        or server_id
+        or device_id
+        or base_device_id
+    )
+    return {
+        "id": device_id,
+        "name": name,
+        "host": host,
+        "server_id": server_id or device_id,
+        "base_device_id": base_device_id,
+    }
+
+
+def roles_to_sender_device(roles: dict[str, str]) -> dict[str, str]:
+    return {
+        "id": roles.get("sender_id", ""),
+        "name": roles.get("sender_name", ""),
+        "host": "",
+        "server_id": "",
+        "base_device_id": "",
+    }
+
+
+def roles_to_receiver_device(roles: dict[str, str]) -> dict[str, str]:
+    return {
+        "id": roles.get("receiver_id", ""),
+        "name": roles.get("receiver_name", ""),
+        "host": roles.get("receiver_host", ""),
+        "server_id": roles.get("receiver_server_id", ""),
+        "base_device_id": "",
+    }
+
+
+def explicit_device_roles(entry: dict[str, Any], source: str = "") -> Optional[dict[str, str]]:
+    has_explicit_sender = entry_has_any_value(
+        entry,
+        "senderDeviceId", "sourceDeviceId", "sender_device_id", "source_device_id",
+        "senderBaseDeviceId", "sourceBaseDeviceId", "sender_base_device_id", "source_base_device_id",
+        "senderName", "sourceDeviceName", "sender_name", "source_device_name",
+        "senderHost", "sourceHost", "sender_host", "source_host",
+    )
+    has_explicit_receiver = entry_has_any_value(
+        entry,
+        "receiverDeviceId", "receiver_device_id",
+        "receiverBaseDeviceId", "receiver_base_device_id",
+        "receiverName", "receiver_name",
+        "receiverHost", "receiver_host",
+    )
+    if not has_explicit_sender and not has_explicit_receiver:
+        return None
+
+    sender = explicit_sender_device(entry)
+    receiver = explicit_receiver_device(entry)
+    if not device_has_identity(sender) and not device_has_identity(receiver):
+        return None
+    legacy_roles = derive_legacy_device_roles(entry, source)
+    if not device_has_identity(sender):
+        sender = roles_to_sender_device(legacy_roles)
+    if not device_has_identity(receiver):
+        receiver = roles_to_receiver_device(legacy_roles)
+    sender = canonicalize_device(sender, role="sender")
+    receiver = canonicalize_device(receiver, role="receiver")
+    return {
+        "sender_id": sender.get("id", ""),
+        "sender_name": sender.get("name", "") or sender.get("id", "") or "未知发送端",
+        "receiver_id": receiver.get("id", ""),
+        "receiver_name": receiver.get("name", "") or receiver.get("id", "") or "未知接收端",
+        "receiver_host": receiver.get("host", ""),
+        "receiver_server_id": receiver.get("server_id", ""),
+    }
 
 
 def derive_device_roles(entry: dict[str, Any], source: str = "") -> dict[str, str]:
+    explicit_roles = explicit_device_roles(entry, source)
+    if explicit_roles is not None:
+        return explicit_roles
+
+    return derive_legacy_device_roles(entry, source)
+
+
+def derive_legacy_device_roles(entry: dict[str, Any], source: str = "") -> dict[str, str]:
     direction = clean_label(pick(entry, "direction"))
     client_id = clean_label(pick(entry, "client_id", "clientId", "deviceId"))
     client_name = clean_label(pick(entry, "client_name", "clientName", "deviceName")) or client_id
+    client_base_device_id = clean_label(pick(entry, "clientBaseDeviceId", "client_base_device_id", "baseDeviceId", "base_device_id"))
     target_id = clean_label(pick(entry, "target_id", "targetId", "target"))
+    target_base_device_id = clean_label(pick(entry, "targetBaseDeviceId", "target_base_device_id"))
     target_host = clean_label(pick(entry, "targetHost", "targetDeviceName", "hostname"))
     target_server_id = clean_label(pick(entry, "targetServerId", "serverId", "target_server_id"))
     target_name = (
@@ -227,8 +360,20 @@ def derive_device_roles(entry: dict[str, Any], source: str = "") -> dict[str, st
     )
     source_receiver = source_receiver_device(source)
 
-    client = {"id": client_id, "name": client_name, "host": "", "server_id": ""}
-    target = {"id": target_id, "name": target_name, "host": target_host, "server_id": target_server_id}
+    client = {
+        "id": client_id or client_base_device_id,
+        "name": client_name or client_id or client_base_device_id,
+        "host": "",
+        "server_id": "",
+        "base_device_id": client_base_device_id,
+    }
+    target = {
+        "id": target_id or target_server_id or target_base_device_id,
+        "name": target_name,
+        "host": target_host,
+        "server_id": target_server_id,
+        "base_device_id": target_base_device_id,
+    }
 
     if direction == "desktop_to_mobile":
         sender = target if target["name"] or target["id"] else source_receiver
@@ -1780,8 +1925,43 @@ function deviceDisplayName(name, id) {
   return name || id || '未知设备';
 }
 
-function deviceFilterValue(name, id) {
-  return deviceDisplayName(name, id);
+function shortDeviceId(id) {
+  const text = String(id || '').trim();
+  if (!text) return '';
+  if (text.length <= 16) return text;
+  return `...${text.slice(-12)}`;
+}
+
+function historyDeviceIdentity(entry, role) {
+  if (role === 'sender') {
+    return {
+      id: entry.senderId || '',
+      name: entry.senderName || '',
+      host: '',
+    };
+  }
+  return {
+    id: entry.receiverId || entry.receiverServerId || '',
+    name: entry.receiverName || '',
+    host: entry.receiverHost || '',
+  };
+}
+
+function deviceFilterKey(identity) {
+  const id = String(identity.id || '').trim();
+  const name = String(identity.name || '').trim();
+  if (id) return `id:${id}`;
+  if (name) return `name:${name}`;
+  return 'unknown';
+}
+
+function deviceFilterLabel(identity, duplicateNames) {
+  const label = deviceDisplayName(identity.name, identity.id);
+  const id = String(identity.id || '').trim();
+  if (id && duplicateNames.has(label) && id !== label) {
+    return `${label} · ${shortDeviceId(id)}`;
+  }
+  return label;
 }
 
 function incrementCount(map, key) {
@@ -1792,31 +1972,48 @@ function optionLabel(label, count) {
   return `${label} (${count})`;
 }
 
-function compareByCountThenName(counts) {
+function compareByCountThenName(counts, labels = new Map()) {
   return (a, b) => {
     const countDiff = (counts.get(b) || 0) - (counts.get(a) || 0);
     if (countDiff !== 0) return countDiff;
-    return a.localeCompare(b, 'zh-CN');
+    return (labels.get(a) || a).localeCompare(labels.get(b) || b, 'zh-CN');
   };
 }
 
 function populateDeviceFilter(selectId, entries, role) {
   const select = document.getElementById(selectId);
   const counts = new Map();
+  const identities = new Map();
+  const nameIds = new Map();
   entries.forEach((entry) => {
-    const label = role === 'sender'
-      ? deviceFilterValue(entry.senderName, entry.senderId)
-      : deviceFilterValue(entry.receiverName, entry.receiverId);
-    if (label) {
-      incrementCount(counts, label);
+    const identity = historyDeviceIdentity(entry, role);
+    const key = deviceFilterKey(identity);
+    identities.set(key, identity);
+    incrementCount(counts, key);
+    const label = deviceDisplayName(identity.name, identity.id);
+    const id = String(identity.id || '').trim();
+    if (label && id) {
+      if (!nameIds.has(label)) nameIds.set(label, new Set());
+      nameIds.get(label).add(id);
     }
   });
+  const duplicateNames = new Set(
+    Array.from(nameIds.entries())
+      .filter(([, ids]) => ids.size > 1)
+      .map(([label]) => label)
+  );
+  const labels = new Map(
+    Array.from(counts.keys()).map((key) => [
+      key,
+      deviceFilterLabel(identities.get(key) || {}, duplicateNames),
+    ])
+  );
   const selected = select.value || 'all';
-  const options = ['all', ...Array.from(counts.keys()).sort(compareByCountThenName(counts))];
+  const options = ['all', ...Array.from(counts.keys()).sort(compareByCountThenName(counts, labels))];
   select.innerHTML = options.map((value) => {
     const label = value === 'all'
       ? optionLabel(role === 'sender' ? '全部发送端' : '全部接收端', entries.length)
-      : optionLabel(value, counts.get(value) || 0);
+      : optionLabel(labels.get(value) || value, counts.get(value) || 0);
     return `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`;
   }).join('');
   select.value = options.includes(selected) ? selected : 'all';
@@ -1900,9 +2097,9 @@ function entryMatches(entry, query, kind, senderFilter, receiverFilter) {
   ].filter(Boolean).join('\\n').toLowerCase();
   const queryOk = !query || haystack.includes(query);
   if (!queryOk) return false;
-  const senderOk = senderFilter === 'all' || deviceFilterValue(entry.senderName, entry.senderId) === senderFilter;
+  const senderOk = senderFilter === 'all' || deviceFilterKey(historyDeviceIdentity(entry, 'sender')) === senderFilter;
   if (!senderOk) return false;
-  const receiverOk = receiverFilter === 'all' || deviceFilterValue(entry.receiverName, entry.receiverId) === receiverFilter;
+  const receiverOk = receiverFilter === 'all' || deviceFilterKey(historyDeviceIdentity(entry, 'receiver')) === receiverFilter;
   if (!receiverOk) return false;
   return entryMatchesKind(entry, kind);
 }

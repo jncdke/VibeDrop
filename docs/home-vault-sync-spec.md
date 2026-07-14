@@ -61,7 +61,7 @@ Vault 根目录必须生成 `open-home-vault-viewer.webloc`，用于在 Mac mini
 
 1. 在本机创建临时 staging 目录，并创建 256 个对象桶。
 2. 如果远端已有 `db/vibedrop.sqlite`，先拉回本地继续写入，保留历史同步快照；没有则新建数据库。
-3. 读取 `~/.vibedrop/history.jsonl` 和 `~/.voicedrop/history.jsonl`，逐行解析 JSON；历史条目 ID 使用原始 JSON 行的 SHA-256，和桌面端“相同行去重”的语义一致。
+3. 读取 `~/.vibedrop/history.jsonl` 和 `~/.voicedrop/history.jsonl`，逐行解析 JSON；旧 Tauri Mac 行使用原始 JSON 行的 SHA-256 去重，原生 Android/Mac 行如果带稳定 `id`，则分别用 `android-entry:<id>` / `mac-entry:<id>` 去重，避免同一条原生记录更新后重复入库。
 4. 从历史记录中提取 `image_path`、`file_path`、`saved_path`、`items[]`、camelCase/snake_case 变体字段；存在的本地文件计算 SHA-256 并进入对象库，不存在则记录缺失原因。
 5. 生成查看器 JSON 和同步报告。
 6. 使用 rsync 把 staging 中的 `objects/db/viewer/manifests` 增量同步到 Mac mini。

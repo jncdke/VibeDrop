@@ -29,6 +29,9 @@ const NEARBY_REORDER_HINT_KEY = 'vibedrop_nearby_reorder_hint_seen';
 const HOME_VAULT_DEFAULT_URL = 'http://192.168.3.2:8788';
 const SMART_DISCOVERY_REFRESH_COOLDOWN_MS = 15000;
 const DIAGNOSTICS_REFRESH_INTERVAL_MS = 1000;
+const SEND_CONNECTION_WAIT_MS = 3500;
+const SEND_CONNECTION_POLL_MS = 100;
+const SEND_COMPOSER_DEFERRED_RENDER_DELAY_MS = 180;
 const DEFAULT_HISTORY_FILTERS = {
     device: 'all',
     quickTime: 'all',
@@ -42,12 +45,21 @@ const DEFAULT_HISTORY_FILTERS = {
     query: '',
 };
 
+function debugLog() {}
+
 // ---- 状态 ----
 const connections = {}; // key = device.id, value = { ws, authenticated, hostname, ... }
 const incomingDesktopTransfers = {};
 const outboundDesktopFileTransfers = {};
 const sendDrafts = new Map();
 let sendDraftFocusState = null;
+let sendCardsLayoutPending = false;
+let sendComposerState = {
+    focusedDeviceId: '',
+    composingDeviceId: '',
+    lastInputAt: 0,
+    deferredRenderTimer: null,
+};
 let pendingSharedContents = [];
 let currentHistoryFilters = { ...DEFAULT_HISTORY_FILTERS };
 let historyDatePickerState = {
@@ -2538,19 +2550,87 @@ function getSendDraft(deviceId) {
     return sendDrafts.get(deviceId) || '';
 }
 
+function getSendInputDeviceId(input) {
+    const id = String(input?.id || '');
+    const match = id.match(/^input-(.+)$/);
+    return match ? match[1] : '';
+}
+
+function isSendInputElement(element) {
+    return Boolean(element?.matches?.('#send-cards textarea[id^="input-"]'));
+}
+
+function getProtectedSendComposerDeviceId() {
+    const active = document.activeElement;
+    if (isSendInputElement(active)) {
+        return getSendInputDeviceId(active);
+    }
+    return sendComposerState.composingDeviceId || '';
+}
+
+function flushDeferredSendCardsRender() {
+    clearTimeout(sendComposerState.deferredRenderTimer);
+    sendComposerState.deferredRenderTimer = null;
+    if (!sendCardsLayoutPending) {
+        return;
+    }
+    if (getProtectedSendComposerDeviceId()) {
+        return;
+    }
+    sendCardsLayoutPending = false;
+    renderSendCards(getDevices());
+}
+
+function scheduleDeferredSendCardsRender() {
+    clearTimeout(sendComposerState.deferredRenderTimer);
+    sendComposerState.deferredRenderTimer = setTimeout(
+        flushDeferredSendCardsRender,
+        SEND_COMPOSER_DEFERRED_RENDER_DELAY_MS
+    );
+}
+
+function bindSendComposerEvents(input, deviceId) {
+    input.addEventListener('focus', () => {
+        sendComposerState.focusedDeviceId = deviceId;
+    });
+    input.addEventListener('blur', () => {
+        setSendDraft(deviceId, input.value);
+        if (sendComposerState.focusedDeviceId === deviceId) {
+            sendComposerState.focusedDeviceId = '';
+        }
+        scheduleDeferredSendCardsRender();
+    });
+    input.addEventListener('input', () => {
+        sendComposerState.focusedDeviceId = deviceId;
+        sendComposerState.lastInputAt = Date.now();
+        setSendDraft(deviceId, input.value);
+    });
+    input.addEventListener('compositionstart', () => {
+        sendComposerState.focusedDeviceId = deviceId;
+        sendComposerState.composingDeviceId = deviceId;
+    });
+    input.addEventListener('compositionend', () => {
+        setSendDraft(deviceId, input.value);
+        if (sendComposerState.composingDeviceId === deviceId) {
+            sendComposerState.composingDeviceId = '';
+        }
+        scheduleDeferredSendCardsRender();
+    });
+}
+
 function captureSendDraftsFromDom() {
     sendDraftFocusState = null;
     document.querySelectorAll('#send-cards textarea[id^="input-"]').forEach((input) => {
-        const deviceId = input.id.replace(/^input-/, '');
+        const deviceId = getSendInputDeviceId(input);
         if (deviceId) {
             setSendDraft(deviceId, input.value);
         }
     });
 
     const active = document.activeElement;
-    if (active?.matches?.('#send-cards textarea[id^="input-"]')) {
+    if (isSendInputElement(active)) {
         sendDraftFocusState = {
-            deviceId: active.id.replace(/^input-/, ''),
+            deviceId: getSendInputDeviceId(active),
             selectionStart: active.selectionStart,
             selectionEnd: active.selectionEnd,
         };
@@ -2584,22 +2664,16 @@ function restoreSendDraftFocus() {
         if (typeof input.setSelectionRange === 'function') {
             input.setSelectionRange(start, end);
         }
+        sendDraftFocusState = null;
     });
 }
 
-function renderSendCards(devices) {
-    const container = $('send-cards');
-    captureSendDraftsFromDom();
-    pruneSendDrafts(devices);
-    container.innerHTML = '';
-
-    devices.forEach(dev => {
-        if (!dev.ip) return; // 未配置的设备不显示
-
-        const card = document.createElement('div');
-        card.className = 'mac-card';
-        card.id = `card-${dev.id}`;
-        card.innerHTML = `
+function createSendCard(dev) {
+    const card = document.createElement('div');
+    card.className = 'mac-card';
+    card.id = `card-${dev.id}`;
+    card.dataset.deviceId = dev.id;
+    card.innerHTML = `
             <div class="mac-header">
                 <span class="status-dot" id="dot-${dev.id}"></span>
                 <span class="mac-name" id="name-${dev.id}">${escapeHtml(dev.name)}</span>
@@ -2620,69 +2694,193 @@ function renderSendCards(devices) {
                 <input type="file" id="fileinput-${dev.id}" class="hidden-file-input" multiple>
             </div>
         `;
-        container.appendChild(card);
 
-        // 发送按钮
-        const sendBtn = card.querySelector(`#sendbtn-${dev.id}`);
-        const enterBtn = card.querySelector(`#enterbtn-${dev.id}`);
-        const sendEnterBtn = card.querySelector(`#sendenterbtn-${dev.id}`);
-        const imageBtn = card.querySelector(`#imagebtn-${dev.id}`);
-        const fileBtn = card.querySelector(`#filebtn-${dev.id}`);
-        const imageInput = card.querySelector(`#imageinput-${dev.id}`);
-        const fileInput = card.querySelector(`#fileinput-${dev.id}`);
-        const input = card.querySelector('textarea');
-        input.value = getSendDraft(dev.id);
-        input.addEventListener('input', () => setSendDraft(dev.id, input.value));
+    const sendBtn = card.querySelector(`#sendbtn-${dev.id}`);
+    const enterBtn = card.querySelector(`#enterbtn-${dev.id}`);
+    const sendEnterBtn = card.querySelector(`#sendenterbtn-${dev.id}`);
+    const imageBtn = card.querySelector(`#imagebtn-${dev.id}`);
+    const fileBtn = card.querySelector(`#filebtn-${dev.id}`);
+    const imageInput = card.querySelector(`#imageinput-${dev.id}`);
+    const fileInput = card.querySelector(`#fileinput-${dev.id}`);
+    const input = card.querySelector('textarea');
+    input.value = getSendDraft(dev.id);
+    bindSendComposerEvents(input, dev.id);
 
-        sendBtn.addEventListener('click', () => sendText(dev.id));
-        enterBtn.addEventListener('click', () => sendEnter(dev.id));
-        sendEnterBtn.addEventListener('click', () => sendTextAndEnter(dev.id));
-        imageBtn.addEventListener('click', () => {
-            const primaryShared = getPrimaryPendingSharedContent();
-            if (pendingSharedContents.length) {
-                if (pendingSharedContents.length > 1) {
-                    showToast('批量内容请使用“传到收件箱”');
-                    return;
-                }
-                if (!primaryShared?.isImage) {
-                    showToast('当前共享内容不是图片，请使用“传到收件箱”');
-                    return;
-                }
-                sendPendingSharedImage(dev.id);
+    sendBtn.addEventListener('click', () => sendText(dev.id));
+    enterBtn.addEventListener('click', () => sendEnter(dev.id));
+    sendEnterBtn.addEventListener('click', () => sendTextAndEnter(dev.id));
+    imageBtn.addEventListener('click', () => {
+        const primaryShared = getPrimaryPendingSharedContent();
+        if (pendingSharedContents.length) {
+            if (pendingSharedContents.length > 1) {
+                showToast('批量内容请使用“传到收件箱”');
                 return;
             }
-            imageInput.click();
-        });
-        fileBtn.addEventListener('click', () => {
-            if (pendingSharedContents.length) {
-                if (pendingSharedContents.length > 1) {
-                    sendPendingSharedFilesBatch(dev.id);
-                } else {
-                    sendPendingSharedFile(dev.id);
-                }
+            if (!primaryShared?.isImage) {
+                showToast('当前共享内容不是图片，请使用“传到收件箱”');
                 return;
             }
-            fileInput.click();
-        });
-        imageInput.addEventListener('change', async (event) => {
-            const [file] = event.target.files || [];
-            event.target.value = '';
-            if (file) {
-                await sendSelectedImage(dev.id, file);
-            }
-        });
-        fileInput.addEventListener('change', async (event) => {
-            const files = Array.from(event.target.files || []);
-            event.target.value = '';
-            if (files.length > 1) {
-                await sendSelectedFilesBatch(dev.id, files);
-            } else if (files[0]) {
-                const [file] = files;
-                await sendSelectedFile(dev.id, file);
-            }
-        });
+            sendPendingSharedImage(dev.id);
+            return;
+        }
+        imageInput.click();
     });
-    restoreSendDraftFocus();
+    fileBtn.addEventListener('click', () => {
+        if (pendingSharedContents.length) {
+            if (pendingSharedContents.length > 1) {
+                sendPendingSharedFilesBatch(dev.id);
+            } else {
+                sendPendingSharedFile(dev.id);
+            }
+            return;
+        }
+        fileInput.click();
+    });
+    imageInput.addEventListener('change', async (event) => {
+        const [file] = event.target.files || [];
+        event.target.value = '';
+        if (file) {
+            await sendSelectedImage(dev.id, file);
+        }
+    });
+    fileInput.addEventListener('change', async (event) => {
+        const files = Array.from(event.target.files || []);
+        event.target.value = '';
+        if (files.length > 1) {
+            await sendSelectedFilesBatch(dev.id, files);
+        } else if (files[0]) {
+            const [file] = files;
+            await sendSelectedFile(dev.id, file);
+        }
+    });
+
+    return card;
+}
+
+function getSendCardDeviceId(card) {
+    return card?.dataset?.deviceId || String(card?.id || '').replace(/^card-/, '');
+}
+
+function updateSendCardDeviceMeta(card, dev) {
+    if (!card || !dev?.id) {
+        return;
+    }
+    card.dataset.deviceId = dev.id;
+    card.dataset.endpoint = dev.ip ? `${dev.ip}:${dev.port || DESKTOP_DISCOVERY_DEFAULT_PORT}` : '';
+    const name = $(`name-${dev.id}`);
+    if (!name) {
+        return;
+    }
+    const conn = connections[dev.id];
+    name.textContent = (conn?.authenticated && conn.hostname)
+        ? conn.hostname
+        : (dev.name || dev.hostName || dev.ip || '未命名设备');
+}
+
+function syncNewSendCardConnectionState(deviceId) {
+    const conn = connections[deviceId];
+    if (isConnectionReady(conn)) {
+        updateDeviceUI(deviceId, 'connected', conn.hostname || undefined);
+    } else if (conn?.ws && conn.ws.readyState === WebSocket.CONNECTING) {
+        updateDeviceUI(deviceId, 'connecting');
+    } else if (conn?.ws && conn.ws.readyState === WebSocket.OPEN && !conn.authenticated) {
+        updateDeviceUI(deviceId, 'connecting', '认证中...');
+    }
+}
+
+function isSendCardOrderAligned(container, orderedIds) {
+    const currentIds = Array.from(container.children)
+        .map((card) => getSendCardDeviceId(card))
+        .filter(Boolean);
+    return currentIds.length === orderedIds.length
+        && currentIds.every((id, index) => id === orderedIds[index]);
+}
+
+function reorderSendCards(container, orderedIds) {
+    let cursor = container.firstElementChild;
+    orderedIds.forEach((deviceId) => {
+        const card = $(`card-${deviceId}`);
+        if (!card || card.parentElement !== container) {
+            return;
+        }
+        if (card === cursor) {
+            cursor = cursor.nextElementSibling;
+            return;
+        }
+        container.insertBefore(card, cursor);
+    });
+}
+
+function renderSendCards(devices) {
+    const container = $('send-cards');
+    if (!container) return;
+
+    captureSendDraftsFromDom();
+    pruneSendDrafts(devices);
+
+    const visibleDevices = devices.filter((dev) => dev?.ip);
+    const visibleIds = visibleDevices.map((dev) => dev.id);
+    const visibleIdSet = new Set(visibleIds);
+    const protectedDeviceId = getProtectedSendComposerDeviceId();
+    const existingCards = new Map();
+    let layoutPending = false;
+
+    Array.from(container.children).forEach((card) => {
+        const deviceId = getSendCardDeviceId(card);
+        if (deviceId) {
+            existingCards.set(deviceId, card);
+        }
+    });
+
+    visibleDevices.forEach((dev) => {
+        let card = existingCards.get(dev.id);
+        const isNewCard = !card;
+        if (!card) {
+            card = createSendCard(dev);
+            container.appendChild(card);
+        } else {
+            updateSendCardDeviceMeta(card, dev);
+        }
+        existingCards.delete(dev.id);
+
+        const input = $(`input-${dev.id}`);
+        if (input) {
+            if (protectedDeviceId === dev.id) {
+                setSendDraft(dev.id, input.value);
+            } else {
+                const draft = getSendDraft(dev.id);
+                if (input.value !== draft) {
+                    input.value = draft;
+                }
+            }
+        }
+
+        if (isNewCard) {
+            syncNewSendCardConnectionState(dev.id);
+        }
+    });
+
+    existingCards.forEach((card, deviceId) => {
+        if (deviceId === protectedDeviceId) {
+            layoutPending = true;
+            return;
+        }
+        card.remove();
+    });
+
+    if (protectedDeviceId) {
+        if (!visibleIdSet.has(protectedDeviceId) || !isSendCardOrderAligned(container, visibleIds)) {
+            layoutPending = true;
+        }
+        sendDraftFocusState = null;
+    } else {
+        reorderSendCards(container, visibleIds);
+        restoreSendDraftFocus();
+    }
+
+    if (layoutPending) {
+        sendCardsLayoutPending = true;
+    }
 }
 
 // ============================================
@@ -4096,6 +4294,7 @@ function connectDevice(deviceId, ip, port, pin) {
 
     const url = `ws://${ip}:${port}/ws`;
     console.log(`[${deviceId}] 正在连接: ${url}`);
+    debugLog('connect:start', { deviceId, ip, port });
     let ws;
     try {
         ws = new WebSocket(url);
@@ -4115,6 +4314,7 @@ function connectDevice(deviceId, ip, port, pin) {
         if (conn.ws !== ws) return;
         conn.lastMessageAt = Date.now();
         console.log(`[${deviceId}] WebSocket 已连接，发送 PIN 认证`);
+        debugLog('connect:open', { deviceId, readyState: ws.readyState });
         ws.send(JSON.stringify({
             action: 'auth',
             pin: pin,
@@ -4174,10 +4374,12 @@ function connectDevice(deviceId, ip, port, pin) {
                 conn.authenticated = true;
                 conn.hostname = data.hostname;
                 conn.reconnectAttempts = 0;
+                debugLog('connect:auth_ok', { deviceId, hostname: data.hostname });
                 reconcileAuthenticatedDesktopIdentity(deviceId, data);
                 updateDeviceUI(deviceId, 'connected', data.hostname);
                 startHeartbeat(deviceId, ip, port, pin);
             } else {
+                debugLog('connect:auth_fail', { deviceId, error: data.error || 'PIN 错误' });
                 updateDeviceUI(deviceId, 'error', data.error || 'PIN 错误');
             }
             return;
@@ -4191,11 +4393,13 @@ function connectDevice(deviceId, ip, port, pin) {
 
     ws.onerror = () => {
         if (conn.ws !== ws) return;
+        debugLog('connect:error', { deviceId });
         updateDeviceUI(deviceId, 'error', '连接出错');
     };
 
     ws.onclose = () => {
         if (conn.ws !== ws) return;
+        debugLog('connect:close', { deviceId });
         rejectOutboundDesktopTransfersForDevice(deviceId, '连接已断开');
         conn.ws = null;
         conn.authenticated = false;
@@ -4726,6 +4930,63 @@ function setActionButtonsDisabled(deviceId, disabled) {
     if (fileBtn) fileBtn.disabled = disabled;
 }
 
+function isConnectionReady(conn) {
+    return Boolean(conn?.authenticated && conn.ws && conn.ws.readyState === WebSocket.OPEN);
+}
+
+function getDeviceDisplayName(deviceId) {
+    const device = findDeviceByAnyId(deviceId, getDevices());
+    return device?.name || device?.hostName || device?.ip || '目标电脑';
+}
+
+async function ensureReadyConnectionForSend(deviceId, {
+    timeoutMs = SEND_CONNECTION_WAIT_MS,
+    showConnectingToast = true,
+} = {}) {
+    let conn = connections[deviceId];
+    if (isConnectionReady(conn)) {
+        debugLog('ensureReady:already_ready', {
+            deviceId,
+            readyState: conn.ws.readyState,
+            authenticated: Boolean(conn.authenticated),
+        });
+        return conn;
+    }
+
+    const device = findDeviceByAnyId(deviceId, getDevices());
+    if (!device?.ip) {
+        debugLog('ensureReady:no_device_ip', { deviceId });
+        showToast('设备地址缺失，请到设置里重新选择电脑');
+        updateDeviceUI(deviceId, 'error', '未配置地址');
+        return null;
+    }
+
+    const label = getDeviceDisplayName(deviceId);
+    if (showConnectingToast) {
+        showToast(`正在重连 ${label}`);
+    }
+    debugLog('ensureReady:reconnect', { deviceId, ip: device.ip, port: device.port || '9001' });
+    connectDevice(deviceId, device.ip, device.port || '9001', device.pin || '');
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        await sleep(SEND_CONNECTION_POLL_MS);
+        conn = connections[deviceId];
+        if (isConnectionReady(conn)) {
+            debugLog('ensureReady:ready_after_wait', { deviceId });
+            return conn;
+        }
+    }
+
+    debugLog('ensureReady:timeout', {
+        deviceId,
+        readyState: connections[deviceId]?.ws?.readyState,
+        authenticated: Boolean(connections[deviceId]?.authenticated),
+    });
+    showToast(`${label} 未连接，请稍后再试`);
+    return null;
+}
+
 async function sendDeviceAction(deviceId, {
     action,
     payload = {},
@@ -4737,13 +4998,39 @@ async function sendDeviceAction(deviceId, {
     successToast = '',
     timeoutMs = 5000,
 }) {
-    const conn = connections[deviceId];
     const btn = $(buttonId);
     const input = $(`input-${deviceId}`);
+    let conn = connections[deviceId];
 
-    if (!btn || !conn || !conn.authenticated || !conn.ws) {
+    debugLog('sendAction:start', {
+        deviceId,
+        action,
+        buttonId,
+        hasButton: Boolean(btn),
+        hasInput: Boolean(input),
+        readyState: conn?.ws?.readyState,
+        authenticated: Boolean(conn?.authenticated),
+    });
+
+    if (!btn) {
+        return { ok: false, error: '操作按钮不存在' };
+    }
+
+    if (!isConnectionReady(conn)) {
+        conn = await ensureReadyConnectionForSend(deviceId);
+    }
+
+    if (!isConnectionReady(conn)) {
+        debugLog('sendAction:not_ready_after_ensure', {
+            deviceId,
+            action,
+            readyState: conn?.ws?.readyState,
+            authenticated: Boolean(conn?.authenticated),
+        });
         return { ok: false, error: '未连接' };
     }
+
+    debugLog('sendAction:ready', { deviceId, action });
 
     const originalText = btn.textContent;
     btn.classList.add('sending');
@@ -4752,6 +5039,12 @@ async function sendDeviceAction(deviceId, {
 
     try {
         const result = await sendDesktopRequest(conn, { action, ...payload }, timeoutMs);
+        debugLog('sendAction:result', {
+            deviceId,
+            action,
+            status: result?.status,
+            error: result?.error || '',
+        });
 
         if (result.status === 'ok') {
             if (historyEntry) {
@@ -4781,6 +5074,11 @@ async function sendDeviceAction(deviceId, {
         btn.textContent = '✗';
         return { ok: false, error: result.error || '操作失败' };
     } catch (e) {
+        debugLog('sendAction:catch', {
+            deviceId,
+            action,
+            error: e.message || '操作失败',
+        });
         if (historyEntry) {
             historyEntry.status = 'failed';
             updateHistory(historyEntry);
@@ -4802,11 +5100,23 @@ async function sendDeviceAction(deviceId, {
 }
 
 async function sendText(deviceId) {
-    const conn = connections[deviceId];
-    if (!conn || !conn.authenticated || !conn.ws) return;
-
+    debugLog('sendText:start', { deviceId });
     const text = await resolveTextToSend(deviceId);
-    if (!text) return;
+    if (!text) {
+        debugLog('sendText:no_text', { deviceId });
+        return;
+    }
+    debugLog('sendText:resolved', { deviceId, textLength: text.length });
+
+    const conn = await ensureReadyConnectionForSend(deviceId);
+    if (!isConnectionReady(conn)) {
+        debugLog('sendText:not_ready', {
+            deviceId,
+            readyState: conn?.ws?.readyState,
+            authenticated: Boolean(conn?.authenticated),
+        });
+        return;
+    }
 
     const historyEntry = {
         id: Date.now(),
@@ -4824,6 +5134,7 @@ async function sendText(deviceId) {
         pendingText: '发送中...',
         clearInput: true,
         historyEntry,
+        failureToast: true,
     });
 }
 
@@ -4836,12 +5147,25 @@ async function sendEnter(deviceId) {
 }
 
 async function sendTextAndEnter(deviceId) {
-    const conn = connections[deviceId];
     const input = $(`input-${deviceId}`);
-    if (!conn || !conn.authenticated || !conn.ws) return;
 
+    debugLog('sendTextAndEnter:start', { deviceId });
     const text = await resolveTextToSend(deviceId);
-    if (!text) return;
+    if (!text) {
+        debugLog('sendTextAndEnter:no_text', { deviceId });
+        return;
+    }
+    debugLog('sendTextAndEnter:resolved', { deviceId, textLength: text.length });
+
+    const conn = await ensureReadyConnectionForSend(deviceId);
+    if (!isConnectionReady(conn)) {
+        debugLog('sendTextAndEnter:not_ready', {
+            deviceId,
+            readyState: conn?.ws?.readyState,
+            authenticated: Boolean(conn?.authenticated),
+        });
+        return;
+    }
 
     const historyEntry = {
         id: Date.now(),
@@ -5026,9 +5350,16 @@ function sendWsJson(ws, payload) {
 
 function sendDesktopRequest(conn, payload, timeoutMs = 5000) {
     if (!conn || !conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
+        debugLog('desktopRequest:not_ready', {
+            action: payload?.action,
+            hasConn: Boolean(conn),
+            readyState: conn?.ws?.readyState,
+            authenticated: Boolean(conn?.authenticated),
+        });
         return Promise.reject(new Error('未连接'));
     }
     if (conn._sendCallback) {
+        debugLog('desktopRequest:busy', { action: payload?.action });
         return Promise.reject(new Error('当前有未完成操作'));
     }
 
@@ -5046,15 +5377,33 @@ function sendDesktopRequest(conn, payload, timeoutMs = 5000) {
             }
             handler(value);
         };
-        const callback = finish(resolve);
+        const callback = finish((value) => {
+            debugLog('desktopRequest:response', {
+                action: payload?.action,
+                status: value?.status,
+                error: value?.error || '',
+            });
+            resolve(value);
+        });
         timer = setTimeout(() => {
+            debugLog('desktopRequest:timeout', { action: payload?.action, timeoutMs });
             finish(reject)(new Error('超时'));
         }, timeoutMs);
 
         conn._sendCallback = callback;
         try {
+            debugLog('desktopRequest:send', {
+                action: payload?.action,
+                textLength: payload?.text ? payload.text.length : 0,
+                readyState: conn.ws.readyState,
+                authenticated: Boolean(conn.authenticated),
+            });
             sendWsJson(conn.ws, payload);
         } catch (error) {
+            debugLog('desktopRequest:send_error', {
+                action: payload?.action,
+                error: error instanceof Error ? error.message : String(error || '发送失败'),
+            });
             finish(reject)(error instanceof Error ? error : new Error(String(error || '发送失败')));
         }
     });
@@ -6266,6 +6615,8 @@ function getHomeVaultSettings() {
         url: resolveHomeVaultUrlForNetwork(homeVault.url || HOME_VAULT_DEFAULT_URL),
         lastSyncedAt: homeVault.lastSyncedAt || '',
         lastEntryCount: Number(homeVault.lastEntryCount || 0),
+        lastRestoredAt: homeVault.lastRestoredAt || '',
+        lastRestoreCount: Number(homeVault.lastRestoreCount || 0),
     };
 }
 
@@ -6309,6 +6660,36 @@ async function syncHomeVaultWithFetch(endpoint, payload) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
+            signal: controller.signal,
+        });
+        const resultText = await response.text();
+        let result = {};
+        try {
+            result = resultText ? JSON.parse(resultText) : {};
+        } catch (error) {
+            result = { error: resultText || error.message };
+        }
+        if (!response.ok || result.ok === false) {
+            throw new Error(result.error || `HTTP ${response.status}`);
+        }
+        return result;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function restoreHomeVaultWithFetch(endpoint, deviceId, mode = 'compact') {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90000);
+    try {
+        const url = new URL(`${endpoint}/api/android-history/latest`);
+        if (deviceId) {
+            url.searchParams.set('deviceId', deviceId);
+        }
+        url.searchParams.set('mode', mode);
+        const response = await fetch(url.toString(), {
+            method: 'GET',
+            headers: { 'Accept': 'application/json' },
             signal: controller.signal,
         });
         const resultText = await response.text();
@@ -6399,9 +6780,82 @@ async function syncHomeVaultHistory() {
     }
 }
 
+async function restoreHomeVaultHistory() {
+    const input = $('home-vault-url-input');
+    const endpoint = resolveHomeVaultUrlForNetwork(input?.value || HOME_VAULT_DEFAULT_URL);
+    if (input) {
+        input.value = endpoint;
+    }
+    saveHomeVaultSettings({ url: endpoint });
+
+    const button = $('restore-home-vault-btn');
+    const syncButton = $('sync-home-vault-btn');
+    if (button) {
+        button.disabled = true;
+        button.textContent = '恢复中...';
+    }
+    if (syncButton) {
+        syncButton.disabled = true;
+    }
+    setHomeVaultStatus(`正在从 ${endpoint} 拉取历史...`);
+
+    try {
+        let result;
+        const deviceId = clientIdentity.id || '';
+        if (window.NativeHomeVault && typeof window.NativeHomeVault.restoreHistory === 'function') {
+            result = await waitForNativeBridgeEvent('native-home-vault-restore-result', () => {
+                window.NativeHomeVault.restoreHistory(endpoint, deviceId, 'compact');
+            }, 120000);
+            if (!result.ok) {
+                throw new Error(result.error || '恢复失败');
+            }
+            if (result.body) {
+                try {
+                    result = {
+                        ...JSON.parse(result.body),
+                        status: result.status,
+                    };
+                } catch (error) {
+                    throw new Error('恢复响应不是有效 JSON');
+                }
+            }
+        } else {
+            result = await restoreHomeVaultWithFetch(endpoint, deviceId, 'compact');
+        }
+
+        if (!Array.isArray(result.history)) {
+            throw new Error('Vault 返回的 history 不是数组');
+        }
+
+        const mergeResult = mergeImportedHistoryEntries(result.history);
+        const restoredAt = new Date().toISOString();
+        saveHomeVaultSettings({
+            url: endpoint,
+            lastRestoredAt: restoredAt,
+            lastRestoreCount: mergeResult.added,
+        });
+        const returnedCount = result.returnedCount || result.history.length;
+        setHomeVaultStatus(`已恢复 ${mergeResult.added} 条，跳过 ${mergeResult.skipped} 条重复。Vault 返回 ${returnedCount} 条。`, 'success');
+        showToast(`已从 Mac mini 恢复 ${mergeResult.added} 条`);
+    } catch (error) {
+        const message = error?.name === 'AbortError' ? '恢复超时' : (error?.message || '恢复失败');
+        setHomeVaultStatus(`恢复失败：${message}`, 'error');
+        showToast(`恢复失败：${message}`);
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '从 Mac mini 恢复';
+        }
+        if (syncButton) {
+            syncButton.disabled = false;
+        }
+    }
+}
+
 function initHomeVaultSync() {
     const input = $('home-vault-url-input');
     const button = $('sync-home-vault-btn');
+    const restoreButton = $('restore-home-vault-btn');
     if (!input || !button) {
         return;
     }
@@ -6414,6 +6868,12 @@ function initHomeVaultSync() {
             ? settings.lastSyncedAt
             : date.toLocaleString('zh-CN');
         setHomeVaultStatus(`上次同步：${label} · ${settings.lastEntryCount || 0} 条`, 'success');
+    } else if (settings.lastRestoredAt) {
+        const date = new Date(settings.lastRestoredAt);
+        const label = Number.isNaN(date.getTime())
+            ? settings.lastRestoredAt
+            : date.toLocaleString('zh-CN');
+        setHomeVaultStatus(`上次恢复：${label} · ${settings.lastRestoreCount || 0} 条`, 'success');
     }
 
     input.addEventListener('change', () => {
@@ -6423,6 +6883,9 @@ function initHomeVaultSync() {
         setHomeVaultStatus('服务器地址已保存');
     });
     button.addEventListener('click', () => syncHomeVaultHistory());
+    if (restoreButton) {
+        restoreButton.addEventListener('click', () => restoreHomeVaultHistory());
+    }
 }
 
 async function exportHistory() {
@@ -7165,6 +7628,45 @@ function truncateFilenamePreserveExtension(filename, maxBaseLength = 16, maxTota
     return `${base.slice(0, allowedBaseLength)}…${ext}`;
 }
 
+function mergeImportedHistoryEntries(imported) {
+    if (!Array.isArray(imported)) {
+        throw new Error('history 必须是 JSON 数组');
+    }
+
+    const existing = getHistory();
+    const existingKeys = new Set(
+        existing.map(h => `${h.timestamp}|${h.text || ''}`)
+    );
+
+    let added = 0;
+    let skipped = 0;
+
+    for (const rawEntry of imported) {
+        const entry = normalizeImportedHistoryEntry(rawEntry);
+        entry.text = String(entry.text || entry.fileName || '');
+        const key = `${entry.timestamp}|${entry.text}`;
+        if (existingKeys.has(key)) {
+            skipped++;
+        } else {
+            existing.push(entry);
+            existingKeys.add(key);
+            added++;
+        }
+    }
+
+    existing.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    setStoredHistoryRaw(JSON.stringify(existing));
+    persistHistory();
+    scheduleHistoryRender();
+
+    return {
+        added,
+        skipped,
+        total: imported.length,
+        currentCount: existing.length,
+    };
+}
+
 function importHistory(file) {
     const resultDiv = $('import-result');
     resultDiv.style.display = 'block';
@@ -7181,33 +7683,9 @@ function importHistory(file) {
                 return;
             }
 
-            const existing = getHistory();
-            const existingKeys = new Set(
-                existing.map(h => `${h.timestamp}|${h.text}`)
-            );
-
-            let added = 0;
-            let skipped = 0;
-
-            for (const rawEntry of imported) {
-                const entry = normalizeImportedHistoryEntry(rawEntry);
-                const key = `${entry.timestamp}|${entry.text}`;
-                if (existingKeys.has(key)) {
-                    skipped++;
-                } else {
-                    existing.push(entry);
-                    existingKeys.add(key);
-                    added++;
-                }
-            }
-
-            existing.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-            setStoredHistoryRaw(JSON.stringify(existing));
-            persistHistory();
-
-            resultDiv.innerHTML = `已导入 ${added} 条，跳过 ${skipped} 条重复`;
+            const result = mergeImportedHistoryEntries(imported);
+            resultDiv.innerHTML = `已导入 ${result.added} 条，跳过 ${result.skipped} 条重复`;
             resultDiv.style.color = '#147d33';
-            scheduleHistoryRender();
         } catch (err) {
             resultDiv.innerHTML = `解析失败：${err.message}`;
             resultDiv.style.color = '#c73b31';
