@@ -20,6 +20,7 @@ private const val BACKGROUND_CLIPBOARD_PREFS_NAME = "vibedrop_background_clipboa
 private const val BACKGROUND_CLIPBOARD_KEY_CONFIG_JSON = "config_json"
 private const val BACKGROUND_CLIPBOARD_KEY_FRONTEND_SYNC_GATE_UNTIL_MS = "frontend_sync_gate_until_ms"
 private const val BACKGROUND_CLIPBOARD_FRONTEND_SYNC_GATE_MS = 20_000L
+private const val BACKGROUND_CLIPBOARD_DIAGNOSTICS_EVENT_LIMIT = 120
 
 data class BackgroundClipboardIdentity(
   val id: String,
@@ -49,6 +50,19 @@ data class BackgroundClipboardConnectionDiagnostics(
   val reconnectScheduled: Boolean,
   val lastError: String,
   val lastStateAtMs: Long
+)
+
+data class BackgroundClipboardEventDiagnostics(
+  val timeMs: Long,
+  val type: String,
+  val deviceId: String,
+  val deviceName: String,
+  val ip: String,
+  val port: String,
+  val endpoint: String,
+  val status: String,
+  val error: String,
+  val detail: String
 )
 
 object BackgroundClipboardConfigStore {
@@ -142,6 +156,7 @@ object BackgroundClipboardStartupGate {
 object BackgroundClipboardDiagnosticsStore {
   private val lock = Any()
   private val connections = LinkedHashMap<String, BackgroundClipboardConnectionDiagnostics>()
+  private val events = mutableListOf<BackgroundClipboardEventDiagnostics>()
   private var lastReloadAtMs: Long = 0L
   private var lastClipboardAppliedAtMs: Long = 0L
   private var lastClipboardSourceName: String = ""
@@ -149,6 +164,10 @@ object BackgroundClipboardDiagnosticsStore {
   fun markReload() {
     synchronized(lock) {
       lastReloadAtMs = System.currentTimeMillis()
+      appendEventLocked(
+        type = "background:config_reloaded",
+        detail = "后台剪贴板配置已刷新"
+      )
     }
   }
 
@@ -156,6 +175,11 @@ object BackgroundClipboardDiagnosticsStore {
     synchronized(lock) {
       lastClipboardAppliedAtMs = System.currentTimeMillis()
       lastClipboardSourceName = sourceDeviceName
+      appendEventLocked(
+        type = "background:clipboard_applied",
+        deviceName = sourceDeviceName,
+        detail = "收到桌面端剪贴板同步"
+      )
     }
   }
 
@@ -168,6 +192,12 @@ object BackgroundClipboardDiagnosticsStore {
   ) {
     synchronized(lock) {
       val existing = connections[device.id]
+      val resolvedError = lastError ?: existing?.lastError.orEmpty()
+      val shouldLog = existing == null
+        || existing.status != status
+        || existing.authenticated != authenticated
+        || existing.reconnectScheduled != reconnectScheduled
+        || (lastError != null && existing?.lastError != resolvedError)
       connections[device.id] = BackgroundClipboardConnectionDiagnostics(
         id = device.id,
         name = device.name,
@@ -176,21 +206,80 @@ object BackgroundClipboardDiagnosticsStore {
         status = status,
         authenticated = authenticated,
         reconnectScheduled = reconnectScheduled,
-        lastError = lastError ?: existing?.lastError.orEmpty(),
+        lastError = resolvedError,
         lastStateAtMs = System.currentTimeMillis()
       )
+      if (shouldLog) {
+        appendEventLocked(
+          type = "background:$status",
+          deviceId = device.id,
+          deviceName = device.name,
+          ip = device.ip,
+          port = device.port,
+          status = status,
+          error = resolvedError
+        )
+      }
     }
   }
 
   fun clearConnection(deviceId: String) {
     synchronized(lock) {
-      connections.remove(deviceId)
+      val removed = connections.remove(deviceId)
+      if (removed != null) {
+        appendEventLocked(
+          type = "background:connection_removed",
+          deviceId = removed.id,
+          deviceName = removed.name,
+          ip = removed.ip,
+          port = removed.port,
+          status = "removed",
+          detail = "设备已从后台连接配置移除"
+        )
+      }
     }
   }
 
   fun clearAllConnections() {
     synchronized(lock) {
+      if (connections.isNotEmpty()) {
+        appendEventLocked(
+          type = "background:connections_cleared",
+          detail = "后台连接列表已清空"
+        )
+      }
       connections.clear()
+    }
+  }
+
+  private fun appendEventLocked(
+    type: String,
+    deviceId: String = "",
+    deviceName: String = "",
+    ip: String = "",
+    port: String = "",
+    status: String = "",
+    error: String = "",
+    detail: String = ""
+  ) {
+    val safeIp = ip.trim()
+    val safePort = port.trim()
+    events.add(
+      BackgroundClipboardEventDiagnostics(
+        timeMs = System.currentTimeMillis(),
+        type = type,
+        deviceId = deviceId.take(160),
+        deviceName = deviceName.take(160),
+        ip = safeIp.take(80),
+        port = safePort.take(16),
+        endpoint = listOf(safeIp, safePort).filter { it.isNotEmpty() }.joinToString(":").take(120),
+        status = status.take(80),
+        error = error.take(240),
+        detail = detail.take(240)
+      )
+    )
+    while (events.size > BACKGROUND_CLIPBOARD_DIAGNOSTICS_EVENT_LIMIT) {
+      events.removeAt(0)
     }
   }
 
@@ -233,6 +322,23 @@ object BackgroundClipboardDiagnosticsStore {
         })
       }
       root.put("connections", connectionItems)
+
+      val eventItems = JSONArray()
+      events.forEach { event ->
+        eventItems.put(JSONObject().apply {
+          put("timeMs", event.timeMs)
+          put("type", event.type)
+          put("deviceId", event.deviceId)
+          put("deviceName", event.deviceName)
+          put("ip", event.ip)
+          put("port", event.port)
+          put("endpoint", event.endpoint)
+          put("status", event.status)
+          put("error", event.error)
+          put("detail", event.detail)
+        })
+      }
+      root.put("events", eventItems)
     }
     return root.toString()
   }

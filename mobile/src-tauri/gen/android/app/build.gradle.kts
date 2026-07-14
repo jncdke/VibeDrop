@@ -37,6 +37,8 @@ android {
             }
         }
         getByName("release") {
+            isDebuggable = true
+            isJniDebuggable = true
             isMinifyEnabled = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }

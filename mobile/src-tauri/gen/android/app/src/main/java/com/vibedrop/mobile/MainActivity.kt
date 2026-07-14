@@ -3,12 +3,15 @@ package com.vibedrop.mobile
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.database.Cursor
+import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteOpenHelper
 import android.media.MediaScannerConnection
 import android.net.ConnectivityManager
 import android.net.Network
@@ -44,6 +47,7 @@ import java.net.SocketException
 import java.net.URL
 import java.net.URLConnection
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -87,7 +91,289 @@ class MainActivity : TauriActivity() {
     val network: String
   )
 
+  private data class CachedVaultObject(
+    val file: File,
+    val bytes: Long,
+    val skipped: Boolean
+  )
+
+  private class HistoryDatabaseHelper(private val context: Context) :
+    SQLiteOpenHelper(context.applicationContext, "vibedrop_history.db", null, 1) {
+
+    override fun onCreate(db: SQLiteDatabase) {
+      db.execSQL(
+        """
+        CREATE TABLE IF NOT EXISTS history_entries (
+          entry_key TEXT PRIMARY KEY,
+          timestamp TEXT NOT NULL,
+          text TEXT,
+          kind TEXT,
+          status TEXT,
+          target TEXT,
+          target_name TEXT,
+          target_alias TEXT,
+          target_device_name TEXT,
+          target_server_id TEXT,
+          raw_json TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        )
+        """.trimIndent()
+      )
+      db.execSQL("CREATE INDEX IF NOT EXISTS idx_history_entries_timestamp ON history_entries(timestamp DESC)")
+      db.execSQL("CREATE INDEX IF NOT EXISTS idx_history_entries_kind ON history_entries(kind)")
+      db.execSQL("CREATE INDEX IF NOT EXISTS idx_history_entries_target_server ON history_entries(target_server_id)")
+      db.execSQL(
+        """
+        CREATE TABLE IF NOT EXISTS media_cache (
+          cache_key TEXT PRIMARY KEY,
+          entry_key TEXT NOT NULL,
+          item_index INTEGER NOT NULL,
+          kind TEXT,
+          file_name TEXT,
+          mime_type TEXT,
+          object_hash TEXT,
+          object_path TEXT,
+          local_path TEXT,
+          thumbnail_path TEXT,
+          thumbnail_data_url TEXT,
+          size_bytes INTEGER,
+          status TEXT,
+          missing_reason TEXT,
+          updated_at INTEGER NOT NULL
+        )
+        """.trimIndent()
+      )
+      db.execSQL("CREATE INDEX IF NOT EXISTS idx_media_cache_entry ON media_cache(entry_key, item_index)")
+      db.execSQL("CREATE INDEX IF NOT EXISTS idx_media_cache_object_hash ON media_cache(object_hash)")
+    }
+
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+      onCreate(db)
+    }
+
+    fun loadHistory(): String {
+      val result = JSONArray()
+      readableDatabase.rawQuery(
+        "SELECT raw_json FROM history_entries ORDER BY timestamp DESC, updated_at DESC",
+        null
+      ).use { cursor ->
+        while (cursor.moveToNext()) {
+          val raw = cursor.getString(0) ?: continue
+          runCatching { result.put(JSONObject(raw)) }
+        }
+      }
+      return result.toString()
+    }
+
+    fun replaceHistory(historyJson: String): JSONObject {
+      val entries = JSONArray(historyJson)
+      val db = writableDatabase
+      val now = System.currentTimeMillis()
+      db.beginTransaction()
+      try {
+        db.delete("media_cache", null, null)
+        db.delete("history_entries", null, null)
+        for (index in 0 until entries.length()) {
+          val entry = entries.optJSONObject(index) ?: continue
+          upsertEntry(db, entry, now)
+        }
+        db.setTransactionSuccessful()
+      } finally {
+        db.endTransaction()
+      }
+      return JSONObject().apply {
+        put("ok", true)
+        put("count", entries.length())
+      }
+    }
+
+    fun upsertHistoryEntry(entryJson: String): JSONObject {
+      val entry = JSONObject(entryJson)
+      val db = writableDatabase
+      val key = upsertEntry(db, entry, System.currentTimeMillis())
+      return JSONObject().apply {
+        put("ok", true)
+        put("entryKey", key)
+      }
+    }
+
+    fun upsertHistoryArray(historyJson: String): JSONObject {
+      val entries = JSONArray(historyJson)
+      val db = writableDatabase
+      val now = System.currentTimeMillis()
+      db.beginTransaction()
+      var count = 0
+      try {
+        for (index in 0 until entries.length()) {
+          val entry = entries.optJSONObject(index) ?: continue
+          upsertEntry(db, entry, now)
+          count += 1
+        }
+        db.setTransactionSuccessful()
+      } finally {
+        db.endTransaction()
+      }
+      return JSONObject().apply {
+        put("ok", true)
+        put("count", count)
+      }
+    }
+
+    fun countExistingEntries(entries: JSONArray): Int {
+      val existingKeys = mutableSetOf<String>()
+      readableDatabase.rawQuery("SELECT entry_key FROM history_entries", null).use { cursor ->
+        while (cursor.moveToNext()) {
+          existingKeys.add(cursor.getString(0))
+        }
+      }
+      var count = 0
+      for (index in 0 until entries.length()) {
+        val entry = entries.optJSONObject(index) ?: continue
+        if (existingKeys.contains(deriveEntryKey(entry))) {
+          count += 1
+        }
+      }
+      return count
+    }
+
+    fun clearHistory(): JSONObject {
+      val db = writableDatabase
+      db.beginTransaction()
+      try {
+        db.delete("media_cache", null, null)
+        db.delete("history_entries", null, null)
+        db.setTransactionSuccessful()
+      } finally {
+        db.endTransaction()
+      }
+      return JSONObject().apply { put("ok", true) }
+    }
+
+    fun stats(): JSONObject {
+      val db = readableDatabase
+      val entryCount = scalarLong(db, "SELECT COUNT(*) FROM history_entries")
+      val mediaCount = scalarLong(db, "SELECT COUNT(*) FROM media_cache")
+      val cachedMediaCount = scalarLong(db, "SELECT COUNT(*) FROM media_cache WHERE local_path IS NOT NULL AND local_path != ''")
+      return JSONObject().apply {
+        put("ok", true)
+        put("entryCount", entryCount)
+        put("mediaCount", mediaCount)
+        put("cachedMediaCount", cachedMediaCount)
+        put("cacheBytes", directorySize(mediaCacheRoot()))
+      }
+    }
+
+    fun mediaCacheRoot(): File {
+      return File(context.filesDir, "vibedrop_history_media").apply { mkdirs() }
+    }
+
+    private fun scalarLong(db: SQLiteDatabase, sql: String): Long {
+      db.rawQuery(sql, null).use { cursor ->
+        return if (cursor.moveToFirst()) cursor.getLong(0) else 0L
+      }
+    }
+
+    private fun upsertEntry(db: SQLiteDatabase, entry: JSONObject, updatedAt: Long): String {
+      val key = deriveEntryKey(entry)
+      val values = ContentValues().apply {
+        put("entry_key", key)
+        put("timestamp", entry.optString("timestamp").ifBlank { entry.optString("timestamp_iso") })
+        put("text", entry.optString("text"))
+        put("kind", entry.optString("kind", "text"))
+        put("status", entry.optString("status", "success"))
+        put("target", entry.optString("target"))
+        put("target_name", entry.optString("targetName"))
+        put("target_alias", entry.optString("targetAlias"))
+        put("target_device_name", entry.optString("targetDeviceName").ifBlank { entry.optString("targetHost") })
+        put("target_server_id", entry.optString("targetServerId").ifBlank { entry.optString("serverId") })
+        put("raw_json", entry.toString())
+        put("updated_at", updatedAt)
+      }
+      db.insertWithOnConflict("history_entries", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+      replaceMediaRows(db, key, entry, updatedAt)
+      return key
+    }
+
+    private fun replaceMediaRows(db: SQLiteDatabase, entryKey: String, entry: JSONObject, updatedAt: Long) {
+      db.delete("media_cache", "entry_key = ?", arrayOf(entryKey))
+      val items = collectMediaItems(entry)
+      for (index in 0 until items.length()) {
+        val item = items.optJSONObject(index) ?: continue
+        val objectHash = item.optString("objectHash")
+        val localPath = item.optString("savedPath").ifBlank { item.optString("filePath") }
+        val cacheKey = "$entryKey:$index:${objectHash.ifBlank { sha256("${item.optString("fileName")}|$localPath|${item.optString("thumbnailDataUrl")}") }}"
+        val values = ContentValues().apply {
+          put("cache_key", cacheKey)
+          put("entry_key", entryKey)
+          put("item_index", index)
+          put("kind", item.optString("kind", entry.optString("kind", "media")))
+          put("file_name", item.optString("fileName").ifBlank { entry.optString("fileName") })
+          put("mime_type", item.optString("mimeType").ifBlank { entry.optString("mimeType") })
+          put("object_hash", objectHash)
+          put("object_path", item.optString("objectPath"))
+          put("local_path", localPath)
+          put("thumbnail_path", item.optString("thumbnailPath"))
+          put("thumbnail_data_url", item.optString("thumbnailDataUrl"))
+          put("size_bytes", item.optLong("sizeBytes", 0L))
+          put("status", item.optString("status", entry.optString("status")))
+          put("missing_reason", item.optString("missingReason"))
+          put("updated_at", updatedAt)
+        }
+        db.insertWithOnConflict("media_cache", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+      }
+    }
+
+    private fun collectMediaItems(entry: JSONObject): JSONArray {
+      entry.optJSONArray("items")?.let { return it }
+      entry.optJSONArray("media")?.let { return it }
+      val kind = entry.optString("kind")
+      if (kind !in setOf("image", "video", "media", "file")) {
+        return JSONArray()
+      }
+      return JSONArray().put(JSONObject().apply {
+        put("kind", kind)
+        put("fileName", entry.optString("fileName"))
+        put("mimeType", entry.optString("mimeType"))
+        put("savedPath", entry.optString("savedPath"))
+        put("filePath", entry.optString("filePath"))
+        put("thumbnailDataUrl", entry.optString("thumbnailDataUrl"))
+      })
+    }
+
+    private fun deriveEntryKey(entry: JSONObject): String {
+      val vaultId = entry.optString("vaultEntryId").ifBlank {
+        val id = entry.optString("id")
+        if (id.length >= 32 && id.all { it.isLetterOrDigit() }) id else ""
+      }
+      if (vaultId.isNotBlank()) {
+        return "vault:$vaultId"
+      }
+      val id = entry.optString("id")
+      if (id.isNotBlank()) {
+        return "local:$id"
+      }
+      val source = "${entry.optString("timestamp")}|${entry.optString("text")}|${entry.optString("target")}|${entry.optString("targetServerId")}"
+      return "derived:${sha256(source)}"
+    }
+
+    private fun sha256(value: String): String {
+      val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+      return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    private fun directorySize(file: File): Long {
+      if (!file.exists()) {
+        return 0L
+      }
+      if (file.isFile) {
+        return file.length()
+      }
+      return file.listFiles()?.sumOf { directorySize(it) } ?: 0L
+    }
+  }
+
   private var appWebView: WebView? = null
+  private val historyStore: HistoryDatabaseHelper by lazy { HistoryDatabaseHelper(applicationContext) }
   private var pendingExportFilename: String? = null
   private var pendingExportData: String? = null
   private var pendingSharedContents: MutableList<PendingSharedContent> = mutableListOf()
@@ -200,7 +486,8 @@ class MainActivity : TauriActivity() {
     webView.addJavascriptInterface(DeviceBridge(), "NativeDevice")
     webView.addJavascriptInterface(BackgroundClipboardBridge(this), "NativeBackgroundClipboard")
     webView.addJavascriptInterface(MediaLibraryBridge(this), "NativeMediaLibrary")
-    webView.addJavascriptInterface(HomeVaultBridge(), "NativeHomeVault")
+    webView.addJavascriptInterface(HistoryBridge(historyStore), "NativeHistory")
+    webView.addJavascriptInterface(HomeVaultBridge(historyStore), "NativeHomeVault")
     Log.d(TAG, "JS Bridge NativeClipboard 已注入")
     Log.d(TAG, "Tauri init scripts: ${(webView as? RustWebView)?.initScripts?.size ?: 0}")
     webView.post { installPreviewAssetLoaderIfNeeded(webView) }
@@ -807,7 +1094,90 @@ class MainActivity : TauriActivity() {
     }
   }
 
-  inner class HomeVaultBridge {
+  private inner class HistoryBridge(private val store: HistoryDatabaseHelper) {
+    @JavascriptInterface
+    fun loadHistory(): String {
+      return try {
+        store.loadHistory()
+      } catch (e: Exception) {
+        Log.e(TAG, "读取 SQLite 历史失败", e)
+        "[]"
+      }
+    }
+
+    // 异步版：同步 loadHistory 会让 WebView 的 JS 线程原地等待整库读取，
+    // 冷启动时表现为首页卡住无法输入。这里放到后台线程读，完成后回调 JS。
+    @JavascriptInterface
+    fun loadHistoryAsync(requestId: String) {
+      Thread {
+        val payload = try {
+          store.loadHistory()
+        } catch (e: Exception) {
+          Log.e(TAG, "异步读取 SQLite 历史失败", e)
+          "[]"
+        }
+        val script = "window.__vibedropNativeHistoryLoaded && window.__vibedropNativeHistoryLoaded(" +
+          JSONObject.quote(requestId) + "," + JSONObject.quote(payload) + ")"
+        runOnUiThread {
+          appWebView?.evaluateJavascript(script, null)
+        }
+      }.start()
+    }
+
+    @JavascriptInterface
+    fun replaceHistory(historyJson: String): String {
+      return try {
+        store.replaceHistory(historyJson).toString()
+      } catch (e: Exception) {
+        Log.e(TAG, "替换 SQLite 历史失败", e)
+        JSONObject().apply {
+          put("ok", false)
+          put("error", e.message ?: "保存失败")
+        }.toString()
+      }
+    }
+
+    @JavascriptInterface
+    fun upsertHistoryEntry(entryJson: String): String {
+      return try {
+        store.upsertHistoryEntry(entryJson).toString()
+      } catch (e: Exception) {
+        Log.e(TAG, "写入 SQLite 历史失败", e)
+        JSONObject().apply {
+          put("ok", false)
+          put("error", e.message ?: "写入失败")
+        }.toString()
+      }
+    }
+
+    @JavascriptInterface
+    fun deleteHistory(): String {
+      return try {
+        store.clearHistory().toString()
+      } catch (e: Exception) {
+        Log.e(TAG, "清空 SQLite 历史失败", e)
+        JSONObject().apply {
+          put("ok", false)
+          put("error", e.message ?: "清空失败")
+        }.toString()
+      }
+    }
+
+    @JavascriptInterface
+    fun stats(): String {
+      return try {
+        store.stats().toString()
+      } catch (e: Exception) {
+        Log.e(TAG, "读取 SQLite 历史统计失败", e)
+        JSONObject().apply {
+          put("ok", false)
+          put("error", e.message ?: "读取统计失败")
+        }.toString()
+      }
+    }
+  }
+
+  private inner class HomeVaultBridge(private val store: HistoryDatabaseHelper) {
     @JavascriptInterface
     fun syncHistory(endpoint: String, data: String) {
       Thread {
@@ -866,6 +1236,11 @@ class MainActivity : TauriActivity() {
           val targetUrl = buildHomeVaultRestoreUrl(endpoint, deviceId, mode)
           val url = URL(targetUrl)
           val wifiNetwork = if (isLocalHomeVaultTarget(url)) findWifiNetwork() else null
+          emitRestoreProgress(
+            phase = "requesting",
+            message = "正在连接 Home Vault...",
+            percent = 0
+          )
           val response = executeHomeVaultRequest(
             wifiNetwork,
             createConnection = { network ->
@@ -885,11 +1260,22 @@ class MainActivity : TauriActivity() {
 
           result.put("ok", response.statusCode in 200..299)
           result.put("status", response.statusCode)
-          result.put("body", response.body)
           result.put("url", targetUrl)
           result.put("network", response.network)
           if (response.statusCode !in 200..299) {
             result.put("error", extractErrorMessage(response.body) ?: "HTTP ${response.statusCode}")
+          } else if (mode == "full-media") {
+            emitRestoreProgress(
+              phase = "manifest",
+              message = "已收到恢复清单，正在解析...",
+              percent = 3
+            )
+            val restored = restoreFullMediaPayload(url, wifiNetwork, response.body)
+            restored.keys().forEach { key ->
+              result.put(key, restored.get(key))
+            }
+          } else {
+            result.put("body", response.body)
           }
         } catch (e: Exception) {
           Log.e(TAG, "从 Home Vault 恢复失败", e)
@@ -899,6 +1285,378 @@ class MainActivity : TauriActivity() {
           emitBridgeEvent("native-home-vault-restore-result", result)
         }
       }.start()
+    }
+
+    private fun emitRestoreProgress(
+      phase: String,
+      message: String,
+      percent: Int,
+      totalEntries: Int = 0,
+      processedEntries: Int = 0,
+      totalMedia: Int = 0,
+      downloadedMedia: Int = 0,
+      skippedMedia: Int = 0,
+      failedMedia: Int = 0,
+      downloadedBytes: Long = 0L,
+      existingEntries: Int = 0,
+      newEntries: Int = 0,
+      currentFileName: String = "",
+      currentFileBytes: Long = 0L,
+      currentFileTotalBytes: Long = 0L
+    ) {
+      emitBridgeEvent(
+        "native-home-vault-restore-progress",
+        JSONObject().apply {
+          put("phase", phase)
+          put("message", message)
+          put("percent", percent.coerceIn(0, 100))
+          put("totalEntries", totalEntries)
+          put("processedEntries", processedEntries)
+          put("totalMedia", totalMedia)
+          put("downloadedMedia", downloadedMedia)
+          put("skippedMedia", skippedMedia)
+          put("failedMedia", failedMedia)
+          put("downloadedBytes", downloadedBytes)
+          put("existingEntries", existingEntries)
+          put("newEntries", newEntries)
+          put("currentFileName", currentFileName)
+          put("currentFileBytes", currentFileBytes)
+          put("currentFileTotalBytes", currentFileTotalBytes)
+        }
+      )
+    }
+
+    private fun restoreFullMediaPayload(requestUrl: URL, wifiNetwork: Network?, body: String): JSONObject {
+      val payload = JSONObject(body)
+      val sourceHistory = payload.optJSONArray("history") ?: JSONArray()
+      val restoredEntries = JSONArray()
+      val totalEntries = sourceHistory.length()
+      var totalMediaReferences = 0
+      var mediaReferenceCount = 0
+      var downloadedMediaCount = 0
+      var skippedMediaCount = 0
+      var failedMediaCount = 0
+      var thumbnailCachedCount = 0
+      var downloadedBytes = 0L
+      val baseUrl = buildBaseUrl(requestUrl)
+
+      for (entryIndex in 0 until totalEntries) {
+        val sourceEntry = sourceHistory.optJSONObject(entryIndex) ?: continue
+        totalMediaReferences += sourceEntry.optJSONArray("items")?.length() ?: 0
+      }
+
+      emitRestoreProgress(
+        phase = "processing",
+        message = "正在处理历史与媒体缓存...",
+        percent = 5,
+        totalEntries = totalEntries,
+        totalMedia = totalMediaReferences
+      )
+
+      for (entryIndex in 0 until totalEntries) {
+        val sourceEntry = sourceHistory.optJSONObject(entryIndex) ?: continue
+        val entry = JSONObject(sourceEntry.toString())
+        val items = sourceEntry.optJSONArray("items") ?: JSONArray()
+        val restoredItems = JSONArray()
+        val vaultEntryId = sourceEntry.optString("vaultEntryId").ifBlank { sourceEntry.optString("id") }
+        if (vaultEntryId.isNotBlank()) {
+          entry.put("vaultEntryId", vaultEntryId)
+        }
+
+        for (itemIndex in 0 until items.length()) {
+          val sourceItem = items.optJSONObject(itemIndex) ?: continue
+          val item = JSONObject(sourceItem.toString())
+          mediaReferenceCount += 1
+
+          val downloadUrl = item.optString("downloadUrl")
+          val objectPath = item.optString("objectPath")
+          val objectHash = item.optString("objectHash")
+          if (downloadUrl.isNotBlank() || objectPath.isNotBlank()) {
+            try {
+              val fileName = item.optString("fileName").ifBlank { objectHash.ifBlank { objectPath } }
+              emitRestoreProgress(
+                phase = "processing",
+                message = "正在恢复媒体：$fileName",
+                percent = progressPercent(entryIndex, totalEntries),
+                totalEntries = totalEntries,
+                processedEntries = entryIndex,
+                totalMedia = totalMediaReferences,
+                downloadedMedia = downloadedMediaCount,
+                skippedMedia = skippedMediaCount,
+                failedMedia = failedMediaCount,
+                downloadedBytes = downloadedBytes,
+                currentFileName = fileName
+              )
+              val cached = downloadVaultObject(baseUrl, wifiNetwork, item) { currentBytes, totalBytes ->
+                emitRestoreProgress(
+                  phase = "processing",
+                  message = "正在下载媒体：$fileName",
+                  percent = progressPercent(entryIndex, totalEntries),
+                  totalEntries = totalEntries,
+                  processedEntries = entryIndex,
+                  totalMedia = totalMediaReferences,
+                  downloadedMedia = downloadedMediaCount,
+                  skippedMedia = skippedMediaCount,
+                  failedMedia = failedMediaCount,
+                  downloadedBytes = downloadedBytes + currentBytes,
+                  currentFileName = fileName,
+                  currentFileBytes = currentBytes,
+                  currentFileTotalBytes = totalBytes
+                )
+              }
+              item.put("savedPath", cached.file.absolutePath)
+              item.put("filePath", cached.file.absolutePath)
+              item.put("sizeBytes", cached.bytes)
+              if (cached.skipped) {
+                skippedMediaCount += 1
+              } else {
+                downloadedMediaCount += 1
+                downloadedBytes += cached.bytes
+              }
+            } catch (e: Exception) {
+              Log.w(TAG, "恢复 Vault 媒体对象失败: ${objectHash.ifBlank { objectPath }}", e)
+              item.put("missingReason", e.message ?: "download-failed")
+              failedMediaCount += 1
+            }
+          }
+
+          val thumbnailDataUrl = item.optString("thumbnailDataUrl")
+          if (thumbnailDataUrl.startsWith("data:")) {
+            runCatching {
+              val thumb = cacheThumbnailDataUrl(thumbnailDataUrl, vaultEntryId.ifBlank { entryIndex.toString() }, itemIndex)
+              if (thumb.isNotBlank()) {
+                item.put("thumbnailPath", thumb)
+                thumbnailCachedCount += 1
+              }
+            }.onFailure {
+              Log.w(TAG, "缓存 Vault 缩略图失败", it)
+            }
+          }
+
+          restoredItems.put(item)
+        }
+
+        if (restoredItems.length() > 0) {
+          entry.put("items", restoredItems)
+        }
+        restoredEntries.put(entry)
+
+        if (entryIndex == totalEntries - 1 || entryIndex % 25 == 0) {
+          emitRestoreProgress(
+            phase = "processing",
+            message = "正在处理历史 ${entryIndex + 1}/$totalEntries...",
+            percent = progressPercent(entryIndex + 1, totalEntries),
+            totalEntries = totalEntries,
+            processedEntries = entryIndex + 1,
+            totalMedia = totalMediaReferences,
+            downloadedMedia = downloadedMediaCount,
+            skippedMedia = skippedMediaCount,
+            failedMedia = failedMediaCount,
+            downloadedBytes = downloadedBytes
+          )
+        }
+      }
+
+      val existingEntryCount = store.countExistingEntries(restoredEntries)
+      val newEntryCount = (restoredEntries.length() - existingEntryCount).coerceAtLeast(0)
+
+      emitRestoreProgress(
+        phase = "writing",
+        message = "正在写入手机 SQLite...",
+        percent = 95,
+        totalEntries = totalEntries,
+        processedEntries = totalEntries,
+        totalMedia = totalMediaReferences,
+        downloadedMedia = downloadedMediaCount,
+        skippedMedia = skippedMediaCount,
+        failedMedia = failedMediaCount,
+        downloadedBytes = downloadedBytes,
+        existingEntries = existingEntryCount,
+        newEntries = newEntryCount
+      )
+      val storeResult = store.upsertHistoryArray(restoredEntries.toString())
+      emitRestoreProgress(
+        phase = "done",
+        message = "恢复完成",
+        percent = 100,
+        totalEntries = totalEntries,
+        processedEntries = totalEntries,
+        totalMedia = totalMediaReferences,
+        downloadedMedia = downloadedMediaCount,
+        skippedMedia = skippedMediaCount,
+        failedMedia = failedMediaCount,
+        downloadedBytes = downloadedBytes,
+        existingEntries = existingEntryCount,
+        newEntries = newEntryCount
+      )
+      return JSONObject().apply {
+        put("ok", true)
+        put("mode", "full-media")
+        put("historyCount", payload.optInt("historyCount", totalEntries))
+        put("returnedCount", totalEntries)
+        put("restoredCount", storeResult.optInt("count", restoredEntries.length()))
+        put("existingEntryCount", existingEntryCount)
+        put("newEntryCount", newEntryCount)
+        put("mediaReferenceCount", mediaReferenceCount)
+        put("downloadedMediaCount", downloadedMediaCount)
+        put("skippedMediaCount", skippedMediaCount)
+        put("failedMediaCount", failedMediaCount)
+        put("thumbnailCachedCount", thumbnailCachedCount)
+        put("downloadedBytes", downloadedBytes)
+      }
+    }
+
+    private fun progressPercent(processedEntries: Int, totalEntries: Int): Int {
+      if (totalEntries <= 0) {
+        return 5
+      }
+      return (5 + (processedEntries.coerceIn(0, totalEntries) * 90 / totalEntries)).coerceIn(5, 95)
+    }
+
+    private fun buildBaseUrl(url: URL): URL {
+      val port = if (url.port > 0) ":${url.port}" else ""
+      return URL("${url.protocol}://${url.host}$port/")
+    }
+
+    private fun downloadVaultObject(
+      baseUrl: URL,
+      wifiNetwork: Network?,
+      item: JSONObject,
+      onProgress: (Long, Long) -> Unit
+    ): CachedVaultObject {
+      val downloadUrl = item.optString("downloadUrl").ifBlank {
+        val objectPath = item.optString("objectPath")
+        if (objectPath.isNotBlank()) "/$objectPath" else ""
+      }
+      if (downloadUrl.isBlank()) {
+        throw IllegalStateException("missing-download-url")
+      }
+
+      val objectHash = item.optString("objectHash").ifBlank { sha256(downloadUrl) }
+      val ext = resolveVaultObjectExtension(item)
+      val bucket = objectHash.take(2).ifBlank { "xx" }
+      val dest = File(File(store.mediaCacheRoot(), "objects/$bucket").apply { mkdirs() }, "$objectHash$ext")
+      if (dest.exists() && dest.length() > 0) {
+        return CachedVaultObject(dest, dest.length(), skipped = true)
+      }
+
+      val url = URL(baseUrl, downloadUrl.removePrefix("/"))
+      var connection: HttpURLConnection? = null
+      try {
+        connection = openHomeVaultConnection(url, wifiNetwork) as HttpURLConnection
+        val bytes = downloadConnectionToFile(connection, dest, onProgress)
+        return CachedVaultObject(dest, bytes, skipped = false)
+      } catch (e: SocketException) {
+        if (wifiNetwork == null || !isVpnBypassDenied(e)) {
+          dest.delete()
+          throw e
+        }
+        Log.w(TAG, "Vault 对象下载 Wi-Fi 绑定失败，降级默认网络重试", e)
+        connection?.disconnect()
+        connection = openHomeVaultConnection(url, null) as HttpURLConnection
+        val bytes = downloadConnectionToFile(connection, dest, onProgress)
+        return CachedVaultObject(dest, bytes, skipped = false)
+      } catch (e: Exception) {
+        dest.delete()
+        throw e
+      } finally {
+        connection?.disconnect()
+      }
+    }
+
+    private fun downloadConnectionToFile(
+      connection: HttpURLConnection,
+      dest: File,
+      onProgress: (Long, Long) -> Unit
+    ): Long {
+      connection.requestMethod = "GET"
+      connection.connectTimeout = 10_000
+      connection.readTimeout = 180_000
+      connection.setRequestProperty("Accept", "*/*")
+      val statusCode = connection.responseCode
+      if (statusCode !in 200..299) {
+        throw IllegalStateException("HTTP $statusCode")
+      }
+      var total = 0L
+      var lastEmitBytes = 0L
+      var lastEmitMs = 0L
+      val expectedBytes = connection.contentLengthLong.takeIf { it > 0 } ?: 0L
+      connection.inputStream.use { input ->
+        dest.outputStream().use { output ->
+          val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+          while (true) {
+            val read = input.read(buffer)
+            if (read <= 0) {
+              break
+            }
+            output.write(buffer, 0, read)
+            total += read
+            val now = System.currentTimeMillis()
+            if (total - lastEmitBytes >= 512L * 1024L || now - lastEmitMs >= 800L) {
+              onProgress(total, expectedBytes)
+              lastEmitBytes = total
+              lastEmitMs = now
+            }
+          }
+        }
+      }
+      onProgress(total, expectedBytes)
+      return total
+    }
+
+    private fun cacheThumbnailDataUrl(dataUrl: String, entryKey: String, itemIndex: Int): String {
+      val comma = dataUrl.indexOf(',')
+      if (comma < 0) {
+        return ""
+      }
+      val header = dataUrl.substring(0, comma)
+      if (!header.contains(";base64", ignoreCase = true)) {
+        return ""
+      }
+      val mimeType = header.removePrefix("data:").substringBefore(';')
+      val ext = extensionForMimeType(mimeType)
+      val safeEntry = safeSegment(entryKey)
+      val dest = File(File(store.mediaCacheRoot(), "thumbs/$safeEntry").apply { mkdirs() }, "$itemIndex$ext")
+      if (!dest.exists() || dest.length() == 0L) {
+        val bytes = Base64.decode(dataUrl.substring(comma + 1), Base64.DEFAULT)
+        dest.writeBytes(bytes)
+      }
+      return dest.absolutePath
+    }
+
+    private fun resolveVaultObjectExtension(item: JSONObject): String {
+      val objectPathExt = File(item.optString("objectPath")).extension
+      if (objectPathExt.isNotBlank()) {
+        return ".${objectPathExt.lowercase()}"
+      }
+      val fileExt = File(item.optString("fileName")).extension
+      if (fileExt.isNotBlank()) {
+        return ".${fileExt.lowercase()}"
+      }
+      return extensionForMimeType(item.optString("mimeType"))
+    }
+
+    private fun extensionForMimeType(mimeType: String): String {
+      return when (mimeType.lowercase()) {
+        "image/jpeg", "image/jpg" -> ".jpg"
+        "image/png" -> ".png"
+        "image/webp" -> ".webp"
+        "image/gif" -> ".gif"
+        "video/mp4" -> ".mp4"
+        "video/quicktime" -> ".mov"
+        "application/pdf" -> ".pdf"
+        else -> ".bin"
+      }
+    }
+
+    private fun safeSegment(value: String): String {
+      val cleaned = value.replace(Regex("""[^A-Za-z0-9._-]"""), "_").trim('.', '_', '-')
+      return cleaned.take(80).ifBlank { "entry" }
+    }
+
+    private fun sha256(value: String): String {
+      val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+      return digest.joinToString("") { "%02x".format(it) }
     }
 
     private fun executeHomeVaultRequest(

@@ -25,7 +25,7 @@
         </header>
 
         <!-- 设置页面 -->
-        <section id="settings-view" class="view">
+        <section id="settings-view" class="view hidden">
             <div class="settings-header">
                 <button id="settings-back-btn" class="icon-btn back-btn" title="返回">返回</button>
                 <div class="settings-title-group">
@@ -119,21 +119,23 @@
                         <button id="sync-home-vault-btn" class="primary-btn" type="button">同步到 Mac mini</button>
                         <button id="restore-home-vault-btn" class="secondary-btn" type="button">从 Mac mini 恢复</button>
                     </div>
+                    <div id="home-vault-restore-progress" class="home-vault-progress hidden" aria-hidden="true">
+                        <div class="home-vault-progress-head">
+                            <span id="home-vault-restore-progress-label">准备恢复</span>
+                            <span id="home-vault-restore-progress-percent">0%</span>
+                        </div>
+                        <div class="home-vault-progress-track">
+                            <div id="home-vault-restore-progress-bar" class="home-vault-progress-bar"></div>
+                        </div>
+                        <div id="home-vault-restore-progress-detail" class="home-vault-progress-detail">等待开始</div>
+                    </div>
                     <div id="home-vault-sync-status" class="home-vault-sync-status">未同步</div>
                 </div>
-                <div class="history-actions">
-                    <button id="import-history-btn" class="secondary-btn">导入历史</button>
-                    <button id="export-history-btn" class="secondary-btn">导出历史</button>
-                    <button id="share-history-btn" class="secondary-btn">分享历史</button>
-                    <button id="clear-history-btn" class="danger-btn">清空历史</button>
-                </div>
-                <input type="file" id="import-file-input" accept=".json" style="display:none">
-                <div id="import-result" class="test-result" style="display:none"></div>
             </div>
         </section>
 
         <!-- 发送页面 -->
-        <section id="send-view" class="view hidden">
+        <section id="send-view" class="view">
             <div id="share-inbox" class="share-inbox hidden">
                 <div class="share-inbox-header">
                     <div class="share-inbox-kicker">来自系统分享</div>
