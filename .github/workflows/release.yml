@@ -1,0 +1,190 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: python3 -m pip install --upgrade pip pillow
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;29.0.14206865"
+
+      - name: Export Android environment
+        run: |
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mobile/src-tauri -> target
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Generate app icons
+        run: ./scripts/generate-app-icons.py
+
+      - name: Build Android release APK
+        working-directory: mobile
+        run: cargo tauri android build --target aarch64
+
+      - name: Sign APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::缺少 ANDROID_KEYSTORE_BASE64 secret，请在仓库 Settings → Secrets and variables → Actions 里添加"
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          UNSIGNED="mobile/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
+          "$APKSIGNER" sign \
+            --ks /tmp/release.keystore \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --out "VibeDrop-${GITHUB_REF_NAME}-android.apk" \
+            "$UNSIGNED"
+          rm -f /tmp/release.keystore
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: VibeDrop-*-android.apk
+          if-no-files-found: error
+
+  macos:
+    name: Build macOS app
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: python3 -m pip install --upgrade pip pillow
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Generate app icons
+        run: ./scripts/generate-app-icons.py
+
+      - name: Build desktop bundle
+        working-directory: desktop
+        run: cargo tauri build
+
+      - name: Collect artifacts
+        run: |
+          DMG=$(ls desktop/src-tauri/target/release/bundle/dmg/*.dmg 2>/dev/null | head -n 1 || true)
+          if [ -n "$DMG" ]; then
+            cp "$DMG" "VibeDrop-${GITHUB_REF_NAME}-macos.dmg"
+          else
+            # DMG 打包在无头环境偶发失败时，退回压缩 .app
+            APP=$(ls -d desktop/src-tauri/target/release/bundle/macos/*.app | head -n 1)
+            ditto -c -k --keepParent "$APP" "VibeDrop-${GITHUB_REF_NAME}-macos.app.zip"
+          fi
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: |
+            VibeDrop-*-macos.dmg
+            VibeDrop-*-macos.app.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [android, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## 安装说明
+
+            ### Android
+            下载 `VibeDrop-*-android.apk` 直接安装。与之前版本同签名，可覆盖升级，无需卸载。
+
+            ### macOS
+            下载 `VibeDrop-*-macos.dmg`，打开后把 VibeDrop 拖进「应用程序」。
+            首次打开如提示"无法验证开发者"：右键点击 App → 打开；或在终端执行
+            `xattr -dr com.apple.quarantine /Applications/VibeDrop.app`
+            文字输入功能需要在「系统设置 → 隐私与安全性 → 辅助功能」里授权 VibeDrop。
+          files: |
+            VibeDrop-*-android.apk
+            VibeDrop-*-macos.dmg
+            VibeDrop-*-macos.app.zip
