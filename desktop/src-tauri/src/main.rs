@@ -166,6 +166,8 @@ enum InputAction {
     TypeText(String),
     TypeTextAndEnter(String),
     PressEnter,
+    // 外出模式：文字只写入剪贴板（配合 UU 远程等工具的剪贴板同步转发），不模拟键盘输入
+    ClipboardText(String),
 }
 
 struct InputRequest {
@@ -1740,6 +1742,13 @@ fn main() {
                     InputAction::PressEnter => enigo
                         .key(Key::Return, Direction::Click)
                         .map_err(|e| format!("{:?}", e)),
+                    InputAction::ClipboardText(text) => {
+                        // 写入的内容会被剪贴板监听线程看到，先登记抑制避免回声广播给手机
+                        suppress_clipboard_broadcast(&suppress, &text);
+                        arboard::Clipboard::new()
+                            .and_then(|mut clipboard| clipboard.set_text(text))
+                            .map_err(|e| format!("无法写入剪贴板: {}", e))
+                    }
                 };
                 let _ = req.reply.send(reply);
             }
@@ -2508,6 +2517,78 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                             }
                                             Ok(Err(e)) => {
                                                 error!("键盘模拟失败: {}", e);
+                                                let reply = ServerMessage {
+                                                    status: "error".to_string(),
+                                                    hostname: None,
+                                                    error: Some(e),
+                                                };
+                                                let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                            }
+                                            Err(_) => {
+                                                error!("键盘输入线程无响应");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 外出模式：文字写入本机剪贴板（不模拟键盘）。
+                            // 典型链路：手机 → 本机剪贴板 → UU 远程等远控工具的剪贴板同步 → 被控电脑。
+                            "clipboard_text" => {
+                                if !authenticated {
+                                    let reply = ServerMessage {
+                                        status: "error".to_string(),
+                                        hostname: None,
+                                        error: Some("未认证".to_string()),
+                                    };
+                                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                    continue;
+                                }
+
+                                if let Some(text_content) = &client_msg.text {
+                                    info!("收到文字进剪贴板: {}", text_content);
+                                    let history_entry = HistoryEntry::text_entry(
+                                        text_content,
+                                        "ws-client",
+                                        if current_client_id.is_empty() {
+                                            None
+                                        } else {
+                                            Some(current_client_id.clone())
+                                        },
+                                        if current_client_name.is_empty() {
+                                            None
+                                        } else {
+                                            Some(current_client_name.clone())
+                                        },
+                                    );
+                                    append_history_entry(&history_entry);
+
+                                    let (reply_tx, reply_rx) = oneshot::channel();
+                                    let req = InputRequest {
+                                        action: InputAction::ClipboardText(text_content.clone()),
+                                        reply: reply_tx,
+                                    };
+
+                                    if state.input_tx.send(req).await.is_ok() {
+                                        match reply_rx.await {
+                                            Ok(Ok(())) => {
+                                                info!("文字已写入剪贴板");
+
+                                                if let Ok(guard) = state.app_handle.lock() {
+                                                    if let Some(handle) = guard.as_ref() {
+                                                        let _ = handle.emit("text-received", &history_entry);
+                                                    }
+                                                }
+
+                                                let reply = ServerMessage {
+                                                    status: "ok".to_string(),
+                                                    hostname: None,
+                                                    error: None,
+                                                };
+                                                let _ = ws_sender.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await;
+                                            }
+                                            Ok(Err(e)) => {
+                                                error!("写入剪贴板失败: {}", e);
                                                 let reply = ServerMessage {
                                                     status: "error".to_string(),
                                                     hostname: None,

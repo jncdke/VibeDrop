@@ -297,6 +297,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     initNavigation();
     initSettingsButton();
+    initOutingModeSetting();
     initMediaOpenerSettings();
     initNearbyDesktopDiscovery();
     initConnectionDiagnostics();
@@ -700,6 +701,41 @@ function saveStoredSettingsObject(settings) {
     storedDevicesCache.key = null;
     hydratedHistoryCache.devicesKey = null;
     hydratedHistoryCache.value = [];
+}
+
+// ---- 外出模式：发送按钮改为写入 Mac 剪贴板（配合 UU 远程等工具的剪贴板同步）----
+
+function isOutingMode() {
+    return getStoredSettingsObject().outingMode === true;
+}
+
+function setOutingMode(enabled) {
+    saveStoredSettingsObject({ ...getStoredSettingsObject(), outingMode: enabled === true });
+    refreshSendCardModeUI();
+}
+
+function refreshSendCardModeUI() {
+    const outing = isOutingMode();
+    document.querySelectorAll('[id^="sendbtn-"]').forEach(btn => {
+        if (!btn.classList.contains('sending')) {
+            btn.textContent = outing ? '同步剪贴板' : '发送';
+        }
+    });
+    document.querySelectorAll('[id^="sendenterbtn-"]').forEach(btn => {
+        btn.style.display = outing ? 'none' : '';
+    });
+}
+
+function initOutingModeSetting() {
+    const toggle = $('outing-mode-toggle');
+    if (!toggle) {
+        return;
+    }
+    toggle.checked = isOutingMode();
+    toggle.addEventListener('change', () => {
+        setOutingMode(toggle.checked);
+        showToast(toggle.checked ? '外出模式已开启：发送将写入 Mac 剪贴板' : '外出模式已关闭：恢复键盘输入');
+    });
 }
 
 function normalizeMediaOpenerPreference(pref) {
@@ -3256,6 +3292,11 @@ function createSendCard(dev) {
     const input = card.querySelector('textarea');
     input.value = getSendDraft(dev.id);
     bindSendComposerEvents(input, dev.id);
+
+    if (isOutingMode()) {
+        sendBtn.textContent = '同步剪贴板';
+        sendEnterBtn.style.display = 'none';
+    }
 
     sendBtn.addEventListener('click', () => sendText(dev.id));
     enterBtn.addEventListener('click', () => sendEnter(dev.id));
@@ -6028,11 +6069,12 @@ async function sendText(deviceId) {
     };
     addHistory(historyEntry);
 
+    const outing = isOutingMode();
     await sendDeviceAction(deviceId, {
-        action: 'type',
+        action: outing ? 'clipboard_text' : 'type',
         payload: { text },
         buttonId: `sendbtn-${deviceId}`,
-        pendingText: '发送中...',
+        pendingText: outing ? '同步中...' : '发送中...',
         clearInput: true,
         historyEntry,
         failureToast: true,
@@ -6048,6 +6090,12 @@ async function sendEnter(deviceId) {
 }
 
 async function sendTextAndEnter(deviceId) {
+    if (isOutingMode()) {
+        // 外出模式下没有"回车"语义（回车要在被控电脑上手动按），统一走剪贴板同步
+        await sendText(deviceId);
+        return;
+    }
+
     const input = $(`input-${deviceId}`);
 
     debugLog('sendTextAndEnter:start', { deviceId });
