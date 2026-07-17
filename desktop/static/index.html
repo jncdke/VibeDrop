@@ -34,6 +34,19 @@
                 </div>
             </div>
 
+            <section class="settings-card outing-mode-card">
+                <div class="outing-mode-row">
+                    <div class="outing-mode-copy">
+                        <h3>外出模式</h3>
+                        <p class="hint">开启后，首页只保留"同步剪贴板"按钮：文字写入 Mac 剪贴板（不模拟键盘输入），由 UU 远程等远控工具自动同步到被控电脑。</p>
+                    </div>
+                    <label class="outing-mode-switch">
+                        <input type="checkbox" id="outing-mode-toggle">
+                        <span class="outing-mode-slider"></span>
+                    </label>
+                </div>
+            </section>
+
             <section class="settings-card nearby-desktops-card">
                 <div class="nearby-desktops-header">
                     <div>
@@ -62,19 +75,6 @@
                     <div id="connection-diagnostics-sections" class="diagnostics-sections"></div>
                 </div>
             </details>
-
-            <section class="settings-card outing-mode-card">
-                <div class="outing-mode-row">
-                    <div class="outing-mode-copy">
-                        <h3>外出模式</h3>
-                        <p class="hint">开启后，首页的发送按钮改为把文字写入 Mac 剪贴板（不再模拟键盘输入）。适合出门在外时：手机 → MacBook 剪贴板 → UU 远程等远控工具自动同步 → 家里电脑粘贴。</p>
-                    </div>
-                    <label class="outing-mode-switch">
-                        <input type="checkbox" id="outing-mode-toggle">
-                        <span class="outing-mode-slider"></span>
-                    </label>
-                </div>
-            </section>
 
             <details id="advanced-connect-panel" class="settings-card advanced-connect-panel">
                 <summary class="advanced-connect-summary">

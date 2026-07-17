@@ -714,16 +714,20 @@ function setOutingMode(enabled) {
     refreshSendCardModeUI();
 }
 
-function refreshSendCardModeUI() {
+function applySendCardMode(card) {
     const outing = isOutingMode();
-    document.querySelectorAll('[id^="sendbtn-"]').forEach(btn => {
-        if (!btn.classList.contains('sending')) {
-            btn.textContent = outing ? '同步剪贴板' : '发送';
-        }
+    // 外出模式：隐藏 发送/回车 和 传图/传收件箱 两排白底按钮，只留蓝色大按钮
+    card.querySelectorAll('.send-actions').forEach(row => {
+        row.style.display = outing ? 'none' : '';
     });
-    document.querySelectorAll('[id^="sendenterbtn-"]').forEach(btn => {
-        btn.style.display = outing ? 'none' : '';
-    });
+    const comboBtn = card.querySelector('.combo-btn');
+    if (comboBtn && !comboBtn.classList.contains('sending')) {
+        comboBtn.textContent = outing ? '同步剪贴板' : '发送并回车';
+    }
+}
+
+function refreshSendCardModeUI() {
+    document.querySelectorAll('#send-cards .mac-card').forEach(applySendCardMode);
 }
 
 function initOutingModeSetting() {
@@ -3293,10 +3297,7 @@ function createSendCard(dev) {
     input.value = getSendDraft(dev.id);
     bindSendComposerEvents(input, dev.id);
 
-    if (isOutingMode()) {
-        sendBtn.textContent = '同步剪贴板';
-        sendEnterBtn.style.display = 'none';
-    }
+    applySendCardMode(card);
 
     sendBtn.addEventListener('click', () => sendText(dev.id));
     enterBtn.addEventListener('click', () => sendEnter(dev.id));
@@ -6041,7 +6042,7 @@ async function sendDeviceAction(deviceId, {
 
 }
 
-async function sendText(deviceId) {
+async function sendText(deviceId, buttonIdOverride = null) {
     debugLog('sendText:start', { deviceId });
     const text = await resolveTextToSend(deviceId);
     if (!text) {
@@ -6073,7 +6074,7 @@ async function sendText(deviceId) {
     await sendDeviceAction(deviceId, {
         action: outing ? 'clipboard_text' : 'type',
         payload: { text },
-        buttonId: `sendbtn-${deviceId}`,
+        buttonId: buttonIdOverride || `sendbtn-${deviceId}`,
         pendingText: outing ? '同步中...' : '发送中...',
         clearInput: true,
         historyEntry,
@@ -6091,8 +6092,9 @@ async function sendEnter(deviceId) {
 
 async function sendTextAndEnter(deviceId) {
     if (isOutingMode()) {
-        // 外出模式下没有"回车"语义（回车要在被控电脑上手动按），统一走剪贴板同步
-        await sendText(deviceId);
+        // 外出模式下没有"回车"语义（回车要在被控电脑上手动按），统一走剪贴板同步。
+        // 按钮状态动画落在蓝色大按钮（此模式下唯一可见的按钮）上。
+        await sendText(deviceId, `sendenterbtn-${deviceId}`);
         return;
     }
 
