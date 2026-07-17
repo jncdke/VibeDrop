@@ -1974,74 +1974,36 @@ fn main() {
             }
             // 创建系统托盘菜单（类似 KDE Connect 风格）
             let server_addr = format!("{}:{}", ip, port);
-            let tray_pin = pin.clone();
-            let title = MenuItem::with_id(app, "title", "VibeDrop", false, None::<&str>)?;
-            let addr_label = MenuItem::with_id(
-                app,
-                "addr",
-                &format!("地址 {}", server_addr),
-                false,
-                None::<&str>,
-            )?;
-            let pin_label = MenuItem::with_id(
-                app,
-                "pin",
-                &format!("PIN {}", tray_pin),
-                false,
-                None::<&str>,
-            )?;
+            // 极简菜单：状态行 / 复制最近（动态出现）/ 打开 / 退出。
+            // 地址和 PIN 只在配对时用一次，收进主窗口，不占菜单；悬停 tooltip 仍可见地址。
+            let status = MenuItem::with_id(app, "status", "等待连接…", false, None::<&str>)?;
             let sep1 = PredefinedMenuItem::separator(app)?;
-            let copy_addr = MenuItem::with_id(app, "copy_addr", "复制地址", true, None::<&str>)?;
-            let copy_pin = MenuItem::with_id(app, "copy_pin", "复制 PIN", true, None::<&str>)?;
-            let sep2 = PredefinedMenuItem::separator(app)?;
             let show = MenuItem::with_id(app, "show", "打开 VibeDrop", true, None::<&str>)?;
-            let sep3 = PredefinedMenuItem::separator(app)?;
+            let sep2 = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "退出 VibeDrop", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&status, &sep1, &show, &sep2, &quit])?;
 
-            let menu = Menu::with_items(
-                app,
-                &[
-                    &title,
-                    &addr_label,
-                    &pin_label,
-                    &sep1,
-                    &copy_addr,
-                    &copy_pin,
-                    &sep2,
-                    &show,
-                    &sep3,
-                    &quit,
-                ],
-            )?;
+            let tray_icon = decode_tray_png(TRAY_ICON_DIM).expect("解码托盘图标失败");
 
-            // 加载托盘图标（白色透明底）
-            let tray_png = include_bytes!("../icons/tray-icon.png");
-            let decoder = png::Decoder::new(std::io::Cursor::new(tray_png));
-            let mut reader = decoder.read_info().expect("读取托盘图标失败");
-            let mut buf = vec![0; reader.output_buffer_size()];
-            let info = reader.next_frame(&mut buf).expect("解码托盘图标失败");
-            buf.truncate(info.buffer_size());
-            let tray_icon = tauri::image::Image::new(&buf, info.width, info.height);
-
-            let _tray = TrayIconBuilder::new()
+            let _tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(tray_icon)
                 .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .tooltip(&format!("VibeDrop · {}", server_addr))
                 .on_menu_event(move |app, event| match event.id.as_ref() {
-                    "copy_addr" => {
-                        if let Err(err) = arboard::Clipboard::new()
-                            .and_then(|mut clipboard| clipboard.set_text(server_addr.clone()))
-                        {
-                            warn!("复制地址失败: {}", err);
+                    "copy_recent" => {
+                        let recent = TRAY_LAST_TEXT
+                            .lock()
+                            .map(|s| s.clone())
+                            .unwrap_or_default();
+                        if recent.is_empty() {
+                            return;
                         }
-                    }
-                    "copy_pin" => {
                         if let Err(err) = arboard::Clipboard::new()
-                            .and_then(|mut clipboard| clipboard.set_text(tray_pin.clone()))
+                            .and_then(|mut clipboard| clipboard.set_text(recent))
                         {
-                            warn!("复制 PIN 失败: {}", err);
+                            warn!("复制最近记录失败: {}", err);
                         }
                     }
                     "quit" => {
@@ -2425,6 +2387,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                         };
 
                                         append_history_entry(&history_entry);
+                                        tray_notify_received(&state, None, TrayFx::Ripple);
 
                                         if let Ok(guard) = state.app_handle.lock() {
                                             if let Some(handle) = guard.as_ref() {
@@ -2500,6 +2463,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                         match reply_rx.await {
                                             Ok(Ok(())) => {
                                                 info!("文字已输入");
+                                                tray_notify_received(&state, Some(text_content.as_str()), TrayFx::Ripple);
 
                                                 // 通知 Tauri 前端窗口
                                                 if let Ok(guard) = state.app_handle.lock() {
@@ -2573,6 +2537,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                         match reply_rx.await {
                                             Ok(Ok(())) => {
                                                 info!("文字已写入剪贴板");
+                                                tray_notify_received(&state, Some(text_content.as_str()), TrayFx::ClipboardSync);
 
                                                 if let Ok(guard) = state.app_handle.lock() {
                                                     if let Some(handle) = guard.as_ref() {
@@ -2680,6 +2645,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                         }
 
                                         append_history_entry(&history_entry);
+                                        tray_notify_received(&state, None, TrayFx::Ripple);
 
                                         if let Ok(guard) = state.app_handle.lock() {
                                             if let Some(handle) = guard.as_ref() {
@@ -2770,6 +2736,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                         };
 
                                         append_history_entry(&history_entry);
+                                        tray_notify_received(&state, None, TrayFx::Ripple);
 
                                         if let Ok(guard) = state.app_handle.lock() {
                                             if let Some(handle) = guard.as_ref() {
@@ -2947,11 +2914,187 @@ fn connected_clients_snapshot(state: &Arc<WsState>) -> Vec<ConnectedClientInfo> 
     clients
 }
 
+// ---- 托盘状态反馈：图标涟漪动画 + 动态菜单 ----
+
+const TRAY_ID: &str = "vibedrop-tray";
+const TRAY_ICON_BASE: &[u8] = include_bytes!("../icons/tray-icon.png");
+const TRAY_ICON_DIM: &[u8] = include_bytes!("../icons/tray-dim.png");
+const TRAY_FRAMES: [&[u8]; 3] = [
+    include_bytes!("../icons/tray-frame-1.png"),
+    include_bytes!("../icons/tray-frame-2.png"),
+    include_bytes!("../icons/tray-frame-3.png"),
+];
+
+// 动画代数：新动画开始时旧动画自动作废，避免帧序交错
+static TRAY_FX_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TRAY_CONNECTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TRAY_LAST_TEXT: Mutex<String> = Mutex::new(String::new());
+
+#[derive(Clone, Copy, PartialEq)]
+enum TrayFx {
+    // 涟漪动画（收到打字输入 / 图片 / 文件）
+    Ripple,
+    // 涟漪 + 图标旁短暂显示"已同步 ✓"（外出模式剪贴板同步）
+    ClipboardSync,
+}
+
+fn decode_tray_png(bytes: &'static [u8]) -> Option<tauri::image::Image<'static>> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    Some(tauri::image::Image::new_owned(buf, info.width, info.height))
+}
+
+fn tray_set_frame(app: &AppHandle, bytes: &'static [u8]) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        if let Some(img) = decode_tray_png(bytes) {
+            let _ = tray.set_icon(Some(img));
+            let _ = tray.set_icon_as_template(true);
+        }
+    }
+}
+
+// 常态图标：有连接 = 正常，无连接 = 半透明变体
+fn tray_set_base_icon(app: &AppHandle) {
+    let connected = TRAY_CONNECTED.load(std::sync::atomic::Ordering::SeqCst) > 0;
+    tray_set_frame(app, if connected { TRAY_ICON_BASE } else { TRAY_ICON_DIM });
+}
+
+fn tray_play_fx(app: &AppHandle, fx: TrayFx) {
+    use std::sync::atomic::Ordering;
+    let gen = TRAY_FX_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let steps: [(usize, u64); 3] = [(0, 120), (1, 120), (2, 140)];
+        for (i, &(frame_idx, delay_ms)) in steps.iter().enumerate() {
+            if TRAY_FX_GEN.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            let app2 = app.clone();
+            let frame: &'static [u8] = TRAY_FRAMES[frame_idx];
+            let set_title = i == 0;
+            let _ = app.run_on_main_thread(move || {
+                tray_set_frame(&app2, frame);
+                if set_title {
+                    if let Some(tray) = app2.tray_by_id(TRAY_ID) {
+                        let _ = tray.set_title(if fx == TrayFx::ClipboardSync {
+                            Some("已同步 ✓")
+                        } else {
+                            None
+                        });
+                    }
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+
+        if TRAY_FX_GEN.load(Ordering::SeqCst) != gen {
+            return;
+        }
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || tray_set_base_icon(&app2));
+
+        if fx == TrayFx::ClipboardSync {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            if TRAY_FX_GEN.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            let app2 = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(tray) = app2.tray_by_id(TRAY_ID) {
+                    let _ = tray.set_title(None::<&str>);
+                }
+            });
+        }
+    });
+}
+
+fn tray_truncate_chars(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+fn tray_build_and_set_menu(app: &AppHandle, status_line: &str, recent: &str) -> tauri::Result<()> {
+    let tray = match app.tray_by_id(TRAY_ID) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let status = MenuItem::with_id(app, "status", status_line, false, None::<&str>)?;
+    let sep1 = PredefinedMenuItem::separator(app)?;
+    let show = MenuItem::with_id(app, "show", "打开 VibeDrop", true, None::<&str>)?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", "退出 VibeDrop", true, None::<&str>)?;
+    if recent.is_empty() {
+        let menu = Menu::with_items(app, &[&status, &sep1, &show, &sep2, &quit])?;
+        tray.set_menu(Some(menu))?;
+    } else {
+        let label = format!("复制最近：「{}」", tray_truncate_chars(recent, 12));
+        let recent_item = MenuItem::with_id(app, "copy_recent", &label, true, None::<&str>)?;
+        let menu = Menu::with_items(app, &[&status, &recent_item, &sep1, &show, &sep2, &quit])?;
+        tray.set_menu(Some(menu))?;
+    }
+    Ok(())
+}
+
+// 依据当前连接快照生成状态行，并同步无连接置灰状态
+fn tray_status_line(state: &Arc<WsState>) -> String {
+    let clients = connected_clients_snapshot(state);
+    TRAY_CONNECTED.store(clients.len(), std::sync::atomic::Ordering::SeqCst);
+    if clients.is_empty() {
+        "等待连接…".to_string()
+    } else if clients.len() == 1 {
+        format!("已连接 · {}", clients[0].name)
+    } else {
+        format!("已连接 {} 台设备", clients.len())
+    }
+}
+
+fn tray_refresh(app: &AppHandle, status_line: String) {
+    let recent = TRAY_LAST_TEXT
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Err(err) = tray_build_and_set_menu(&app2, &status_line, &recent) {
+            warn!("刷新托盘菜单失败: {}", err);
+        }
+        tray_set_base_icon(&app2);
+    });
+}
+
+// WebSocket 线程里收到内容后调用：text 为 Some 时更新"复制最近"菜单项
+fn tray_notify_received(state: &Arc<WsState>, text: Option<&str>, fx: TrayFx) {
+    if let Some(text) = text {
+        if let Ok(mut guard) = TRAY_LAST_TEXT.lock() {
+            *guard = text.to_string();
+        }
+    }
+    let status = tray_status_line(state);
+    if let Ok(guard) = state.app_handle.lock() {
+        if let Some(handle) = guard.as_ref() {
+            tray_play_fx(handle, fx);
+            tray_refresh(handle, status);
+        }
+    }
+}
+
 fn broadcast_connected_clients(state: &Arc<WsState>) {
     let clients = connected_clients_snapshot(state);
     if let Ok(guard) = state.app_handle.lock() {
         if let Some(handle) = guard.as_ref() {
             let _ = handle.emit("connected-clients-changed", &clients);
+        }
+    }
+    let status = tray_status_line(state);
+    if let Ok(guard) = state.app_handle.lock() {
+        if let Some(handle) = guard.as_ref() {
+            tray_refresh(handle, status);
         }
     }
 }
